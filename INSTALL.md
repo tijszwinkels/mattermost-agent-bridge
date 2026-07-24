@@ -41,7 +41,7 @@ Install **Mattermost in a container** and the **two Python services on the host*
 ## Decision tree — branch here first
 
 Three choices shape the path through this runbook. Settle them with the operator
-before Step 0 (they resurface as Q4 / the systemd question / the OS below):
+before Step 0 (they resurface as Q5 / the systemd question / the OS below):
 
 1. **Mattermost — reuse or fresh?**
    - *Reuse an existing Mattermost* you administer (admin access + rights to
@@ -74,7 +74,9 @@ before Step 0 (they resurface as Q4 / the systemd question / the OS below):
 
 Do not run anything until you have answers. Record them in the table below; later steps
 reference these names. If the operator says "use your judgement" / "go", pick the
-**default** shown and tell them what you chose.
+**default** shown and tell them what you chose — **except for the 0a questions, which have
+no defaults.** Ask those and wait, even on a "go": they decide which machine, which user,
+and which directory the agents get.
 
 The two services are public repos — you will clone them in Steps 4 and 5:
 
@@ -90,41 +92,41 @@ The two services are public repos — you will clone them in Steps 4 and 5:
 > `config.toml`, or state files across hosts — those are per-host and recreated
 > from the templates here.
 
-### 0a. Host & backends (blocking — you cannot proceed without these)
+### 0a. Host, workspace & backends (blocking — ask these, never assume)
 
 | # | Question | Notes |
 |---|---|---|
 | 1 | **Host & OS user** — which machine, and which non-root user owns the repos and runs the agents? | All host services run as this user. |
 | 2 | **Install directory** — where the two repos are cloned. | Default `~/.local/opt/agent-chatops/` (→ `.../mm-bridge` + `.../agent-harness`). Don't assume `~/projects`. |
 | 3 | **Backend credentials** — which coding agents should work: `claude`, `codex`, `pi`? For each, is the CLI installed and **logged in as this user**, or do I need to authenticate it? | At least one is required. Have API keys / logins ready. If a CLI login is interactive, stop and ask the operator to complete it. |
+| 4 | **`default_cwd`** — which directory should agent sessions start in? This is the operator's *code* root, **distinct from the install dir** (Q2 — tooling, not workspace), and it's what every new agent sees first. Only a default: a channel can override it in-chat with `.cwd <path>` (persisted in its Channel Purpose), and `mm-bridge spawn --cwd` overrides it per spawn. | **No default — ask.** Common answers: `~/projects`, `~/src`, `~/work`, or a single repo. Never silently pick one; the built-in fallback is the user's whole home directory, which is rarely what they want. |
 
 ### 0b. Mattermost
 
 | # | Question | Default |
 |---|---|---|
-| 4 | **New Mattermost, or reuse an existing one?** If existing, give me its URL + admin access and skip Step 1. | New container |
-| 5 | **Where will Mattermost be reachable (`DOMAIN`)?** Any of these is fine — ask the operator, don't assume: `localhost` (single-host / eval), a Tailnet hostname (tailnet-only access), or a public domain. | `localhost` |
-| 6 | **TLS?** nginx variant (HTTPS on :443) or plain `:8065` behind your own proxy / Tailscale. | Plain `:8065` |
-| 7 | **`public_url`** — the URL humans actually click (may differ from where the daemon reaches MM, e.g. a Tailscale hostname). | `http://<DOMAIN>:8065` |
-| 8 | **Team slug** (`MM_TEAM`) the bot operates in. | Ask — must be created |
+| 5 | **New Mattermost, or reuse an existing one?** If existing, give me its URL + admin access and skip Step 1. | New container |
+| 6 | **Where will Mattermost be reachable (`DOMAIN`)?** Any of these is fine — ask the operator, don't assume: `localhost` (single-host / eval), a Tailnet hostname (tailnet-only access), or a public domain. | `localhost` |
+| 7 | **TLS?** nginx variant (HTTPS on :443) or plain `:8065` behind your own proxy / Tailscale. | Plain `:8065` |
+| 8 | **`public_url`** — the URL humans actually click (may differ from where the daemon reaches MM, e.g. a Tailscale hostname). | `http://<DOMAIN>:8065` |
+| 9 | **Team slug** (`MM_TEAM`) the bot operates in. | Ask — must be created |
 
 ### 0c. The bot & session behaviour
 
 | # | Question | Default |
 |---|---|---|
-| 9  | **Bot username** — the `@name` the agent posts as. | `b3mo` |
-| 10 | **Auto-join public channels?** If on, the bot silently joins every public channel it can see (sessions still created only on first engagement). If off, someone must `/invite @<bot>` per channel. | **off** |
-| 11 | **Autorespond default** — reply to every message, or only when `@mentioned`? | **mention-only** (off) |
-| 12 | **Default backend** for new channels — `claude`, `codex`, and `pi` are all first-class. Sensible default: **whichever agent is running this install**, since it's demonstrably installed + authed on this host. | the installing agent |
-| 13 | **Default model** per backend (`claude` / `codex`). **`pi` needs none** — the harness is model-optional for it (agent-harness PR #34, deployed). | `claude=opus, codex=gpt-5.5` |
-| 14 | **`default_cwd`** — working dir new sessions start in: the user's *code* root, **distinct from the install dir** (Q2 — tooling, not workspace). Only a default: any channel can override it in-chat with `.cwd <path>` (persisted in its Channel Purpose), and `mm-bridge spawn --cwd` overrides it per spawn. | `~/projects` |
-| 15 | **`allowed_attachment_roots`** — directories the bridge may upload files from via `<openFile>`. Include a scratch dir (`~/mm-attachments`) so agents have an unambiguous place to stage generated files — otherwise they reach for `/tmp`, which is outside the roots and silently fails to attach. These roots also bound the per-channel cwd overrides (`.cwd <path>` / `cwd=` in the Channel Purpose), so keep the user's code root in the list. | `["~/projects", "~/mm-attachments"]` |
+| 10 | **Bot username** — the `@name` the agent posts as. | `b3mo` |
+| 11 | **Auto-join public channels?** If on, the bot silently joins every public channel it can see (sessions still created only on first engagement). If off, someone must `/invite @<bot>` per channel. | **off** |
+| 12 | **Autorespond default** — reply to every message, or only when `@mentioned`? | **mention-only** (off) |
+| 13 | **Default backend** for new channels — `claude`, `codex`, and `pi` are all first-class. Sensible default: **whichever agent is running this install**, since it's demonstrably installed + authed on this host. | the installing agent |
+| 14 | **Default model** per backend (`claude` / `codex`). **`pi` needs none** — the harness is model-optional for it (agent-harness PR #34, deployed). | `claude=opus, codex=gpt-5.5` |
+| 15 | **`allowed_attachment_roots`** — directories the bridge may upload files from via `<openFile>`. Include a scratch dir (`~/mm-attachments`) so agents have an unambiguous place to stage generated files — otherwise they reach for `/tmp`, which is outside the roots and silently fails to attach. **Must also contain the Q4 `default_cwd`**: these roots gate more than attachments — they bound the per-channel cwd overrides too (`.cwd <path>` and `cwd=` in the Channel Purpose), and a value outside them is silently replaced by `default_cwd`. If Q4 was answered `~/src`, this list needs `~/src`. | `["~/projects", "~/mm-attachments"]` (+ the Q4 answer if it differs) |
 | 16 | **Show tool-use posts?** Coalesced per-turn tool-use placeholders, or hide them (only real replies + errors). | show |
 
 > **Fill this in before continuing:**
-> host=`____` user=`____` install_dir=`____` backends=`____`
+> host=`____` user=`____` install_dir=`____` default_cwd=`____` backends=`____`
 > DOMAIN=`____` tls=`____` public_url=`____` MM_TEAM=`____` bot=`____`
-> auto_join=`____` autorespond=`____` default_backend=`____` default_cwd=`____`
+> auto_join=`____` autorespond=`____` default_backend=`____`
 
 ---
 
@@ -166,7 +168,7 @@ user (`docker run --rm hello-world`).
 > it over localhost, so nothing else needs to. **Never bind `0.0.0.0` on a box with a
 > public IP.** If this host is internet-facing, also firewall everything except SSH (22) and
 > the Mattermost port before proceeding — e.g. `sudo ufw default deny incoming; sudo ufw
-> allow 22; sudo ufw allow 8065; sudo ufw enable` (adjust the MM port for your Q6 variant).
+> allow 22; sudo ufw allow 8065; sudo ufw enable` (adjust the MM port for your Q7 variant).
 > Serve Mattermost over TLS when `DOMAIN` is a public hostname — plain `:8065` sends the
 > bot token and passwords in cleartext.
 
@@ -175,7 +177,7 @@ user (`docker run --rm hello-world`).
 ## Step 2 — Backend coding-agent CLIs
 
 agent-harness runs `claude`, `codex`, and `pi` as subprocesses inheriting its PATH — all
-three are first-class. Install **at least the default backend** (Q12) and authenticate **as
+three are first-class. Install **at least the default backend** (Q13) and authenticate **as
 the host user** (not root). If an agent is *running this install*, its own backend is already
 installed + authed here — the natural default; just add whichever others you chose in Q3.
 Claude Code as a worked example:
@@ -198,7 +200,7 @@ note its directory — you'll adjust the harness `run.sh` PATH line in Step 4.
 
 ## Step 3 — Mattermost (container install)
 
-Skip if reusing an existing instance (Q4) — go to Step 3b to create the bot.
+Skip if reusing an existing instance (Q5) — go to Step 3b to create the bot.
 
 Official quick-start (`github.com/mattermost/docker`):
 
@@ -207,14 +209,14 @@ git clone https://github.com/mattermost/docker
 cd docker
 cp env.example .env
 # Edit .env:
-#   DOMAIN=<DOMAIN>                              (from Q5)
+#   DOMAIN=<DOMAIN>                              (from Q6)
 #   MM_SERVICESETTINGS_SITEURL=<site_url>        (see below — MUST match how clients reach MM)
 
 mkdir -p ./volumes/app/mattermost/{config,data,logs,plugins,client/plugins,bleve-indexes}
 sudo chown -R 2000:2000 ./volumes/app/mattermost
 ```
 
-Bring it up — pick the variant from Q6:
+Bring it up — pick the variant from Q7:
 
 ```bash
 # Plain HTTP on :8065  (evaluation / behind your own proxy)
@@ -224,7 +226,7 @@ docker compose -f docker-compose.yml -f docker-compose.without-nginx.yml up -d
 # docker compose -f docker-compose.yml -f docker-compose.nginx.yml up -d
 ```
 
-> **`MM_SERVICESETTINGS_SITEURL` per variant (Q6).** SiteURL must equal the origin clients
+> **`MM_SERVICESETTINGS_SITEURL` per variant (Q7).** SiteURL must equal the origin clients
 > actually use, or logins and the bot WebSocket break:
 > - **Plain `:8065`** → `http://<DOMAIN>:8065` (note the port and **http**, not https).
 > - **Bundled nginx / your own TLS proxy** → `https://<DOMAIN>` (no port).
@@ -296,7 +298,7 @@ ADMIN_TOKEN=$(curl -sS -D - -o /dev/null -X POST http://localhost:8065/api/v4/us
   | awk 'tolower($1)=="token:"{print $2}' | tr -d '\r')
 [ -n "$ADMIN_TOKEN" ] || { echo "admin login failed"; exit 1; }
 
-# 5. Create the team. `name` is the URL slug = MM_TEAM (Q8); type O = open.
+# 5. Create the team. `name` is the URL slug = MM_TEAM (Q9); type O = open.
 curl -sSf -X POST http://localhost:8065/api/v4/teams \
   -H "Authorization: Bearer $ADMIN_TOKEN" -H 'Content-Type: application/json' \
   -d '{"name":"<MM_TEAM>","display_name":"<MM_TEAM>","type":"O"}' >/dev/null
@@ -333,7 +335,7 @@ curl -sSf -X PUT http://localhost:8065/api/v4/config/patch \
   -H "Authorization: Bearer $ADMIN_TOKEN" -H 'Content-Type: application/json' \
   -d '{"ServiceSettings":{"EnableBotAccountCreation":true,"EnableUserAccessTokens":true}}' >/dev/null
 
-# 2. Create the bot (Q9) and capture its user id.
+# 2. Create the bot (Q10) and capture its user id.
 BOT_USER_ID=$(curl -sSf -X POST http://localhost:8065/api/v4/bots \
   -H "Authorization: Bearer $ADMIN_TOKEN" -H 'Content-Type: application/json' \
   -d '{"username":"<bot>","display_name":"<bot>"}' | jq -r .user_id)
@@ -359,7 +361,7 @@ The `token` printed by step 4 is **`MM_BOT_TOKEN`** — put it in `~/.config/mm-
 > **Browser alternative.** In **System Console**: **Integrations → Bot Accounts** → *Enable
 > Bot Account Creation* = true; **Integrations → Integration Management** → *Enable Personal
 > Access Tokens* = true; then **Integrations → Bot Accounts → Add Bot Account**
-> (username `<bot>`, Q9) and create a token — **copy it immediately, it is shown once.**
+> (username `<bot>`, Q10) and create a token — **copy it immediately, it is shown once.**
 > Add the bot to the team.
 
 **✅ Checkpoint:** the token works and resolves to the bot:
@@ -478,13 +480,13 @@ Fill from the Step 0 answers:
 
 ```toml
 # ── Top-level keys — MUST come before the [sections] below ──
-default_backend           = "<default_backend>"   # Q12
-default_cwd               = "<default_cwd>"         # Q14
-default_autorespond       = false                  # Q11 (true = reply to every message)
-auto_join_public_channels = false                  # Q10 (true = bot joins all public channels)
+default_backend           = "<default_backend>"   # Q13
+default_cwd               = "<default_cwd>"         # Q4
+default_autorespond       = false                  # Q12 (true = reply to every message)
+auto_join_public_channels = false                  # Q11 (true = bot joins all public channels)
 show_tool_use             = true                   # Q16
 allowed_attachment_roots  = ["~/projects", "~/mm-attachments"]   # Q15 (scratch dir for agent-generated attachments)
-default_models            = { claude = "opus", codex = "gpt-5.5" }   # Q13 — pi needs none (harness is model-optional)
+default_models            = { claude = "opus", codex = "gpt-5.5" }   # Q14 — pi needs none (harness is model-optional)
 state_file                = "~/.config/mm-bridge/state.json"
 sidecar_dir               = "~/.mm-bridge/sessions"
 
@@ -492,16 +494,17 @@ sidecar_dir               = "~/.mm-bridge/sessions"
 url        = "localhost"
 port       = 8065
 scheme     = "http"
-team       = "<MM_TEAM>"                       # Q8
-public_url = "<public_url>"                    # Q7 — the URL humans click
+team       = "<MM_TEAM>"                       # Q9
+public_url = "<public_url>"                    # Q8 — the URL humans click
 
 [agent_harness]
 url = "http://localhost:8877"
 ```
 
-> **Create `default_cwd` if it's missing.** New sessions start there, and it may not exist
-> on a fresh box (`~/projects` is *not* the install dir). `mkdir -p "$(eval echo <default_cwd>)"`
-> so the first session doesn't land in a non-existent directory.
+> **`default_cwd` must be the operator's answer to Q4, written explicitly.** Never leave the
+> key out: unset, the bridge falls back to the user's whole home directory. It's also not
+> the install dir, and it may not exist yet on a fresh box —
+> `mkdir -p "$(eval echo <default_cwd>)"` so the first session doesn't land nowhere.
 >
 > **Create the attachment scratch dir (Q15).** `mkdir -p ~/mm-attachments` so agents have a
 > whitelisted place to stage generated files for `<openFile>`. Without it the agent falls back
@@ -526,8 +529,8 @@ AH_URL=http://localhost:8877
 
 # Flag overrides — env wins over BOTH the TOML and the built-in defaults, so this
 # is the most reliable way to turn a flag on. Uncomment only what you want ON.
-# MM_AUTO_JOIN=true                    # Q10 — bot silently joins all public channels
-# MM_BRIDGE_DEFAULT_AUTORESPOND=true   # Q11 — reply to every message, not just @mentions
+# MM_AUTO_JOIN=true                    # Q11 — bot silently joins all public channels
+# MM_BRIDGE_DEFAULT_AUTORESPOND=true   # Q12 — reply to every message, not just @mentions
 ENV
 chmod 600 ~/.config/mm-bridge/env
 ```
