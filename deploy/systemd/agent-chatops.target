@@ -15,7 +15,7 @@
 
 [Unit]
 Description=Agent chat-ops stack (agent-harness + mm-bridge)
-Documentation=https://github.com/tijszwinkels/mm-bridge/blob/main/INSTALL.md
+Documentation=https://github.com/tijszwinkels/mattermost-agent-bridge/blob/main/INSTALL.md
 Wants=agent-harness.service mm-bridge.service
 
 [Install]

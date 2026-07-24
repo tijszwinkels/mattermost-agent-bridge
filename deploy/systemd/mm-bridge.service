@@ -13,7 +13,7 @@
 
 [Unit]
 Description=mm-bridge (Mattermost <-> agent-harness bridge)
-Documentation=https://github.com/tijszwinkels/mm-bridge/blob/main/INSTALL.md
+Documentation=https://github.com/tijszwinkels/mattermost-agent-bridge/blob/main/INSTALL.md
 PartOf=agent-chatops.target
 # Soft ordering only: start after the harness so its SSE endpoint is usually
 # up first. Deliberately NOT BindsTo=/Requires= — the bridge reconnect-resumes

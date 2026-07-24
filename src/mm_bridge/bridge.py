@@ -148,7 +148,7 @@ CHANNEL_JOIN_WELCOME_TEMPLATE = (
     "Start with `.help` for the full command list; "
     "`.stop` to interrupt. Also `@{bot} catch up {catch_up_n}` · "
     "`@{bot} leave`. Catch-up is automatic on the first message. "
-    "More: [README](https://github.com/tijszwinkels/mm-bridge#readme)."
+    "More: [README](https://github.com/tijszwinkels/mattermost-agent-bridge#readme)."
 )
 
 def _compile_bot_command_res(

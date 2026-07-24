@@ -1,4 +1,7 @@
-# mm-bridge
+# mattermost-agent-bridge
+
+*The daemon, the command, and the Python package are all called `mm-bridge` — that's what
+you type.*
 
 **Your coding agent, in your team chat.** Tag the bot in a Mattermost channel and a real
 Claude Code, Codex, or pi session starts on your own machine — in your repos, with your

@@ -81,7 +81,7 @@ and which directory the agents get.
 The two services are public repos — you will clone them in Steps 4 and 5:
 
 - agent-harness → `https://github.com/tijszwinkels/agent-harness`
-- mm-bridge → `https://github.com/tijszwinkels/mm-bridge`
+- mm-bridge → `https://github.com/tijszwinkels/mattermost-agent-bridge`
 
 > **No GitHub access from this host (air-gapped, private repos, blocked egress)?**
 > Steps 4 and 5 only need the two repo trees *present* under `<install_dir>` — the
@@ -442,7 +442,7 @@ harness DB file exists under `~/.local/state/agent-harness/` (not in the clone).
 
 ```bash
 cd ~/.local/opt/agent-chatops    # <install_dir> from Q2 (created in Step 4)
-git clone https://github.com/tijszwinkels/mm-bridge
+git clone https://github.com/tijszwinkels/mattermost-agent-bridge mm-bridge   # dir stays `mm-bridge` — every path below assumes it
 cd mm-bridge
 uv sync                          # creates .venv + installs deps
 cp run.sh.example run.sh && chmod +x run.sh   # run.sh is gitignored (per-host) — create it from the template
