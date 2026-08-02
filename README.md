@@ -231,7 +231,7 @@ the first session is warming up are routed normally once mapping completes.
 | `.status` | Session id, backend, model, cwd, autorespond flag, run state, harness status. |
 | `.model [<name>]` | Show or select the model. In a dormant channel it configures the future session without creating one. In an active channel it recreates the session, so `.stop` any active run first. Names are free text; a bad one fails loudly when the backend starts. |
 | `.backend [<name>]` | Show or select the backend. In a dormant channel it configures the future session without creating one. In an active channel it recreates the session. Validated against known backends (`claude`, `codex`, …); changing it **resets the model to that backend's default**. |
-| `.cwd [<path>]` | Show or set the working directory — see [Which directory a session starts in](#which-directory-a-session-starts-in). In a dormant channel it configures the future session without creating one. In an active channel it recreates the session there, so `.stop` any active run first. The path must be absolute (`~` is expanded) and be an existing directory; the absolute result is persisted as `cwd=<path>` in the Channel Purpose. |
+| `.cwd [<path>]` | Show or set the working directory — see [Which directory a session starts in](#which-directory-a-session-starts-in). In a dormant channel it configures the future session without creating one. In an active channel it recreates the session there, so `.stop` any active run first. The path must be absolute (`~` is expanded), be an existing directory, and contain no comma; the absolute result is persisted as `cwd=<path>` in the Channel Purpose. |
 | `.models` | List the available models for this channel's backend (from the `[models]` config table + the harness catalog), marking the current one. |
 | `.running` | Sessions with a run in flight right now. |
 | `.sessions [N]` | The N most recent sessions across all agents — including terminal (TUI) sessions not yet on Mattermost. Each shows its channel or an `.invite` hint. |
@@ -262,6 +262,10 @@ configured either way behaves identically. Prefer `.cwd` — it checks the path
 before committing to it, expands `~`, and says which check failed, whereas the
 Purpose parser is strict (absolute paths only, no `~` expansion) and a value it
 can't use degrades silently to `default_cwd`.
+
+Because the Purpose is a **comma-separated** config list, a working directory
+whose path contains a comma can't be stored either way — `.cwd` refuses it
+outright rather than writing something that reparses into a truncated path.
 
 A cwd only takes effect when a session is **created**, so changing it in an
 active channel recreates the session — the harness has no cwd-mutate endpoint.

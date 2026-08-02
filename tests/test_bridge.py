@@ -3491,6 +3491,24 @@ class CommandCwdTests(_BridgeTestCase):
         joined = self._joined()
         self.assertNotIn("session restarted there", joined)
 
+    async def test_comma_in_path_refused_because_purpose_is_comma_separated(self):
+        # The Channel Purpose is a comma-separated config list, so a cwd
+        # containing a comma reparses to a truncated path plus a stray-token
+        # warning. Refuse rather than persist something that can't round-trip.
+        target = Path(self.tmp.name) / "a,b"
+        target.mkdir()
+        self._active_channel()
+
+        await self.bridge._on_mm_posted({
+            "channel_id": "c1", "message": f".cwd {target}",
+            "user_id": "u1", "type": "",
+        })
+
+        self.assertEqual(self.bridge.harness.created, [])
+        joined = self._joined()
+        self.assertIn("comma", joined)
+        self.assertNotIn(f"cwd={target}", self.bridge.mm.channels["c1"]["purpose"])
+
     async def test_active_set_refuses_while_run_active(self):
         target = str(Path(self.tmp.name) / "repo")
         Path(target).mkdir()

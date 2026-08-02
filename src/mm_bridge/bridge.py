@@ -3146,6 +3146,18 @@ class Bridge:
                 f"`{candidate}` is outside the allowed roots — sessions can "
                 f"only run under {roots}."
             )
+        # The Channel Purpose is a comma-separated config list, so a cwd
+        # containing a comma can't round-trip: `purpose.parse` would split it
+        # into a truncated path plus a stray token. Checked on the RESOLVED
+        # path — the value actually persisted — so a symlink pointing at a
+        # comma-bearing directory is caught too.
+        if "," in str(resolved):
+            return None, (
+                f"`{resolved}` contains a comma. The Channel Purpose stores "
+                "the working directory in a comma-separated list, so such a "
+                "path can't be saved — move or symlink it somewhere without "
+                "a comma."
+            )
         return str(resolved), None
 
     async def _cmd_cwd(
