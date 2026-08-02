@@ -1704,6 +1704,50 @@ class Bridge:
         self.purpose_by_channel[channel_id] = cfg
         return cfg
 
+    async def _config_for_restart(
+        self, channel_id: str, command: str,
+    ) -> purpose.PurposeConfig | None:
+        """Channel config for a dot-command that recreates the session.
+
+        A cold ``purpose_by_channel`` is the ORDINARY state for a mapped
+        channel after a daemon restart: ``_bootstrap_known_sessions`` doesn't
+        populate it, and the dot-command preload only covers dormant channels.
+        So `.model` / `.backend` / `.cwd` must read the Channel Purpose rather
+        than rebuild the config from defaults — that would silently rewrite
+        every setting the command isn't about (the channel's directory, its
+        autorespond flag, and for `.cwd` its backend and model) while the
+        confirmation names only the one thing the user asked to change.
+
+        Returns ``None`` when the Purpose can't be read; callers refuse the
+        switch via :meth:`_refuse_restart_unknown_config`.
+        """
+        cfg = self.purpose_by_channel.get(channel_id)
+        if cfg is not None:
+            return cfg
+        try:
+            return await self._load_channel_config(channel_id)
+        except Exception:
+            logger.exception(
+                "`%s` could not load the channel config for %s", command, channel_id,
+            )
+            return None
+
+    def _refuse_restart_unknown_config(
+        self, channel_id: str, thread_root: str | None, keeping: str,
+    ) -> None:
+        """Refuse a session-recreating switch we couldn't read the config for.
+
+        Restarting on invented values would hand the channel a configuration
+        the user never chose — and ``_persist_purpose`` needs the same channel
+        read that just failed, so the result couldn't be written back anyway.
+        """
+        self._post_cmd_reply(
+            channel_id,
+            ":warning: Could not read this channel's configuration — "
+            f"{keeping} rather than restarting it with guessed settings.",
+            thread_root,
+        )
+
     async def _run_runtime_toggle(self, channel_id: str, token: str) -> None:
         """Flip the channel's mention_only flag from an autorespond token.
 
@@ -2938,7 +2982,7 @@ class Bridge:
         Switching recreates the session (the harness has no model-mutate
         endpoint), so it's refused while a run is active.
         """
-        cfg = self.purpose_by_channel.get(channel_id)
+        cfg = await self._config_for_restart(channel_id, ".model")
         try:
             meta = await self.harness.get_session(session_id) or {}
         except Exception:
@@ -2977,16 +3021,19 @@ class Bridge:
             )
             return
 
-        base = cfg or purpose.PurposeConfig(
-            backend=backend,
-            model=None,
-            mention_only=not self.config.default_autorespond,
-        )
+        if cfg is None:
+            self._refuse_restart_unknown_config(
+                channel_id, thread_root, "leaving the session on its current model",
+            )
+            return
+
+        # Only the model moves: the backend, the working directory and the
+        # autorespond flag carry over untouched.
         new_cfg = purpose.PurposeConfig(
-            backend=base.backend,
+            backend=cfg.backend,
             model=arg,
-            mention_only=base.mention_only,
-            cwd=base.cwd,
+            mention_only=cfg.mention_only,
+            cwd=cfg.cwd,
             warnings=[],
         )
         new_session = await self._restart_session_with_config(
@@ -3021,7 +3068,7 @@ class Bridge:
         model is dropped on the swap — models are backend-specific, so the new
         backend's per-backend default applies (via ``_merge_configs``).
         """
-        cfg = self.purpose_by_channel.get(channel_id)
+        cfg = await self._config_for_restart(channel_id, ".backend")
         try:
             meta = await self.harness.get_session(session_id) or {}
         except Exception:
@@ -3073,21 +3120,23 @@ class Bridge:
             )
             return
 
-        base = cfg or purpose.PurposeConfig(
-            backend=current_backend,
-            model=None,
-            mention_only=not self.config.default_autorespond,
-        )
+        if cfg is None:
+            self._refuse_restart_unknown_config(
+                channel_id, thread_root, "leaving the session on its current backend",
+            )
+            return
+
         # Layer the new backend over the current config via ``_merge_configs``
         # so the carried model is dropped (a claude model can't run on codex).
+        # The working directory and the autorespond flag survive the swap.
         target = purpose.PurposeConfig(
             backend=requested,
             model=None,
-            mention_only=base.mention_only,
-            cwd=base.cwd,
+            mention_only=cfg.mention_only,
+            cwd=cfg.cwd,
             warnings=[],
         )
-        new_cfg = self._merge_configs(base, target)
+        new_cfg = self._merge_configs(cfg, target)
         new_session = await self._restart_session_with_config(
             channel_id, session_id, new_cfg,
         )
@@ -3174,23 +3223,7 @@ class Bridge:
         puts it under the same rules as `.model` / `.backend`: refused inside
         a thread fork, and refused while a run is in flight.
         """
-        # A cold ``purpose_by_channel`` is the ORDINARY state for a mapped
-        # channel after a daemon restart: ``_bootstrap_known_sessions`` doesn't
-        # populate it, and the dot-command preload only covers dormant
-        # channels. Load it from the Channel Purpose before touching anything —
-        # rebuilding it from config defaults below would silently rewrite the
-        # channel's backend, model and autorespond flag (a codex channel would
-        # come back as claude) while the confirmation claims the directory was
-        # the only thing that moved.
-        cfg = self.purpose_by_channel.get(channel_id)
-        if cfg is None:
-            try:
-                cfg = await self._load_channel_config(channel_id)
-            except Exception:
-                logger.exception(
-                    "`.cwd` could not load the channel config for %s", channel_id,
-                )
-                cfg = None
+        cfg = await self._config_for_restart(channel_id, ".cwd")
         try:
             meta = await self.harness.get_session(session_id) or {}
         except Exception:
@@ -3236,15 +3269,8 @@ class Bridge:
             return
 
         if cfg is None:
-            # The load above failed, so the channel's backend/model are
-            # unknown. Guessing them would persist a config the user never
-            # chose — and we couldn't write the Purpose anyway.
-            self._post_cmd_reply(
-                channel_id,
-                ":warning: Could not read this channel's configuration — "
-                "leaving the session where it is rather than restarting it "
-                "with a guessed backend and model.",
-                thread_root,
+            self._refuse_restart_unknown_config(
+                channel_id, thread_root, "leaving the session where it is",
             )
             return
 
