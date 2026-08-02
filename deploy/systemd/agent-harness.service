@@ -15,7 +15,7 @@
 
 [Unit]
 Description=agent-harness (coding-agent session runtime)
-Documentation=https://github.com/tijszwinkels/mm-bridge/blob/main/INSTALL.md
+Documentation=https://github.com/tijszwinkels/mattermost-agent-bridge/blob/main/INSTALL.md
 # Part of the chat-ops target so target stop/restart cascades here. No hard
 # binding to the bridge — they're independent daemons.
 PartOf=agent-chatops.target
