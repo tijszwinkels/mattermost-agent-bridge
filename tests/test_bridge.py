@@ -2780,6 +2780,76 @@ class CommandTests(_BridgeTestCase):
         # Was autorespond (mention_only False) → bare toggle turns it off.
         self.assertTrue(self.bridge.purpose_by_channel["c1"].mention_only)
 
+    async def test_dot_autorespond_cold_cache_keeps_the_rest_of_the_config(self):
+        # The third instance of the cold-cache bug. `.autorespond` restarts
+        # nothing, so the damage is invisible at the time: it fabricates a
+        # default config, flips the flag on THAT, and persists it — wiping
+        # backend, model and `cwd=` from the Channel Purpose. The next session
+        # the channel creates then starts on the wrong settings.
+        target = str(Path(self.tmp.name) / "repo")
+        Path(target).mkdir()
+        self.bridge.mapping.link(Anchor("c1"), "s1")
+        self.bridge.mm.channels["c1"] = {
+            "id": "c1", "purpose": f"codex, gpt-5.4, mention-only, cwd={target}",
+        }
+        self.assertNotIn("c1", self.bridge.purpose_by_channel)  # cold cache
+
+        await self.bridge._on_mm_posted({
+            "channel_id": "c1", "message": ".autorespond on",
+            "user_id": "u1", "type": "",
+        })
+
+        cfg = self.bridge.purpose_by_channel["c1"]
+        self.assertFalse(cfg.mention_only)  # the one thing the command changes
+        self.assertEqual(cfg.backend, "codex")
+        self.assertEqual(cfg.model, "gpt-5.4")
+        self.assertEqual(cfg.cwd, target)
+        written = self.bridge.mm.channels["c1"]["purpose"]
+        self.assertIn("codex", written)
+        self.assertIn("gpt-5.4", written)
+        self.assertIn(f"cwd={target}", written)
+        self.assertIn("autorespond", written)
+
+    async def test_dot_autorespond_bare_toggle_reads_the_purpose_not_defaults(self):
+        # A bare `.autorespond` toggles relative to the CURRENT state. On a
+        # cold cache that state was read from `config.default_autorespond`
+        # instead of the channel's Purpose, so the toggle could run the wrong
+        # way — here the channel is on autorespond, so bare must turn it off.
+        self.bridge.mapping.link(Anchor("c1"), "s1")
+        self.bridge.mm.channels["c1"] = {
+            "id": "c1", "purpose": "claude, opus, autorespond",
+        }
+        self.assertFalse(self.config.default_autorespond)  # opposite of the channel
+
+        await self.bridge._on_mm_posted({
+            "channel_id": "c1", "message": ".autorespond",
+            "user_id": "u1", "type": "",
+        })
+
+        self.assertTrue(self.bridge.purpose_by_channel["c1"].mention_only)
+        self.assertIn("mention-only", self.bridge.mm.channels["c1"]["purpose"])
+
+    async def test_dot_autorespond_unreadable_config_refuses_without_persisting(self):
+        # Nothing restarts here, but `_persist_purpose` writes unconditionally
+        # — and it swallows its own failed channel read, so persisting a
+        # guessed config could wipe the channel's resume block too.
+        self.bridge.mapping.link(Anchor("c1"), "s1")
+
+        def _boom(_channel_id):
+            raise RuntimeError("mattermost unreachable")
+
+        self.bridge.mm.get_channel = _boom
+
+        await self.bridge._on_mm_posted({
+            "channel_id": "c1", "message": ".autorespond on",
+            "user_id": "u1", "type": "",
+        })
+
+        self.assertEqual(self.bridge.mm.purposes, [])
+        self.assertNotIn("c1", self.bridge.purpose_by_channel)
+        joined = "\n".join(self._posted_texts()).lower()
+        self.assertIn("configuration", joined)
+
     # ----- .status -----
 
     async def test_dot_status_reports_session_and_run(self):
@@ -2993,6 +3063,92 @@ class CommandPhase2Tests(_BridgeTestCase):
         self.assertIn("restart the session", joined)
         self.assertIn("harness down", joined)
         self.assertNotIn("Model set", joined)
+
+    async def test_dot_model_cold_cache_keeps_cwd_and_autorespond(self):
+        # `purpose_by_channel` is EMPTY for every mapped channel after a daemon
+        # restart — `_bootstrap_known_sessions` never populates it, and the
+        # dot-command preload only covers dormant channels. So this is the
+        # ORDINARY first `.model` in a restarted channel, not a race. Building
+        # the config from bare defaults here restarts the session in
+        # `default_cwd` (the agent silently changes repository), resets the
+        # autorespond flag, and writes a Channel Purpose with no `cwd=` token —
+        # losing the setting permanently, not just for this one switch.
+        target = str(Path(self.tmp.name) / "repo")
+        Path(target).mkdir()
+        self.bridge.mapping.link(Anchor("c1"), "s1")
+        self.bridge.mm.channels["c1"] = {
+            "id": "c1", "purpose": f"codex, gpt-5.4, autorespond, cwd={target}",
+        }
+        self.bridge.harness.sessions_meta = [{
+            "id": "s1", "backend": "codex", "model": "gpt-5.4",
+            "project": {"path": target, "name": "repo"}, "origin": "harness",
+        }]
+        self.assertNotIn("c1", self.bridge.purpose_by_channel)  # cold cache
+
+        await self.bridge._on_mm_posted({
+            "channel_id": "c1", "message": ".model gpt-5.4-mini",
+            "user_id": "u1", "type": "",
+        })
+
+        created = self.bridge.harness.created[-1]
+        self.assertEqual(created["model"], "gpt-5.4-mini")
+        self.assertEqual(created["backend"], "codex")
+        # Only the model moves — the channel's directory comes along.
+        self.assertEqual(created["cwd"], target)
+        self.assertFalse(self.bridge.purpose_by_channel["c1"].mention_only)
+        written = self.bridge.mm.channels["c1"]["purpose"]
+        self.assertIn(f"cwd={target}", written)
+        self.assertIn("autorespond", written)
+
+    async def test_dot_model_token_less_purpose_keeps_the_live_backend(self):
+        # Channels created AROUND an existing session (`mm-bridge spawn`,
+        # `.invite <id>`, bootstrap discovery) get a Purpose of
+        # "agent-harness session <id>" — no config tokens — and nothing ever
+        # fills `purpose_by_channel` for them. That Purpose LOADS fine and
+        # parses to pure defaults, so trusting its backend would recreate a
+        # codex session on claude and persist the flip. The live session's
+        # meta is the ground truth for what this session actually runs on.
+        self.bridge.mapping.link(Anchor("c1"), "s1")
+        self.bridge.mm.channels["c1"] = {
+            "id": "c1", "purpose": "agent-harness session s1",
+        }
+        self.bridge.harness.sessions_meta = [{
+            "id": "s1", "backend": "codex", "model": "gpt-5.4",
+            "project": {"path": "/tmp/proj", "name": "proj"}, "origin": "harness",
+        }]
+
+        await self.bridge._on_mm_posted({
+            "channel_id": "c1", "message": ".model gpt-5.4-mini",
+            "user_id": "u1", "type": "",
+        })
+
+        created = self.bridge.harness.created[-1]
+        self.assertEqual(created["backend"], "codex")
+        self.assertEqual(created["model"], "gpt-5.4-mini")
+        self.assertIn("codex", self.bridge.mm.channels["c1"]["purpose"])
+
+    async def test_dot_model_unreadable_config_refuses_the_switch(self):
+        # With the Channel Purpose unreadable we don't know the channel's cwd
+        # or autorespond flag. Restarting anyway would guess them, and
+        # `_persist_purpose` needs the same channel read that just failed —
+        # so refuse instead of silently relocating the session.
+        self.bridge.mapping.link(Anchor("c1"), "s1")
+
+        def _boom(_channel_id):
+            raise RuntimeError("mattermost unreachable")
+
+        self.bridge.mm.get_channel = _boom
+
+        await self.bridge._on_mm_posted({
+            "channel_id": "c1", "message": ".model claude-sonnet",
+            "user_id": "u1", "type": "",
+        })
+
+        self.assertEqual(self.bridge.harness.created, [])
+        self.assertEqual(self.bridge.mm.purposes, [])
+        joined = "\n".join(self._posted_texts()).lower()
+        self.assertIn("configuration", joined)
+        self.assertNotIn("model set", joined)
 
     async def test_bare_model_shows_current_and_hints_models(self):
         self.bridge.mapping.link(Anchor("c1"), "s1")
@@ -3289,6 +3445,96 @@ class CommandBackendTests(_BridgeTestCase):
         self.assertEqual(self.bridge.mapping.get_session(Anchor("c1")), "s1")
         self.assertEqual(self.bridge.harness.sent, [("s1", "still here")])
 
+    async def test_dot_backend_cold_cache_keeps_cwd_and_autorespond(self):
+        # Same cold-cache state as `.model`: after a daemon restart every
+        # mapped channel has `cfg is None`. The backend is meta-derived so the
+        # swap itself is right, but rebuilding the rest of the config from
+        # defaults relocates the session to `default_cwd`, resets autorespond,
+        # and drops the `cwd=` token from the persisted Channel Purpose.
+        target = str(Path(self.tmp.name) / "repo")
+        Path(target).mkdir()
+        self.bridge.mapping.link(Anchor("c1"), "s1")
+        self.bridge.mm.channels["c1"] = {
+            "id": "c1", "purpose": f"codex, gpt-5.4, autorespond, cwd={target}",
+        }
+        self.bridge.harness.sessions_meta = [{
+            "id": "s1", "backend": "codex", "model": "gpt-5.4",
+            "project": {"path": target, "name": "repo"}, "origin": "harness",
+        }]
+        self.assertNotIn("c1", self.bridge.purpose_by_channel)  # cold cache
+
+        await self.bridge._on_mm_posted({
+            "channel_id": "c1", "message": ".backend claude",
+            "user_id": "u1", "type": "",
+        })
+
+        created = self.bridge.harness.created[-1]
+        self.assertEqual(created["backend"], "claude")
+        # The backend swap drops the model, but not the directory.
+        self.assertEqual(created["cwd"], target)
+        self.assertFalse(self.bridge.purpose_by_channel["c1"].mention_only)
+        written = self.bridge.mm.channels["c1"]["purpose"]
+        self.assertIn(f"cwd={target}", written)
+        self.assertIn("autorespond", written)
+
+    async def test_dot_backend_token_less_purpose_merges_against_live_backend(self):
+        # Same token-less Purpose as `.model`, plus the production shape the
+        # test double normally hides: the live harness returns an EMPTY model
+        # catalog, so `purpose.parse` accepts the whole "agent-harness session
+        # s1" string as a MODEL token. Merging against that Purpose's backend
+        # (the default) instead of the live one makes `_merge_configs` see no
+        # backend change — so it carries that garbage string into
+        # `create_session` as the model.
+        self.bridge.harness.models_by_backend = {"claude": [], "codex": []}
+        self.bridge.mapping.link(Anchor("c1"), "s1")
+        self.bridge.mm.channels["c1"] = {
+            "id": "c1", "purpose": "agent-harness session s1",
+        }
+        self.bridge.harness.sessions_meta = [{
+            "id": "s1", "backend": "codex", "model": "gpt-5.4",
+            "project": {"path": "/tmp/proj", "name": "proj"}, "origin": "harness",
+        }]
+
+        await self.bridge._on_mm_posted({
+            "channel_id": "c1", "message": ".backend claude",
+            "user_id": "u1", "type": "",
+        })
+
+        created = self.bridge.harness.created[-1]
+        self.assertEqual(created["backend"], "claude")
+        # The real backend DID change (codex → claude), so the model drops to
+        # the new backend's default rather than carrying the Purpose's text.
+        self.assertNotEqual(created["model"], "agent-harness session s1")
+        self.assertNotIn(
+            "agent-harness session", self.bridge.mm.channels["c1"]["purpose"],
+        )
+
+    async def test_dot_backend_unreadable_config_refuses_the_switch(self):
+        # Unreadable Channel Purpose → the channel's cwd and autorespond flag
+        # are unknown, and `_persist_purpose` couldn't write the result back
+        # anyway. Refuse rather than restart on guessed values.
+        self.bridge.mapping.link(Anchor("c1"), "s1")
+        self.bridge.harness.sessions_meta = [{
+            "id": "s1", "backend": "codex", "model": "gpt-5.4",
+            "project": {"path": "/tmp/proj", "name": "proj"}, "origin": "harness",
+        }]
+
+        def _boom(_channel_id):
+            raise RuntimeError("mattermost unreachable")
+
+        self.bridge.mm.get_channel = _boom
+
+        await self.bridge._on_mm_posted({
+            "channel_id": "c1", "message": ".backend claude",
+            "user_id": "u1", "type": "",
+        })
+
+        self.assertEqual(self.bridge.harness.created, [])
+        self.assertEqual(self.bridge.mm.purposes, [])
+        joined = "\n".join(self._posted_texts()).lower()
+        self.assertIn("configuration", joined)
+        self.assertNotIn("backend set", joined)
+
 
 class CommandCwdTests(_BridgeTestCase):
     """`.cwd [<path>]` — the in-chat route to a channel's working directory.
@@ -3443,6 +3689,31 @@ class CommandCwdTests(_BridgeTestCase):
         self.assertIn("mention-only", written)
         self.assertIn(f"cwd={target}", written)
         self.assertNotIn("claude", written)
+
+    async def test_token_less_purpose_keeps_the_live_backend(self):
+        # A spawn/`.invite`-created channel's Purpose ("agent-harness session
+        # <id>") carries no config tokens, so it parses to pure defaults —
+        # moving the directory must not also move a codex session to claude.
+        target = str(Path(self.tmp.name) / "repo")
+        Path(target).mkdir()
+        self.bridge.mapping.link(Anchor("c1"), "s1")
+        self.bridge.mm.channels["c1"] = {
+            "id": "c1", "purpose": "agent-harness session s1",
+        }
+        self.bridge.harness.sessions_meta = [{
+            "id": "s1", "backend": "codex", "model": "gpt-5.4",
+            "project": {"path": "/tmp/proj", "name": "proj"}, "origin": "harness",
+        }]
+
+        await self.bridge._on_mm_posted({
+            "channel_id": "c1", "message": f".cwd {target}",
+            "user_id": "u1", "type": "",
+        })
+
+        created = self.bridge.harness.created[-1]
+        self.assertEqual(created["backend"], "codex")
+        self.assertEqual(created["cwd"], target)
+        self.assertIn("codex", self.bridge.mm.channels["c1"]["purpose"])
 
     async def test_unreadable_config_refuses_the_switch(self):
         # If the Channel Purpose can't be read we can't know the channel's
