@@ -1572,8 +1572,8 @@ class Bridge:
         We keep the MM channel and mapping slot; only the harness session is
         replaced. The old session is abandoned (no explicit backend delete).
         The new session starts QUIET — no greeting run — because the only
-        callers (`.model` / `.backend`) post their own confirmation; the next
-        user message is the new session's first turn.
+        callers (`.model` / `.backend` / `.cwd`) post their own confirmation;
+        the next user message is the new session's first turn.
 
         Returns the new session id on success, or ``None`` if the restart
         failed — in which case the channel's prior (still-live) session
@@ -1793,7 +1793,7 @@ class Bridge:
             hint = f"_mention-only mode — @mention me to talk._\n{hint}"
         config_hint = (
             "_Reconfigure anytime with `.model <name>` · `.backend <name>` · "
-            "`.autorespond`; `.help` for the full list._"
+            "`.cwd <path>` · `.autorespond`; `.help` for the full list._"
         )
         return f"{head}\n\n{hint}\n\n{config_hint}"
 
@@ -2625,7 +2625,9 @@ class Bridge:
         if not session_id and channel_id in self._dormant_channels:
             # Commands with a pre-session answer read the channel's effective
             # config, so ensure it's loaded (and cached) first.
-            if spec.name in {"backend", "model", "models", "autorespond", "status"}:
+            if spec.name in {
+                "backend", "model", "cwd", "models", "autorespond", "status",
+            }:
                 try:
                     await self._load_channel_config(channel_id)
                 except Exception:
@@ -2645,6 +2647,11 @@ class Bridge:
                 return
             if spec.name == "model":
                 await self._cmd_dormant_model(
+                    channel_id, parsed.arg, thread_root,
+                )
+                return
+            if spec.name == "cwd":
+                await self._cmd_dormant_cwd(
                     channel_id, parsed.arg, thread_root,
                 )
                 return
@@ -2673,6 +2680,8 @@ class Bridge:
             await self._cmd_model(channel_id, session_id, parsed.arg, thread_root)
         elif spec.name == "backend":
             await self._cmd_backend(channel_id, session_id, parsed.arg, thread_root)
+        elif spec.name == "cwd":
+            await self._cmd_cwd(channel_id, session_id, parsed.arg, thread_root)
         elif spec.name == "models":
             await self._cmd_models(channel_id, session_id, thread_root)
         elif spec.name == "running":
@@ -2810,7 +2819,7 @@ class Bridge:
     def _config_switch_blocked_in_thread(
         self, channel_id: str, thread_root: str | None, usage: str,
     ) -> bool:
-        """Refuse a `.model`/`.backend` SWITCH issued inside a thread fork.
+        """Refuse a `.model`/`.backend`/`.cwd` SWITCH inside a thread fork.
 
         ``_restart_session_with_config`` only unlinks/relinks
         ``Anchor(channel_id)``, so a switch inside a thread would replace the
@@ -3092,6 +3101,219 @@ class Bridge:
             f":gear: Backend set to `{requested}` — session restarted "
             f"(model reset to the `{requested}` default). "
             "If the backend rejects it, the error will appear above.",
+            thread_root,
+        )
+
+    def _validate_cwd(self, raw: str) -> tuple[str | None, str | None]:
+        """Resolve a user-supplied `.cwd` value → ``(absolute_path, problem)``.
+
+        Exactly one of the two is non-None. Deliberately stricter than the
+        Channel Purpose parser: an unusable ``cwd=`` token there degrades
+        silently to ``config.default_cwd``, whereas the command can name the
+        exact failure — so we refuse rather than confirm a directory the
+        session would never get.
+
+        ``~`` IS expanded here (``purpose._parse_cwd_token`` is strict and
+        doesn't), which is why callers persist the returned absolute path
+        rather than the typed one.
+        """
+        try:
+            candidate = Path(raw).expanduser()
+        except (OSError, ValueError, RuntimeError):
+            return None, f"`{raw}` is not a usable path."
+        if not candidate.is_absolute():
+            return None, (
+                f"`{raw}` is not an absolute path — give a full path, "
+                "e.g. `/srv/repos/thing`."
+            )
+        try:
+            exists, is_dir = candidate.exists(), candidate.is_dir()
+        except OSError:
+            exists, is_dir = False, False
+        if not exists:
+            return None, f"`{candidate}` does not exist."
+        if not is_dir:
+            return None, f"`{candidate}` is not a directory."
+        resolved = resolve_attachment_path(
+            str(candidate), project_path=None,
+            allowed_roots=self.config.allowed_attachment_roots,
+        )
+        if resolved is None:
+            roots = describe_allowed_roots(
+                None, self.config.allowed_attachment_roots,
+            )
+            return None, (
+                f"`{candidate}` is outside the allowed roots — sessions can "
+                f"only run under {roots}."
+            )
+        # The Channel Purpose is a comma-separated config list, so a cwd
+        # containing a comma can't round-trip: `purpose.parse` would split it
+        # into a truncated path plus a stray token. Checked on the RESOLVED
+        # path — the value actually persisted — so a symlink pointing at a
+        # comma-bearing directory is caught too.
+        if "," in str(resolved):
+            return None, (
+                f"`{resolved}` contains a comma. The Channel Purpose stores "
+                "the working directory in a comma-separated list, so such a "
+                "path can't be saved — move or symlink it somewhere without "
+                "a comma."
+            )
+        return str(resolved), None
+
+    async def _cmd_cwd(
+        self,
+        channel_id: str,
+        session_id: str,
+        arg: str | None,
+        thread_root: str | None,
+    ) -> None:
+        """`.cwd [<path>]` — show the session's working directory, or move it.
+
+        Bare is a pure read, so it works inside a thread fork. A set has to
+        recreate the session (the harness has no cwd-mutate endpoint), which
+        puts it under the same rules as `.model` / `.backend`: refused inside
+        a thread fork, and refused while a run is in flight.
+        """
+        # A cold ``purpose_by_channel`` is the ORDINARY state for a mapped
+        # channel after a daemon restart: ``_bootstrap_known_sessions`` doesn't
+        # populate it, and the dot-command preload only covers dormant
+        # channels. Load it from the Channel Purpose before touching anything —
+        # rebuilding it from config defaults below would silently rewrite the
+        # channel's backend, model and autorespond flag (a codex channel would
+        # come back as claude) while the confirmation claims the directory was
+        # the only thing that moved.
+        cfg = self.purpose_by_channel.get(channel_id)
+        if cfg is None:
+            try:
+                cfg = await self._load_channel_config(channel_id)
+            except Exception:
+                logger.exception(
+                    "`.cwd` could not load the channel config for %s", channel_id,
+                )
+                cfg = None
+        try:
+            meta = await self.harness.get_session(session_id) or {}
+        except Exception:
+            logger.debug("`.cwd` harness get_session failed", exc_info=True)
+            meta = {}
+        current = (meta.get("project") or {}).get("path") or (
+            self._resolve_cwd(cfg)[0] if cfg else self.config.default_cwd
+        )
+
+        # Bare `.cwd` → report where this session is actually running.
+        if not arg:
+            self._post_cmd_reply(
+                channel_id,
+                f":file_folder: Current directory: `{current}`. "
+                "Change with `.cwd <path>` (restarts the session).",
+                thread_root,
+            )
+            return
+
+        # A switch inside a thread would restart the wrong (channel) session.
+        if self._config_switch_blocked_in_thread(channel_id, thread_root, ".cwd <path>"):
+            return
+
+        target, problem = self._validate_cwd(arg)
+        if problem:
+            self._post_cmd_reply(channel_id, f":warning: {problem}", thread_root)
+            return
+        if target == current:
+            self._post_cmd_reply(
+                channel_id,
+                f":information_source: Already running in `{target}`.",
+                thread_root,
+            )
+            return
+
+        # Switching mid-run would orphan the active run — refuse.
+        if self._session_has_active_run(session_id):
+            self._post_cmd_reply(
+                channel_id,
+                ":warning: A run is active — `.stop` it first, then `.cwd <path>`.",
+                thread_root,
+            )
+            return
+
+        if cfg is None:
+            # The load above failed, so the channel's backend/model are
+            # unknown. Guessing them would persist a config the user never
+            # chose — and we couldn't write the Purpose anyway.
+            self._post_cmd_reply(
+                channel_id,
+                ":warning: Could not read this channel's configuration — "
+                "leaving the session where it is rather than restarting it "
+                "with a guessed backend and model.",
+                thread_root,
+            )
+            return
+
+        # Only the directory moves: backend, model and the autorespond flag
+        # carry over untouched (unlike `.backend`, where the model can't
+        # survive the swap).
+        new_cfg = purpose.PurposeConfig(
+            backend=cfg.backend,
+            model=cfg.model,
+            mention_only=cfg.mention_only,
+            cwd=target,
+            warnings=[],
+        )
+        new_session = await self._restart_session_with_config(
+            channel_id, session_id, new_cfg,
+        )
+        if not new_session:
+            # The restart failed; `_restart_session_with_config` already posted
+            # a warning and restored the prior session. Don't claim success or
+            # persist a directory the channel isn't actually in.
+            return
+        self._persist_purpose(channel_id, new_cfg)
+        self._post_cmd_reply(
+            channel_id,
+            f":file_folder: Working directory set to `{target}` — "
+            "session restarted there.",
+            thread_root,
+        )
+
+    async def _cmd_dormant_cwd(
+        self, channel_id: str, arg: str | None, thread_root: str | None,
+    ) -> None:
+        """Read or persist a working directory without creating a session."""
+        cfg = self.purpose_by_channel[channel_id]
+        current = self._resolve_cwd(cfg)[0]
+        if not arg:
+            self._post_cmd_reply(
+                channel_id,
+                f":file_folder: Directory for the next session: `{current}`. "
+                "Change with `.cwd <path>`.",
+                thread_root,
+            )
+            return
+
+        target, problem = self._validate_cwd(arg)
+        if problem:
+            self._post_cmd_reply(channel_id, f":warning: {problem}", thread_root)
+            return
+        if target == current:
+            self._post_cmd_reply(
+                channel_id,
+                f":information_source: Already configured for `{target}`.",
+                thread_root,
+            )
+            return
+
+        updated = purpose.PurposeConfig(
+            backend=cfg.backend,
+            model=cfg.model,
+            mention_only=cfg.mention_only,
+            cwd=target,
+            warnings=[],
+        )
+        self.purpose_by_channel[channel_id] = updated
+        self._persist_purpose(channel_id, updated)
+        self._post_cmd_reply(
+            channel_id,
+            f":file_folder: Working directory set to `{target}` — "
+            "it will apply when the session starts.",
             thread_root,
         )
 

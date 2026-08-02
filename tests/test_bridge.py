@@ -3290,6 +3290,358 @@ class CommandBackendTests(_BridgeTestCase):
         self.assertEqual(self.bridge.harness.sent, [("s1", "still here")])
 
 
+class CommandCwdTests(_BridgeTestCase):
+    """`.cwd [<path>]` — the in-chat route to a channel's working directory.
+
+    Mirrors `.backend`: bare reads (never restarts), a set validates the path
+    up-front and then either persists it (dormant) or recreates the session
+    there (active). Validation is stricter than the Channel Purpose parser
+    because a bad value there degrades silently to `default_cwd`, whereas the
+    command can say exactly what's wrong.
+    """
+
+    def _posted_texts(self) -> list[str]:
+        return [p.message for p in self.bridge.mm.posted]
+
+    def _joined(self) -> str:
+        return "\n".join(self._posted_texts()).lower()
+
+    def _active_channel(self, cwd: str = "/tmp/proj") -> None:
+        from mm_bridge.purpose import PurposeConfig
+        self.bridge.mapping.link(Anchor("c1"), "s1")
+        self.bridge.purpose_by_channel["c1"] = PurposeConfig(
+            backend="claude", model="opus", mention_only=False, cwd=cwd,
+        )
+        self.bridge.mm.channels["c1"] = {
+            "id": "c1", "purpose": f"claude, opus, cwd={cwd}",
+        }
+        self.bridge.harness.sessions_meta = [{
+            "id": "s1", "backend": "claude", "model": "opus",
+            "project": {"path": cwd, "name": Path(cwd).name}, "origin": "harness",
+        }]
+
+    async def _dormant_channel(self, purpose_text: str = "") -> None:
+        self.bridge.mm.channels["c1"] = {
+            "id": "c1", "purpose": purpose_text, "display_name": "Test channel",
+        }
+        await self.bridge._on_mm_user_added("c1", self.bridge.mm.bot_user_id)
+
+    # ── bare read ────────────────────────────────────────────────────────
+
+    async def test_bare_cwd_reports_the_running_session_directory(self):
+        self._active_channel(cwd="/tmp/proj")
+
+        await self.bridge._on_mm_posted({
+            "channel_id": "c1", "message": ".cwd", "user_id": "u1", "type": "",
+        })
+
+        self.assertEqual(self.bridge.harness.created, [])
+        self.assertIn("/tmp/proj", "\n".join(self._posted_texts()))
+
+    async def test_bare_cwd_dormant_reports_the_next_sessions_directory(self):
+        await self._dormant_channel()
+
+        await self.bridge._on_mm_posted({
+            "channel_id": "c1", "message": ".cwd", "user_id": "u1", "type": "",
+        })
+
+        self.assertEqual(self.bridge.harness.created, [])
+        # `default_cwd` from the fixture — what the first message would use.
+        self.assertIn("/tmp/proj", "\n".join(self._posted_texts()))
+
+    # ── set: dormant channel ─────────────────────────────────────────────
+
+    async def test_dormant_set_persists_to_purpose_without_creating_a_session(self):
+        from mm_bridge import purpose as purpose_mod
+        target = str(Path(self.tmp.name) / "repo")
+        Path(target).mkdir()
+        await self._dormant_channel()
+
+        await self.bridge._on_mm_posted({
+            "channel_id": "c1", "message": f".cwd {target}",
+            "user_id": "u1", "type": "",
+        })
+
+        self.assertEqual(self.bridge.harness.created, [])
+        self.assertEqual(self.bridge.harness.sent, [])
+        self.assertEqual(self.bridge.purpose_by_channel["c1"].cwd, target)
+        # Round-trip: what we wrote to the Purpose parses back to the same cwd.
+        written = self.bridge.mm.channels["c1"]["purpose"]
+        self.assertIn(f"cwd={target}", written)
+        reparsed = purpose_mod.parse(
+            written, "claude", None, lambda _b: [],
+        )
+        self.assertEqual(reparsed.cwd, target)
+        self.assertEqual(reparsed.warnings, [])
+
+    async def test_dormant_set_then_first_message_starts_session_there(self):
+        target = str(Path(self.tmp.name) / "repo")
+        Path(target).mkdir()
+        await self._dormant_channel()
+
+        await self.bridge._on_mm_posted({
+            "channel_id": "c1", "message": f".cwd {target}",
+            "user_id": "u1", "type": "",
+        })
+        await self.bridge._on_mm_posted({
+            "id": "engage-1", "channel_id": "c1",
+            "message": "@claude have a look", "user_id": "u1", "type": "",
+        })
+
+        self.assertEqual(len(self.bridge.harness.created), 1)
+        self.assertEqual(self.bridge.harness.created[0]["cwd"], target)
+
+    # ── set: active channel ──────────────────────────────────────────────
+
+    async def test_active_set_recreates_the_session_in_the_new_directory(self):
+        target = str(Path(self.tmp.name) / "repo")
+        Path(target).mkdir()
+        self._active_channel()
+
+        await self.bridge._on_mm_posted({
+            "channel_id": "c1", "message": f".cwd {target}",
+            "user_id": "u1", "type": "",
+        })
+
+        self.assertTrue(self.bridge.harness.created)
+        self.assertEqual(self.bridge.harness.created[-1]["cwd"], target)
+        # Backend/model survive a cwd change — only the directory moves.
+        self.assertEqual(self.bridge.harness.created[-1]["backend"], "claude")
+        self.assertEqual(self.bridge.harness.created[-1]["model"], "opus")
+        self.assertEqual(self.bridge.purpose_by_channel["c1"].cwd, target)
+        self.assertIn(f"cwd={target}", self.bridge.mm.channels["c1"]["purpose"])
+
+    async def test_cold_config_cache_keeps_backend_model_and_autorespond(self):
+        # `purpose_by_channel` is EMPTY for every mapped channel after a daemon
+        # restart — `_bootstrap_known_sessions` never populates it, and the
+        # dot-command preload only runs for dormant channels. Rebuilding the
+        # config from bare defaults here would silently turn a codex channel
+        # into claude and reset the autorespond flag, then write that wrong
+        # config back to the Channel Purpose while the confirmation claims
+        # only the directory moved.
+        target = str(Path(self.tmp.name) / "repo")
+        Path(target).mkdir()
+        self.bridge.mapping.link(Anchor("c1"), "s1")
+        self.bridge.mm.channels["c1"] = {
+            "id": "c1", "purpose": "codex, gpt-5.4, mention-only",
+        }
+        self.assertNotIn("c1", self.bridge.purpose_by_channel)  # cold cache
+
+        await self.bridge._on_mm_posted({
+            "channel_id": "c1", "message": f".cwd {target}",
+            "user_id": "u1", "type": "",
+        })
+
+        created = self.bridge.harness.created[-1]
+        self.assertEqual(created["backend"], "codex")
+        self.assertEqual(created["model"], "gpt-5.4")
+        self.assertEqual(created["cwd"], target)
+        self.assertTrue(self.bridge.purpose_by_channel["c1"].mention_only)
+        written = self.bridge.mm.channels["c1"]["purpose"]
+        self.assertIn("codex", written)
+        self.assertIn("gpt-5.4", written)
+        self.assertIn("mention-only", written)
+        self.assertIn(f"cwd={target}", written)
+        self.assertNotIn("claude", written)
+
+    async def test_unreadable_config_refuses_the_switch(self):
+        # If the Channel Purpose can't be read we can't know the channel's
+        # backend/model — moving the session anyway would guess them. Refuse
+        # instead (we couldn't persist the result either).
+        target = str(Path(self.tmp.name) / "repo")
+        Path(target).mkdir()
+        self.bridge.mapping.link(Anchor("c1"), "s1")
+
+        def _boom(_channel_id):
+            raise RuntimeError("mattermost unreachable")
+
+        self.bridge.mm.get_channel = _boom
+
+        await self.bridge._on_mm_posted({
+            "channel_id": "c1", "message": f".cwd {target}",
+            "user_id": "u1", "type": "",
+        })
+
+        self.assertEqual(self.bridge.harness.created, [])
+        self.assertIn("configuration", self._joined())
+
+    async def test_failed_restart_does_not_persist_the_new_directory(self):
+        # Mirrors the `.backend` failed-restart contract: no success claim and
+        # no Purpose write for a directory the channel isn't actually in.
+        old = str(Path(self.tmp.name) / "old")
+        Path(old).mkdir()
+        target = str(Path(self.tmp.name) / "repo")
+        Path(target).mkdir()
+        self._active_channel(cwd=old)
+
+        async def failing_create(**_kwargs):
+            raise RuntimeError("harness down")
+
+        self.bridge.harness.create_session = failing_create
+
+        await self.bridge._on_mm_posted({
+            "channel_id": "c1", "message": f".cwd {target}",
+            "user_id": "u1", "type": "",
+        })
+
+        # Channel keeps talking to its old, still-live session.
+        self.assertEqual(self.bridge.mapping.get_session(Anchor("c1")), "s1")
+        self.assertEqual(self.bridge.purpose_by_channel["c1"].cwd, old)
+        self.assertNotIn(f"cwd={target}", self.bridge.mm.channels["c1"]["purpose"])
+        joined = self._joined()
+        self.assertNotIn("session restarted there", joined)
+
+    async def test_comma_in_path_refused_because_purpose_is_comma_separated(self):
+        # The Channel Purpose is a comma-separated config list, so a cwd
+        # containing a comma reparses to a truncated path plus a stray-token
+        # warning. Refuse rather than persist something that can't round-trip.
+        target = Path(self.tmp.name) / "a,b"
+        target.mkdir()
+        self._active_channel()
+
+        await self.bridge._on_mm_posted({
+            "channel_id": "c1", "message": f".cwd {target}",
+            "user_id": "u1", "type": "",
+        })
+
+        self.assertEqual(self.bridge.harness.created, [])
+        joined = self._joined()
+        self.assertIn("comma", joined)
+        self.assertNotIn(f"cwd={target}", self.bridge.mm.channels["c1"]["purpose"])
+
+    async def test_active_set_refuses_while_run_active(self):
+        target = str(Path(self.tmp.name) / "repo")
+        Path(target).mkdir()
+        self._active_channel()
+        self.bridge.current_run_id_by_session["s1"] = "run-s1"
+
+        await self.bridge._on_mm_posted({
+            "channel_id": "c1", "message": f".cwd {target}",
+            "user_id": "u1", "type": "",
+        })
+
+        self.assertEqual(self.bridge.harness.created, [])
+        self.assertIn("run is active", self._joined())
+
+    async def test_active_set_to_same_directory_is_a_noop(self):
+        target = str(Path(self.tmp.name) / "repo")
+        Path(target).mkdir()
+        self._active_channel(cwd=target)
+
+        await self.bridge._on_mm_posted({
+            "channel_id": "c1", "message": f".cwd {target}",
+            "user_id": "u1", "type": "",
+        })
+
+        self.assertEqual(self.bridge.harness.created, [])
+        self.assertIn("already", self._joined())
+
+    # ── validation ───────────────────────────────────────────────────────
+
+    async def test_relative_path_rejected_naming_the_absolute_requirement(self):
+        self._active_channel()
+
+        await self.bridge._on_mm_posted({
+            "channel_id": "c1", "message": ".cwd projects/foo",
+            "user_id": "u1", "type": "",
+        })
+
+        self.assertEqual(self.bridge.harness.created, [])
+        joined = self._joined()
+        self.assertIn("absolute", joined)
+        self.assertNotIn("does not exist", joined)
+
+    async def test_missing_path_rejected_naming_existence(self):
+        missing = str(Path(self.tmp.name) / "nope")
+        self._active_channel()
+
+        await self.bridge._on_mm_posted({
+            "channel_id": "c1", "message": f".cwd {missing}",
+            "user_id": "u1", "type": "",
+        })
+
+        self.assertEqual(self.bridge.harness.created, [])
+        joined = self._joined()
+        self.assertIn("does not exist", joined)
+        self.assertNotIn("absolute", joined)
+
+    async def test_file_path_rejected_as_not_a_directory(self):
+        f = Path(self.tmp.name) / "a-file.txt"
+        f.write_text("x")
+        self._active_channel()
+
+        await self.bridge._on_mm_posted({
+            "channel_id": "c1", "message": f".cwd {f}",
+            "user_id": "u1", "type": "",
+        })
+
+        self.assertEqual(self.bridge.harness.created, [])
+        self.assertIn("not a directory", self._joined())
+
+    async def test_tilde_is_expanded_and_the_absolute_path_persisted(self):
+        import os
+        from unittest import mock
+        home = Path(self.tmp.name) / "home"
+        (home / "work").mkdir(parents=True)
+        self._active_channel()
+
+        with mock.patch.dict(os.environ, {"HOME": str(home)}):
+            await self.bridge._on_mm_posted({
+                "channel_id": "c1", "message": ".cwd ~/work",
+                "user_id": "u1", "type": "",
+            })
+
+        expanded = str(home / "work")
+        self.assertEqual(self.bridge.harness.created[-1]["cwd"], expanded)
+        # The Purpose parser is strict (no `~` expansion) — persist absolute.
+        self.assertIn(f"cwd={expanded}", self.bridge.mm.channels["c1"]["purpose"])
+
+    async def test_path_outside_allowed_roots_rejected_naming_the_roots(self):
+        # `_resolve_cwd` silently degrades an out-of-root cwd to `default_cwd`,
+        # so the command must refuse rather than confirm a directory the
+        # session would never get.
+        from doubles import make_bridge
+        allowed = Path(self.tmp.name) / "allowed"
+        allowed.mkdir()
+        outside = Path(self.tmp.name) / "elsewhere"
+        outside.mkdir()
+        self.bridge = make_bridge(
+            self.tmp.name, echoing=False,
+            allowed_attachment_roots=[str(allowed)],
+        )
+        self._active_channel()
+
+        await self.bridge._on_mm_posted({
+            "channel_id": "c1", "message": f".cwd {outside}",
+            "user_id": "u1", "type": "",
+        })
+
+        self.assertEqual(self.bridge.harness.created, [])
+        joined = "\n".join(self._posted_texts())
+        self.assertIn("allowed", joined.lower())
+        self.assertIn(str(allowed), joined)
+
+    async def test_no_session_and_not_dormant_replies_no_session(self):
+        await self.bridge._on_mm_posted({
+            "channel_id": "c-unmapped", "message": ".cwd /tmp",
+            "user_id": "u1", "type": "",
+        })
+
+        self.assertEqual(self.bridge.harness.created, [])
+        self.assertIn("no session", self._joined())
+
+    # ── discoverability ──────────────────────────────────────────────────
+
+    async def test_help_lists_cwd(self):
+        self.bridge.mapping.link(Anchor("c1"), "s1")
+
+        await self.bridge._on_mm_posted({
+            "channel_id": "c1", "message": ".help", "user_id": "u1", "type": "",
+        })
+
+        self.assertIn(".cwd", "\n".join(self._posted_texts()))
+
+
 class ThreadConfigSwitchTests(_BridgeTestCase):
     """`.model <name>` / `.backend <name>` must be REFUSED inside a thread
     fork: `_restart_session_with_config` only relinks `Anchor(channel)`, so a
@@ -3339,6 +3691,39 @@ class ThreadConfigSwitchTests(_BridgeTestCase):
         self.assertEqual(self.bridge.mapping.get_session(Anchor("c1")), "s-chan")
         joined = "\n".join(self._posted_texts()).lower()
         self.assertIn("thread", joined)
+
+    async def test_dot_cwd_switch_in_thread_refused(self):
+        self._setup_forked_thread()
+        target = str(Path(self.tmp.name) / "repo")
+        Path(target).mkdir()
+
+        await self.bridge._on_mm_posted({
+            "channel_id": "c1", "message": f".cwd {target}", "root_id": "root1",
+            "user_id": "u1", "type": "",
+        })
+
+        self.assertEqual(self.bridge.harness.created, [])
+        self.assertEqual(self.bridge.mapping.get_session(Anchor("c1")), "s-chan")
+        self.assertEqual(
+            self.bridge.mapping.get_session(Anchor("c1", "root1")), "s-fork",
+        )
+        joined = "\n".join(self._posted_texts()).lower()
+        self.assertIn("thread", joined)
+
+    async def test_bare_cwd_in_thread_still_reports_the_forks_directory(self):
+        self._setup_forked_thread()
+        self.bridge.harness.sessions_meta = [{
+            "id": "s-fork", "backend": "codex", "model": "gpt-5.5",
+            "project": {"path": "/fork-dir", "name": "fork-dir"}, "origin": "harness",
+        }]
+
+        await self.bridge._on_mm_posted({
+            "channel_id": "c1", "message": ".cwd", "root_id": "root1",
+            "user_id": "u1", "type": "",
+        })
+
+        self.assertEqual(self.bridge.harness.created, [])
+        self.assertIn("/fork-dir", "\n".join(self._posted_texts()))
 
     async def test_bare_model_in_thread_still_reports(self):
         self._setup_forked_thread()  # channel config is claude/opus

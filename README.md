@@ -212,7 +212,7 @@ than reaching the agent.
 
 Manual invites and auto-joins use the same **dormant channel** state: no
 harness session or LLM turn exists yet. Channel-local commands — `.help`,
-`.status`, `.stop`, `.backend`, `.model`, `.models`, `.autorespond` — work
+`.status`, `.stop`, `.backend`, `.model`, `.cwd`, `.models`, `.autorespond` — work
 immediately without a mention (the config commands persist their settings in
 the Channel Purpose). The first conversational post creates exactly one session
 with the final configuration. Only global listings/actions (`.sessions`,
@@ -231,6 +231,7 @@ the first session is warming up are routed normally once mapping completes.
 | `.status` | Session id, backend, model, cwd, autorespond flag, run state, harness status. |
 | `.model [<name>]` | Show or select the model. In a dormant channel it configures the future session without creating one. In an active channel it recreates the session, so `.stop` any active run first. Names are free text; a bad one fails loudly when the backend starts. |
 | `.backend [<name>]` | Show or select the backend. In a dormant channel it configures the future session without creating one. In an active channel it recreates the session. Validated against known backends (`claude`, `codex`, …); changing it **resets the model to that backend's default**. |
+| `.cwd [<path>]` | Show or set the working directory — see [Which directory a session starts in](#which-directory-a-session-starts-in). In a dormant channel it configures the future session without creating one. In an active channel it recreates the session there, so `.stop` any active run first. The path must be absolute (`~` is expanded), be an existing directory, and contain no comma; the absolute result is persisted as `cwd=<path>` in the Channel Purpose. |
 | `.models` | List the available models for this channel's backend (from the `[models]` config table + the harness catalog), marking the current one. |
 | `.running` | Sessions with a run in flight right now. |
 | `.sessions [N]` | The N most recent sessions across all agents — including terminal (TUI) sessions not yet on Mattermost. Each shows its channel or an `.invite` hint. |
@@ -238,10 +239,43 @@ the first session is warming up are routed normally once mapping completes.
 
 Before first engagement, `.status` reports the config the first message will
 start with (backend, model, cwd, autorespond flag); `.stop` replies "No session
-in this channel". `.model` and `.backend` configure that future session instead.
-Inside a **thread fork**, bare `.model` / `.backend` (read-only) work, but a
-*switch* (`.model <name>` / `.backend <name>`) is refused — a restart would
-replace the channel's session, not the thread's. Switch from the channel.
+in this channel". `.model`, `.backend` and `.cwd` configure that future session
+instead. Inside a **thread fork**, bare `.model` / `.backend` / `.cwd`
+(read-only) work, but a *switch* (`.model <name>` / `.backend <name>` /
+`.cwd <path>`) is refused — a restart would replace the channel's session, not
+the thread's. Switch from the channel.
+
+## Which directory a session starts in
+
+Four levers, from broadest to narrowest:
+
+| Lever | Applies to | Where you set it |
+|---|---|---|
+| `default_cwd` | every new session | `config.toml` (or `MM_BRIDGE_DEFAULT_CWD`) |
+| `mm-bridge spawn --cwd <path>` | the one session being spawned | at spawn time (defaults to the caller's cwd) |
+| `cwd=<path>` in the **Channel Purpose** | that channel's sessions | Channel Menu → Edit Channel Purpose |
+| `.cwd <path>` | that channel's sessions | typed in the channel |
+
+The last two are the same setting from two directions: `.cwd <path>` validates
+the path and then writes `cwd=<path>` into the Channel Purpose, so a channel
+configured either way behaves identically. Prefer `.cwd` — it checks the path
+before committing to it, expands `~`, and says which check failed, whereas the
+Purpose parser is strict (absolute paths only, no `~` expansion) and a value it
+can't use degrades silently to `default_cwd`.
+
+Because the Purpose is a **comma-separated** config list, a working directory
+whose path contains a comma can't be stored either way — `.cwd` refuses it
+outright rather than writing something that reparses into a truncated path.
+
+A cwd only takes effect when a session is **created**, so changing it in an
+active channel recreates the session — the harness has no cwd-mutate endpoint.
+That's why `.cwd <path>` refuses while a run is in flight (`.stop` it first) and
+inside a thread fork, exactly like `.model` / `.backend`.
+
+When `allowed_attachment_roots` is configured, a session's cwd must sit under
+one of those roots: `.cwd` rejects an out-of-root path inline and names the
+roots, and an out-of-root `cwd=` token in the Purpose is dropped with a warning
+posted to the channel.
 
 ## Inside-a-session directives
 

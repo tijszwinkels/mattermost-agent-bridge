@@ -98,6 +98,11 @@ _SPECS: tuple[CommandSpec, ...] = (
         session_scoped=True,
     ),
     CommandSpec(
+        "cwd", ".cwd [<path>]",
+        "Show/set the working directory (configures the next session if dormant).",
+        session_scoped=True,
+    ),
+    CommandSpec(
         "models", ".models",
         "List the available models for this channel's backend.",
     ),

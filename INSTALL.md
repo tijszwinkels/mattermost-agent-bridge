@@ -117,8 +117,8 @@ The two services are public repos — you will clone them in Steps 4 and 5:
 | 11 | **Autorespond default** — reply to every message, or only when `@mentioned`? | **mention-only** (off) |
 | 12 | **Default backend** for new channels — `claude`, `codex`, and `pi` are all first-class. Sensible default: **whichever agent is running this install**, since it's demonstrably installed + authed on this host. | the installing agent |
 | 13 | **Default model** per backend (`claude` / `codex`). **`pi` needs none** — the harness is model-optional for it (agent-harness PR #34, deployed). | `claude=opus, codex=gpt-5.5` |
-| 14 | **`default_cwd`** — working dir new sessions start in: the user's *code* root, **distinct from the install dir** (Q2 — tooling, not workspace). | `~/projects` |
-| 15 | **`allowed_attachment_roots`** — directories the bridge may upload files from via `<openFile>`. Include a scratch dir (`~/mm-attachments`) so agents have an unambiguous place to stage generated files — otherwise they reach for `/tmp`, which is outside the roots and silently fails to attach. | `["~/projects", "~/mm-attachments"]` |
+| 14 | **`default_cwd`** — working dir new sessions start in: the user's *code* root, **distinct from the install dir** (Q2 — tooling, not workspace). Only a default: any channel can override it in-chat with `.cwd <path>` (persisted in its Channel Purpose), and `mm-bridge spawn --cwd` overrides it per spawn. | `~/projects` |
+| 15 | **`allowed_attachment_roots`** — directories the bridge may upload files from via `<openFile>`. Include a scratch dir (`~/mm-attachments`) so agents have an unambiguous place to stage generated files — otherwise they reach for `/tmp`, which is outside the roots and silently fails to attach. These roots also bound the per-channel cwd overrides (`.cwd <path>` / `cwd=` in the Channel Purpose), so keep the user's code root in the list. | `["~/projects", "~/mm-attachments"]` |
 | 16 | **Show tool-use posts?** Coalesced per-turn tool-use placeholders, or hide them (only real replies + errors). | show |
 
 > **Fill this in before continuing:**
@@ -713,10 +713,12 @@ contains the `@…/CLAUDE-include.md` import; and in a Claude Code session bound
    sidecar-dir writable). Sourcing `.env` gives your shell the same `MM_BOT_TOKEN` the
    daemon uses; this subsumes the old `curl localhost:8877/v1/health` check.
 2. In Mattermost, create a channel and `/invite @<bot>` (skip the invite if auto-join is on).
-3. Before posting a conversational message, use `.backend <name>` and/or `.model <name>`; confirm no agent session starts yet.
+3. Before posting a conversational message, use `.backend <name>`, `.model <name>` and/or
+   `.cwd <path>`; confirm no agent session starts yet.
 4. Post `@<bot> hello`. Within a few seconds you get a reply from a session using that configuration.
-5. Type `.status` → shows session id, backend, model, cwd, autorespond flag, harness status.
-6. Type `.help` → lists dot-commands (`.stop`, `.model`, `.sessions`, `.autorespond`, …).
+5. Type `.status` → shows session id, backend, model, cwd, autorespond flag, harness status
+   (the cwd is whatever `.cwd` set, else `default_cwd`).
+6. Type `.help` → lists dot-commands (`.stop`, `.model`, `.cwd`, `.sessions`, `.autorespond`, …).
 
 **✅ Done** when a message to the bot produces a model reply and `.status` reports the
 harness as reachable.

@@ -182,6 +182,26 @@ def test_bare_backend_has_no_arg():
     assert cmd.arg is None
 
 
+def test_cwd_command_is_registered_and_parses():
+    assert "cwd" in REGISTRY
+    cmd = parse(".cwd /home/me/projects/foo")
+    assert cmd.name == "cwd"
+    assert cmd.arg == "/home/me/projects/foo"
+
+
+def test_bare_cwd_has_no_arg():
+    cmd = parse(".cwd")
+    assert cmd.name == "cwd"
+    assert cmd.arg is None
+
+
+def test_cwd_arg_preserves_case_and_tilde():
+    # Paths are case-sensitive and `~` must survive to the handler, which
+    # expands it (the Channel Purpose parser is strict and does not).
+    cmd = parse(".cwd ~/Projects/MM-Bridge")
+    assert cmd.arg == "~/Projects/MM-Bridge"
+
+
 # ---------------------------------------------------------------------------
 # Command capability metadata — the single source of truth the bridge's
 # pre-session (dormant) gate reads. `global_scope` marks operator-wide
@@ -195,8 +215,17 @@ def test_global_scope_flags_only_operator_wide_commands():
     for name in ("sessions", "running", "invite"):
         assert REGISTRY[name].global_scope is True, name
     # These are channel-local: they only read/change THIS channel.
-    for name in ("help", "status", "stop", "model", "backend", "models", "autorespond"):
+    for name in (
+        "help", "status", "stop", "model", "backend", "cwd", "models", "autorespond",
+    ):
         assert REGISTRY[name].global_scope is False, name
+
+
+def test_cwd_is_session_scoped_but_channel_local():
+    # `.cwd` acts on the channel's own session (a set recreates it), exactly
+    # like `.model` / `.backend` — and never reveals cross-channel state.
+    assert REGISTRY["cwd"].session_scoped is True
+    assert REGISTRY["cwd"].global_scope is False
 
 
 def test_status_and_stop_are_session_scoped_but_channel_local():
