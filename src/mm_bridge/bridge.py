@@ -7,7 +7,7 @@ import logging
 import re
 import time
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 from . import (
@@ -1704,26 +1704,24 @@ class Bridge:
         self.purpose_by_channel[channel_id] = cfg
         return cfg
 
-    async def _config_for_restart(
+    async def _config_for_update(
         self, channel_id: str, command: str,
     ) -> purpose.PurposeConfig | None:
-        """Channel config for a dot-command that recreates the session.
+        """Channel config for a dot-command that rewrites and persists it.
 
         A cold ``purpose_by_channel`` is the ORDINARY state for a mapped
         channel after a daemon restart: ``_bootstrap_known_sessions`` doesn't
         populate it, and the dot-command preload only covers dormant channels.
-        So `.model` / `.backend` / `.cwd` must read the Channel Purpose rather
-        than rebuild the config from defaults — that would silently rewrite
-        every setting the command isn't about (the channel's directory, its
-        autorespond flag, and for `.cwd` its backend and model) while the
-        confirmation names only the one thing the user asked to change.
+        So `.model` / `.backend` / `.cwd` / `.autorespond` must read the
+        Channel Purpose rather than rebuild the config from defaults — that
+        would silently rewrite every setting the command isn't about (the
+        channel's directory, its autorespond flag, its backend and model)
+        and then persist the result, while the confirmation names only the
+        one thing the user asked to change.
 
-        Returns ``None`` when the Purpose can't be read; callers refuse the
-        switch via :meth:`_refuse_restart_unknown_config`.
+        Returns ``None`` when the Purpose can't be read; callers refuse via
+        :meth:`_refuse_update_unknown_config`.
         """
-        cfg = self.purpose_by_channel.get(channel_id)
-        if cfg is not None:
-            return cfg
         try:
             return await self._load_channel_config(channel_id)
         except Exception:
@@ -1732,37 +1730,51 @@ class Bridge:
             )
             return None
 
-    def _refuse_restart_unknown_config(
+    def _refuse_update_unknown_config(
         self, channel_id: str, thread_root: str | None, keeping: str,
     ) -> None:
-        """Refuse a session-recreating switch we couldn't read the config for.
+        """Refuse a config change we couldn't read the current config for.
 
-        Restarting on invented values would hand the channel a configuration
-        the user never chose — and ``_persist_purpose`` needs the same channel
-        read that just failed, so the result couldn't be written back anyway.
+        Writing invented values would hand the channel a configuration the
+        user never chose — and ``_persist_purpose`` needs the same channel
+        read that just failed, so it would persist with an empty resume
+        section, wiping that block too.
         """
         self._post_cmd_reply(
             channel_id,
-            ":warning: Could not read this channel's configuration — "
-            f"{keeping} rather than restarting it with guessed settings.",
+            ":warning: Could not read this channel's configuration — the "
+            f"settings I'd have to carry over are stored there. {keeping}.",
             thread_root,
         )
 
-    async def _run_runtime_toggle(self, channel_id: str, token: str) -> None:
+    def _live_backend(
+        self, meta: dict, cfg: purpose.PurposeConfig | None,
+    ) -> str:
+        """The backend this session is actually running on.
+
+        Harness meta wins over the Channel Purpose. Channels created *around*
+        an existing session (`mm-bridge spawn`, `.invite <id>`, bootstrap
+        discovery) get a Purpose of "agent-harness session <id>" — no config
+        tokens — which loads fine and parses to plain defaults, so trusting it
+        would recreate a codex session on claude and persist the flip. The
+        Purpose still owns what meta doesn't carry: cwd and the autorespond
+        flag.
+        """
+        return purpose.canonical_backend(
+            meta.get("backend") or (cfg.backend if cfg else None)
+        ) or self.config.default_backend
+
+    async def _run_runtime_toggle(
+        self, channel_id: str, token: str, current: purpose.PurposeConfig,
+    ) -> None:
         """Flip the channel's mention_only flag from an autorespond token.
 
         The sole caller is ``_cmd_autorespond`` (the `.autorespond` command),
-        which passes the literal ``autorespond`` / ``noautorespond`` token.
-        Flips mention_only and persists to Channel Purpose.
+        which passes the literal ``autorespond`` / ``noautorespond`` token and
+        the channel's current config (see ``_config_for_update`` — everything
+        but the flag is carried through to the persisted Purpose untouched).
         """
         turn_on_autorespond = token.strip().lower() in purpose.AUTORESPOND_ALIASES
-        current = self.purpose_by_channel.get(channel_id) or purpose.PurposeConfig(
-            backend=self.config.default_backend,
-            # Don't bake a model token into the persisted Purpose — the
-            # per-backend default applies at session-create time.
-            model=None,
-            mention_only=not self.config.default_autorespond,
-        )
         updated = purpose.PurposeConfig(
             backend=current.backend,
             model=current.model,
@@ -2754,19 +2766,27 @@ class Bridge:
 
         Reuses ``_run_runtime_toggle`` by translating the intent into the
         literal token it already understands (autorespond / noautorespond).
+
+        Nothing restarts here, but the flag is *persisted* alongside the rest
+        of the config — so a cold cache has to be filled from the Channel
+        Purpose first, or the write wipes the channel's backend, model and
+        `cwd=` tokens (invisibly, until the next session starts on them).
         """
+        cfg = await self._config_for_update(channel_id, ".autorespond")
+        if cfg is None:
+            self._refuse_update_unknown_config(
+                channel_id, thread_root, "Leaving the autorespond flag as it is",
+            )
+            return
         arg_lc = (arg or "").strip().lower()
         if arg_lc == "on":
             turn_on = True
         elif arg_lc == "off":
             turn_on = False
         elif arg_lc == "":
-            cur = self.purpose_by_channel.get(channel_id)
-            mention_only = (
-                cur.mention_only if cur
-                else not self.config.default_autorespond
-            )
-            turn_on = mention_only  # currently mention-only → turn autorespond on
+            # Bare toggles relative to the channel's CURRENT state, which
+            # lives in the Purpose — not in ``config.default_autorespond``.
+            turn_on = cfg.mention_only
         else:
             self._post_cmd_reply(
                 channel_id,
@@ -2777,7 +2797,7 @@ class Bridge:
         token = (
             purpose.AUTORESPOND_TOKEN if turn_on else purpose.NOAUTORESPOND_TOKEN
         )
-        await self._run_runtime_toggle(channel_id, token)
+        await self._run_runtime_toggle(channel_id, token, cfg)
 
     async def _cmd_status(
         self, channel_id: str, session_id: str, thread_root: str | None,
@@ -2982,15 +3002,13 @@ class Bridge:
         Switching recreates the session (the harness has no model-mutate
         endpoint), so it's refused while a run is active.
         """
-        cfg = await self._config_for_restart(channel_id, ".model")
+        cfg = await self._config_for_update(channel_id, ".model")
         try:
             meta = await self.harness.get_session(session_id) or {}
         except Exception:
             logger.debug("`.model` harness get_session failed", exc_info=True)
             meta = {}
-        backend = purpose.canonical_backend(
-            meta.get("backend") or (cfg.backend if cfg else None)
-        ) or self.config.default_backend
+        backend = self._live_backend(meta, cfg)
 
         # Bare `.model` → report the current model + hint `.models`.
         if not arg:
@@ -3022,15 +3040,16 @@ class Bridge:
             return
 
         if cfg is None:
-            self._refuse_restart_unknown_config(
-                channel_id, thread_root, "leaving the session on its current model",
+            self._refuse_update_unknown_config(
+                channel_id, thread_root, "Leaving the session on its current model",
             )
             return
 
-        # Only the model moves: the backend, the working directory and the
-        # autorespond flag carry over untouched.
+        # Only the model moves: the backend (the LIVE one — see
+        # ``_live_backend``), the working directory and the autorespond flag
+        # carry over untouched.
         new_cfg = purpose.PurposeConfig(
-            backend=cfg.backend,
+            backend=backend,
             model=arg,
             mention_only=cfg.mention_only,
             cwd=cfg.cwd,
@@ -3068,15 +3087,13 @@ class Bridge:
         model is dropped on the swap — models are backend-specific, so the new
         backend's per-backend default applies (via ``_merge_configs``).
         """
-        cfg = await self._config_for_restart(channel_id, ".backend")
+        cfg = await self._config_for_update(channel_id, ".backend")
         try:
             meta = await self.harness.get_session(session_id) or {}
         except Exception:
             logger.debug("`.backend` harness get_session failed", exc_info=True)
             meta = {}
-        current_backend = purpose.canonical_backend(
-            meta.get("backend") or (cfg.backend if cfg else None)
-        ) or self.config.default_backend
+        current_backend = self._live_backend(meta, cfg)
 
         known_list = ", ".join(f"`{b}`" for b in sorted(purpose.KNOWN_BACKENDS))
 
@@ -3121,8 +3138,8 @@ class Bridge:
             return
 
         if cfg is None:
-            self._refuse_restart_unknown_config(
-                channel_id, thread_root, "leaving the session on its current backend",
+            self._refuse_update_unknown_config(
+                channel_id, thread_root, "Leaving the session on its current backend",
             )
             return
 
@@ -3136,7 +3153,12 @@ class Bridge:
             cwd=cfg.cwd,
             warnings=[],
         )
-        new_cfg = self._merge_configs(cfg, target)
+        # Merge against the LIVE backend, not the Purpose's: in a token-less
+        # channel the Purpose parses to the default backend, which would make
+        # ``_merge_configs`` see no change and carry the old model (or, with
+        # the live harness's empty model catalog, the Purpose's own text) onto
+        # the new backend.
+        new_cfg = self._merge_configs(replace(cfg, backend=current_backend), target)
         new_session = await self._restart_session_with_config(
             channel_id, session_id, new_cfg,
         )
@@ -3223,7 +3245,7 @@ class Bridge:
         puts it under the same rules as `.model` / `.backend`: refused inside
         a thread fork, and refused while a run is in flight.
         """
-        cfg = await self._config_for_restart(channel_id, ".cwd")
+        cfg = await self._config_for_update(channel_id, ".cwd")
         try:
             meta = await self.harness.get_session(session_id) or {}
         except Exception:
@@ -3269,16 +3291,17 @@ class Bridge:
             return
 
         if cfg is None:
-            self._refuse_restart_unknown_config(
-                channel_id, thread_root, "leaving the session where it is",
+            self._refuse_update_unknown_config(
+                channel_id, thread_root, "Leaving the session where it is",
             )
             return
 
-        # Only the directory moves: backend, model and the autorespond flag
-        # carry over untouched (unlike `.backend`, where the model can't
-        # survive the swap).
+        # Only the directory moves: the backend (the LIVE one — see
+        # ``_live_backend``), model and the autorespond flag carry over
+        # untouched (unlike `.backend`, where the model can't survive the
+        # swap).
         new_cfg = purpose.PurposeConfig(
-            backend=cfg.backend,
+            backend=self._live_backend(meta, cfg),
             model=cfg.model,
             mention_only=cfg.mention_only,
             cwd=target,
