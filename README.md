@@ -87,7 +87,9 @@ forwarded to the agent. An unknown `.word` gets a "try `.help`" reply.
 Switching model, backend or directory in an **active** channel recreates the session, so
 `.stop` a running turn first. Inside a **thread fork**, reading works but switching is
 refused — a restart would replace the *channel's* session, not the thread's; switch from
-the channel.
+the channel. A switch is also refused when the bridge can't read the Channel Purpose
+(Mattermost unreachable): the settings it isn't changing live there, so restarting would
+have to guess them — and it couldn't write the result back either.
 The global listings (`.sessions`, `.running`, `.invite`) reveal operator-wide state, so in
 a dormant channel they need an explicit mention.
 
