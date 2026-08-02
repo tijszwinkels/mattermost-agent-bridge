@@ -7,8 +7,8 @@ new sessions by opening a new channel, or open previous coding agent sessions as
 Mattermost channel.
 
 The coding agent knows it lives in a Mattermost channel. It can create new channels, and
-send and receive messages to and from other channels. This way, a mattermost-agent-bridge
-can be used as an orchestrator for other agents, creating an agent-swarm.
+send and receive messages to and from other channels. This way, a mattermost channel
+can be used as an orchestrator for other agents living in other channels, creating an agent-swarm.
 
 ## Install
 
