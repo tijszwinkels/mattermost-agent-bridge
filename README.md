@@ -1,95 +1,26 @@
-# mattermost-agent-bridge
+# Mattermost agent bridge
 
-*The daemon, the command, and the Python package are all called `mm-bridge` — that's what
-you type.*
+Use your Claude Code, Codex, and pi coding agents from Mattermost! Each channel is a
+session. Interact with the same session with multiple people. Attach files and images to
+give them to the coding agent, and the coding agent can send files back as well. Create
+new sessions by opening a new channel, or open previous coding agent sessions as a
+Mattermost channel.
 
-**Your coding agent, in your team chat.** Tag the bot in a Mattermost channel and a real
-Claude Code, Codex, or pi session starts on your own machine — in your repos, with your
-keys. Ask it a question, hand it a job, come back later. From your desk, your phone, or
-the couch.
+The coding agent knows it lives in a Mattermost channel. It can create new channels, and
+send and receive messages to and from other channels. This way, a mattermost-agent-bridge
+can be used as an orchestrator for other agents, creating an agent-swarm.
 
-If you've seen [Claude Tag](https://www.anthropic.com/news/introducing-claude-tag) —
-Anthropic's Claude-as-a-teammate in Slack — this is the self-hosted cousin: **your**
-Mattermost (one you already run, or one the installer stands up for you), your hardware,
-and whichever agent CLI you prefer.
+## Install
 
-```
-   you  (Mattermost — desktop, phone, watch-it-from-the-train)
-    │
-    ▼
- Mattermost  ⇄  mm-bridge  ⇄  agent-harness  ⇄  claude · codex · pi
-                                                (your machine, your repos)
-```
+Clone this repo, open it in Claude Code, Codex, or pi on the machine that should run your
+agents, and say:
 
-mm-bridge is the middle box: it maps **one channel (or thread) to one agent session** and
-relays both directions.
+> **Install this.** I don't have a Mattermost server yet — set one up on this machine too.
 
-## Features
-
-| | |
-|---|---|
-| **Channel = session** | Invite the bot, say what you want. The first message starts a session; the channel keeps its context for as long as it lives. |
-| **Thread = fork** | A thread reply gets its own forked session, so tangents stay out of the main conversation. |
-| **Sub-agents** | An agent can start other agents in other channels — see [Swarms](#swarms--many-agents-one-chat-server). |
-| **Live tool-use** | Tool calls collapse into one post per turn that updates as it works, plus a typing indicator. Or hide them entirely. |
-| **Stall warnings** | When a run idles or hits its runtime cap, the bridge says so instead of going quiet. |
-| **Files both ways** | Drop a screenshot, log, or PDF in the channel and the agent gets it; it attaches files back with a one-line directive. |
-| **Agent-initiated invites** | `mm-bridge invite alice` — the agent pulls in a human when it needs a decision. |
-| **Terminal rescue** | `.sessions` finds sessions you started in your terminal; `.invite <id>` gives one a channel to continue in. |
-| **Reconfigure in place** | `.model sonnet`, `.backend codex`, `.cwd /srv/repo`, `.autorespond on` — per channel, from chat, nothing to edit on the server. |
-| **Catch-up** | A new session reads the channel's recent history first, so it starts with the context you already typed. |
-
-## Swarms — many agents, one chat server
-
-Chat is a good substrate for running *several* agents at once, mostly because the hard part
-of a swarm is having somewhere to watch it from.
-
-| | |
-|---|---|
-| **Agents spawn agents** | `mm-bridge spawn --title "Migrate the parser" "<brief>"` opens a new channel with its own session. Parent links to child, child's header links back. A morning's work leaves a readable tree — one channel per unit of work, each with its full transcript. |
-| **Mixed fleets** | Backend and model are per-channel: Opus planning in one, Codex implementing in three, pi reviewing in a fourth. |
-| **Agent-to-agent** | `mm-bridge post --channel <id>` and `read --channel <id>` let one agent brief another or request a review — as ordinary posts, so you can read the negotiation afterwards instead of guessing at it. |
-| **No half-conversations** | Every cross-channel post is mirrored into the sender's own channel (`_→ also sent to ~channel~_`). |
-| **Fleet view** | `.running` shows every session working right now; `.sessions` lists recent ones across all agents. |
-| **Circuit breaker** | [`CLAUDE-include.md`](CLAUDE-include.md) ships a convention where agents name themselves and count turns, handing the conversation back to a human before two of them talk in circles. |
-
-It's all ordinary Mattermost underneath: push notifications on your phone, one search box
-across every agent's transcript.
-
-## Quickstart — tell an agent to install it
-
-Installing is itself an agent task. Clone this repo, open it in **Claude Code**, **Codex**,
-or **pi** on the machine that should run your agents, and tell it what you've got.
-
-**No Mattermost yet** — the common case, and fully supported:
-
-> **Install this. I don't have a Mattermost server yet — set one up on this machine too.**
-
-**You already run a Mattermost:**
-
-> **Install this against my existing Mattermost at `https://chat.example.com` — I'm an
-> admin there. Create the bot account and its token yourself.**
-
-Either way the agent follows [`INSTALL.md`](INSTALL.md). It interviews you first — host
-user, install dir, which agent CLIs, which directory sessions start in, bot name, where
-Mattermost should be reachable — then stands up whatever you don't already have
-(Mattermost + Postgres in Docker, agent-harness and mm-bridge as user-level systemd
-services), checkpointing each step. It finishes on `mm-bridge doctor` and a live
-round-trip: you post in a channel, an agent answers.
-
-Nothing is guessed silently. Say "use your judgement" and it takes the documented default
-and tells you which — except for the answers that decide which machine, which user, and
-which directory your agents get. Those it asks.
-
-Prefer to drive it yourself? `INSTALL.md` is a plain numbered runbook for humans too. For
-just the Python package (Python 3.11+):
-
-```bash
-uv sync && uv run mm-bridge --help
-# or: uv pip install -e . && mm-bridge --help
-```
-
-Then run the daemon with `mm-bridge serve`.
+…or point it at a Mattermost you already run. The agent interviews you first, then follows
+[`INSTALL.md`](INSTALL.md) — a plain numbered runbook you can also drive yourself. Just
+the Python package: `uv sync && uv run mm-bridge serve` (Python 3.11+). The package, the
+command, and the daemon are all called `mm-bridge`.
 
 **Be aware:** the agent runs as you, on your machine, with your credentials. Anyone who can
 post in a bridged channel can drive it. Treat channel membership like shell access.
