@@ -3411,6 +3411,86 @@ class CommandCwdTests(_BridgeTestCase):
         self.assertEqual(self.bridge.purpose_by_channel["c1"].cwd, target)
         self.assertIn(f"cwd={target}", self.bridge.mm.channels["c1"]["purpose"])
 
+    async def test_cold_config_cache_keeps_backend_model_and_autorespond(self):
+        # `purpose_by_channel` is EMPTY for every mapped channel after a daemon
+        # restart — `_bootstrap_known_sessions` never populates it, and the
+        # dot-command preload only runs for dormant channels. Rebuilding the
+        # config from bare defaults here would silently turn a codex channel
+        # into claude and reset the autorespond flag, then write that wrong
+        # config back to the Channel Purpose while the confirmation claims
+        # only the directory moved.
+        target = str(Path(self.tmp.name) / "repo")
+        Path(target).mkdir()
+        self.bridge.mapping.link(Anchor("c1"), "s1")
+        self.bridge.mm.channels["c1"] = {
+            "id": "c1", "purpose": "codex, gpt-5.4, mention-only",
+        }
+        self.assertNotIn("c1", self.bridge.purpose_by_channel)  # cold cache
+
+        await self.bridge._on_mm_posted({
+            "channel_id": "c1", "message": f".cwd {target}",
+            "user_id": "u1", "type": "",
+        })
+
+        created = self.bridge.harness.created[-1]
+        self.assertEqual(created["backend"], "codex")
+        self.assertEqual(created["model"], "gpt-5.4")
+        self.assertEqual(created["cwd"], target)
+        self.assertTrue(self.bridge.purpose_by_channel["c1"].mention_only)
+        written = self.bridge.mm.channels["c1"]["purpose"]
+        self.assertIn("codex", written)
+        self.assertIn("gpt-5.4", written)
+        self.assertIn("mention-only", written)
+        self.assertIn(f"cwd={target}", written)
+        self.assertNotIn("claude", written)
+
+    async def test_unreadable_config_refuses_the_switch(self):
+        # If the Channel Purpose can't be read we can't know the channel's
+        # backend/model — moving the session anyway would guess them. Refuse
+        # instead (we couldn't persist the result either).
+        target = str(Path(self.tmp.name) / "repo")
+        Path(target).mkdir()
+        self.bridge.mapping.link(Anchor("c1"), "s1")
+
+        def _boom(_channel_id):
+            raise RuntimeError("mattermost unreachable")
+
+        self.bridge.mm.get_channel = _boom
+
+        await self.bridge._on_mm_posted({
+            "channel_id": "c1", "message": f".cwd {target}",
+            "user_id": "u1", "type": "",
+        })
+
+        self.assertEqual(self.bridge.harness.created, [])
+        self.assertIn("configuration", self._joined())
+
+    async def test_failed_restart_does_not_persist_the_new_directory(self):
+        # Mirrors the `.backend` failed-restart contract: no success claim and
+        # no Purpose write for a directory the channel isn't actually in.
+        old = str(Path(self.tmp.name) / "old")
+        Path(old).mkdir()
+        target = str(Path(self.tmp.name) / "repo")
+        Path(target).mkdir()
+        self._active_channel(cwd=old)
+
+        async def failing_create(**_kwargs):
+            raise RuntimeError("harness down")
+
+        self.bridge.harness.create_session = failing_create
+
+        await self.bridge._on_mm_posted({
+            "channel_id": "c1", "message": f".cwd {target}",
+            "user_id": "u1", "type": "",
+        })
+
+        # Channel keeps talking to its old, still-live session.
+        self.assertEqual(self.bridge.mapping.get_session(Anchor("c1")), "s1")
+        self.assertEqual(self.bridge.purpose_by_channel["c1"].cwd, old)
+        self.assertNotIn(f"cwd={target}", self.bridge.mm.channels["c1"]["purpose"])
+        joined = self._joined()
+        self.assertNotIn("session restarted there", joined)
+
     async def test_active_set_refuses_while_run_active(self):
         target = str(Path(self.tmp.name) / "repo")
         Path(target).mkdir()

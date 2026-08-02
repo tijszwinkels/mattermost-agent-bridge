@@ -3162,7 +3162,23 @@ class Bridge:
         puts it under the same rules as `.model` / `.backend`: refused inside
         a thread fork, and refused while a run is in flight.
         """
+        # A cold ``purpose_by_channel`` is the ORDINARY state for a mapped
+        # channel after a daemon restart: ``_bootstrap_known_sessions`` doesn't
+        # populate it, and the dot-command preload only covers dormant
+        # channels. Load it from the Channel Purpose before touching anything —
+        # rebuilding it from config defaults below would silently rewrite the
+        # channel's backend, model and autorespond flag (a codex channel would
+        # come back as claude) while the confirmation claims the directory was
+        # the only thing that moved.
         cfg = self.purpose_by_channel.get(channel_id)
+        if cfg is None:
+            try:
+                cfg = await self._load_channel_config(channel_id)
+            except Exception:
+                logger.exception(
+                    "`.cwd` could not load the channel config for %s", channel_id,
+                )
+                cfg = None
         try:
             meta = await self.harness.get_session(session_id) or {}
         except Exception:
@@ -3207,17 +3223,26 @@ class Bridge:
             )
             return
 
-        base = cfg or purpose.PurposeConfig(
-            backend=self.config.default_backend,
-            model=None,
-            mention_only=not self.config.default_autorespond,
-        )
-        # Only the directory moves: backend and model carry over untouched
-        # (unlike `.backend`, where the model can't survive the swap).
+        if cfg is None:
+            # The load above failed, so the channel's backend/model are
+            # unknown. Guessing them would persist a config the user never
+            # chose — and we couldn't write the Purpose anyway.
+            self._post_cmd_reply(
+                channel_id,
+                ":warning: Could not read this channel's configuration — "
+                "leaving the session where it is rather than restarting it "
+                "with a guessed backend and model.",
+                thread_root,
+            )
+            return
+
+        # Only the directory moves: backend, model and the autorespond flag
+        # carry over untouched (unlike `.backend`, where the model can't
+        # survive the swap).
         new_cfg = purpose.PurposeConfig(
-            backend=base.backend,
-            model=base.model,
-            mention_only=base.mention_only,
+            backend=cfg.backend,
+            model=cfg.model,
+            mention_only=cfg.mention_only,
             cwd=target,
             warnings=[],
         )
