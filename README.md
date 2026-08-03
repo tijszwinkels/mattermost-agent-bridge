@@ -10,6 +10,13 @@ The coding agent knows it lives in a Mattermost channel. It can create new chann
 send and receive messages to and from other channels. This way, a mattermost channel
 can be used as an orchestrator for other agents living in other channels, creating an agent-swarm.
 
+![One brief fans out into three agent sessions, each posting its own result back into the
+channel](docs/swarm-demo.gif)
+
+*Real run, unedited: one brief in **Swarm demo** → three sessions spawned in their own
+channels (52s) → each posts its own result back here (73s). Every channel is a live agent
+session; `.running` lists the fleet.*
+
 ## Install
 
 Clone this repo, open it in Claude Code, Codex, or pi on the machine that should run your
