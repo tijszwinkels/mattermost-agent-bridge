@@ -237,6 +237,86 @@ class AgentHarnessBridgeTests(_BridgeTestCase):
         self.assertEqual(created, [])
         self.assertIn("codex_existing", self.bridge._known_sessions)
 
+    async def test_bootstrap_skips_external_sessions_when_mirroring_disabled(self):
+        """``mirror_external_sessions = false``: bootstrap must NOT create
+        channels for pre-existing external (CLI/terminal) sessions. On a
+        shared MM server every such channel is public and auto-joining
+        bots start answering into it — the operator opts out wholesale."""
+        self.bridge.config.mirror_external_sessions = False
+        self.bridge.harness.sessions_meta = [{
+            "id": "ses_terminal",
+            "backend": "claude-code",
+            "project": {"path": "/tmp/project", "name": "project"},
+            "title": "Terminal session",
+            "origin": "external",
+        }]
+
+        await self.bridge._bootstrap_known_sessions()
+
+        created = [c for c in self.bridge.mm.channels if c.startswith("c-s-")]
+        self.assertEqual(created, [])
+        self.assertIsNone(self.bridge.mapping.get_anchor("ses_terminal"))
+        # Marked known so the SSE bootstrap replay can't trip the
+        # live-create path for the same session either.
+        self.assertIn("ses_terminal", self.bridge._known_sessions)
+
+        await self.bridge._on_harness_event(
+            "session.updated",
+            {"data": {
+                "session_id": "ses_terminal",
+                "session": self.bridge.harness.sessions_meta[0],
+            }},
+        )
+        created_after = [c for c in self.bridge.mm.channels if c.startswith("c-s-")]
+        self.assertEqual(created_after, [])
+
+    async def test_live_external_session_skipped_when_mirroring_disabled(self):
+        """A NEW terminal session appearing while the daemon runs must be
+        skipped too — bootstrap-only filtering would still mirror every
+        session started after daemon boot."""
+        self.bridge.config.mirror_external_sessions = False
+        session = {
+            "id": "ses_live_terminal",
+            "backend": "claude-code",
+            "project": {"path": "/tmp/project", "name": "project"},
+            "title": "Live terminal session",
+            "origin": "external",
+        }
+
+        await self.bridge._on_harness_event(
+            "session.updated",
+            {"data": {"session_id": "ses_live_terminal", "session": session}},
+        )
+
+        created = [c for c in self.bridge.mm.channels if c.startswith("c-s-")]
+        self.assertEqual(created, [])
+        self.assertIsNone(self.bridge.mapping.get_anchor("ses_live_terminal"))
+        # Known, so repeated session.updated events don't retry-create.
+        self.assertIn("ses_live_terminal", self.bridge._known_sessions)
+
+    async def test_spawned_harness_session_still_gets_channel_when_mirroring_disabled(self):
+        """The knob must never break Mattermost-initiated flows:
+        ``mm-bridge spawn`` creates a harness-origin session and relies on
+        the live path spawning its channel (otherwise the spawn CLI's
+        ``_wait_for_new_sidecar`` times out)."""
+        self.bridge.config.mirror_external_sessions = False
+        session = {
+            "id": "ses_spawned",
+            "backend": "claude-code",
+            "project": {"path": "/tmp/project", "name": "project"},
+            "title": "Spawned session",
+            "origin": "harness",
+        }
+
+        await self.bridge._on_harness_event(
+            "session.updated",
+            {"data": {"session_id": "ses_spawned", "session": session}},
+        )
+
+        created = [c for c in self.bridge.mm.channels if c.startswith("c-s-")]
+        self.assertEqual(len(created), 1)
+        self.assertIsNotNone(self.bridge.mapping.get_anchor("ses_spawned"))
+
     async def test_harness_origin_session_spawns_channel_when_unknown(self):
         """A fresh harness-origin ``session.updated`` (e.g. from ``mm-bridge
         spawn``, an integration test, or a future IPC client that created

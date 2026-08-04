@@ -80,6 +80,16 @@ class Config:
     # default is generous.
     direct_user_message_dedup_window_seconds: float = 30.0
 
+    # Auto-create MM channels for "external" sessions — CLI/terminal agent
+    # sessions the harness observer discovers outside the bridge
+    # (``origin == "external"``). On a private single-tenant server this
+    # mirrors all local agent activity into MM. On a shared server it
+    # publishes terminal-session titles as PUBLIC channels, where
+    # auto-joining bots start answering against the mirrored content —
+    # set false there. Mattermost-initiated flows (invite, ``mm-bridge
+    # spawn``) are harness-origin and are never affected by this knob.
+    mirror_external_sessions: bool = True
+
     # When a run finishes, post a standalone ``@<username>`` in the same
     # channel/thread to notify the user whose message triggered it.
     # No-op if the run had no tracked triggerer (e.g. autorespond loops
@@ -210,6 +220,7 @@ class Config:
             "show_tool_use",
             "mirror_direct_user_messages",
             "direct_user_message_dedup_window_seconds",
+            "mirror_external_sessions",
             "mention_user_when_done",
             "auto_join_public_channels",
             "auto_join_reconcile_seconds",
@@ -337,6 +348,11 @@ class Config:
         if "MM_MIRROR_DIRECT_USER_MESSAGES" in env:
             self.mirror_direct_user_messages = (
                 env["MM_MIRROR_DIRECT_USER_MESSAGES"].lower()
+                in ("1", "true", "yes", "on")
+            )
+        if "MM_MIRROR_EXTERNAL_SESSIONS" in env:
+            self.mirror_external_sessions = (
+                env["MM_MIRROR_EXTERNAL_SESSIONS"].lower()
                 in ("1", "true", "yes", "on")
             )
         if "MM_MENTION_USER_WHEN_DONE" in env:

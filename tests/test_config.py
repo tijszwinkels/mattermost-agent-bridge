@@ -330,5 +330,37 @@ class DangerousPermissionsTests(unittest.TestCase):
         self.assertFalse(cfg.dangerous_permissions)
 
 
+class MirrorExternalSessionsTests(unittest.TestCase):
+    """``mirror_external_sessions`` — channel auto-creation for CLI/terminal
+    ("external") sessions the observer discovers. Defaults to true (the
+    single-tenant behavior); shared-server operators set it to false so
+    terminal work never surfaces as public channels."""
+
+    def test_default_is_true(self) -> None:
+        self.assertTrue(Config().mirror_external_sessions)
+
+    def test_toml_key_disables(self) -> None:
+        cfg = Config()
+        cfg._apply_toml({"mirror_external_sessions": False})
+        self.assertFalse(cfg.mirror_external_sessions)
+
+    def test_env_disables(self) -> None:
+        cfg = Config()
+        with patch.dict(
+            "os.environ", {"MM_MIRROR_EXTERNAL_SESSIONS": "0"}, clear=True
+        ):
+            cfg._apply_env()
+        self.assertFalse(cfg.mirror_external_sessions)
+
+    def test_env_overrides_toml(self) -> None:
+        cfg = Config()
+        cfg._apply_toml({"mirror_external_sessions": False})
+        with patch.dict(
+            "os.environ", {"MM_MIRROR_EXTERNAL_SESSIONS": "true"}, clear=True
+        ):
+            cfg._apply_env()
+        self.assertTrue(cfg.mirror_external_sessions)
+
+
 if __name__ == "__main__":
     unittest.main()

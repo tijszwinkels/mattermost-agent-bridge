@@ -202,6 +202,14 @@ show_tool_use = true
 mirror_direct_user_messages = true
 direct_user_message_dedup_window_seconds = 30.0
 
+# Auto-create a channel for every "external" session — CLI/terminal agent
+# sessions the harness observes outside the bridge. Right default for a
+# private single-tenant server (all local agent work becomes visible in MM).
+# Set false on a shared server: those channels are created public, so other
+# members and auto-joining bots see (and answer into) your terminal work.
+# Mattermost-initiated sessions (invite, spawn) always get channels.
+mirror_external_sessions = true
+
 # Auto-join: silently join every public channel the bot can see. Sessions are
 # NOT created until someone actually engages the bot.
 auto_join_public_channels  = false
@@ -254,6 +262,7 @@ url = "http://localhost:8877"
 | `MM_BRIDGE_DEFAULT_AUTORESPOND` | `1/true/yes/on` to enable autorespond by default. |
 | `MM_SHOW_TOOL_USE` | Toggle `show_tool_use` without editing TOML. |
 | `MM_MIRROR_DIRECT_USER_MESSAGES` | Toggle `mirror_direct_user_messages` without editing TOML. |
+| `MM_MIRROR_EXTERNAL_SESSIONS` | Toggle `mirror_external_sessions` without editing TOML. |
 | `MM_AUTO_JOIN` | Toggle `auto_join_public_channels` without editing TOML. |
 | `MM_BRIDGE_STATE` | Path to the state JSON. |
 | `MM_BRIDGE_SIDECAR_DIR` | Sidecar directory. |

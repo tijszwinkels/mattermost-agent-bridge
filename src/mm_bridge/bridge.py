@@ -611,6 +611,18 @@ class Bridge:
                 # in the harness DB (the 2026-05-12 ghost-channel burst).
                 self._known_sessions.add(session_id)
                 continue
+            if not self.config.mirror_external_sessions:
+                # Operator opted out of mirroring CLI/terminal sessions
+                # into channels (shared-server deployment). Mark known so
+                # the SSE bootstrap replay can't trip the live-create
+                # path for the same session.
+                logger.info(
+                    "Not mirroring external session %s "
+                    "(mirror_external_sessions=false)",
+                    session_id[:24],
+                )
+                self._known_sessions.add(session_id)
+                continue
             if await self._create_channel_for_session(session):
                 self._known_sessions.add(session_id)
 
@@ -3894,6 +3906,22 @@ class Bridge:
         # Suppress claude-code subagent transcripts — internal to a parent
         # run, would just churn channels.
         if _is_suppressed_session(session_id):
+            self._known_sessions.add(session_id)
+            return
+        # Operator opted out of mirroring CLI/terminal sessions into
+        # channels (shared-server deployment: those channels are public
+        # and auto-joining bots answer into them). Harness-origin
+        # sessions (``mm-bridge spawn``, future IPC clients) must still
+        # fall through to the create below.
+        if (
+            session.get("origin") == "external"
+            and not self.config.mirror_external_sessions
+        ):
+            logger.info(
+                "Not mirroring external session %s "
+                "(mirror_external_sessions=false)",
+                session_id[:24],
+            )
             self._known_sessions.add(session_id)
             return
         # Both external and harness-origin sessions surface as channels
