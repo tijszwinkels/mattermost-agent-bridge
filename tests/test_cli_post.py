@@ -27,6 +27,13 @@ class FakeMM:
     max_file_size: int = 50 * 1024 * 1024
     next_file_id_counter: int = 0
     next_post_id_counter: int = 0
+    # slug → channel record, for ``--channel`` slug/URL resolution.
+    named_channels: dict = field(default_factory=dict)
+    # post id → post record, for permalink resolution (``--channel``/``--thread``).
+    post_by_id: dict = field(default_factory=dict)
+    # Simulate a 404 from the two lookups above.
+    lookup_404: bool = False
+    lookups: list = field(default_factory=list)
 
     def login(self) -> None:
         if self.login_raises:
@@ -70,6 +77,24 @@ class FakeMM:
             "props": dict(props) if props else None,
         })
         return {"id": pid}
+
+    def get_channel_by_name(self, team_name: str, channel_name: str) -> dict:
+        self.lookups.append(("get_channel_by_name", team_name, channel_name))
+        if self.lookup_404:
+            raise RuntimeError(
+                f"404 NOT FOUND: channel '{channel_name}' in team '{team_name}'"
+            )
+        if channel_name in self.named_channels:
+            return self.named_channels[channel_name]
+        # Identity fallback keeps legacy bare-slug tests green: the slug IS
+        # the resolved id.
+        return {"id": channel_name, "name": channel_name}
+
+    def get_post(self, post_id: str) -> dict:
+        self.lookups.append(("get_post", post_id))
+        if self.lookup_404 or post_id not in self.post_by_id:
+            raise RuntimeError(f"404 NOT FOUND: post '{post_id}'")
+        return self.post_by_id[post_id]
 
 
 class PostCommandTests(unittest.TestCase):
@@ -672,6 +697,182 @@ class CrossChannelMirrorTests(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertEqual(len(mm.posted), 1)
         self.assertEqual(mm.posted[0]["channel_id"], "other-chan")
+
+
+class ChannelAndPermalinkRefPostTests(PostCommandTests):
+    """``mm-bridge post --channel`` / ``--thread`` accept a slug, channel
+    URL, or permalink — the post must land in the RESOLVED channel id (and,
+    for permalinks, the post's thread root), never in the raw slug/URL."""
+
+    HOST = "mm.example"
+    ID26 = "a1b2c3a1b2c3a1b2c3a1b2c3a1"  # 26 × [a-z0-9] (not 22/27/32)
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.cfg.mm_url = self.HOST
+
+    # -- slug -----------------------------------------------------------
+
+    def test_slug_posts_to_resolved_id(self) -> None:
+        mm = FakeMM(named_channels={"general": {"id": "chan-general"}})
+        rc, out, _ = self._invoke(
+            mm, ["mm-bridge", "post", "--channel", "general", "hello"],
+            session_id=None,
+        )
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(mm.posted[0]["channel_id"], "chan-general")
+        self.assertEqual(mm.posted[0]["message"], "hello")
+        self.assertFalse(mm.posted[0]["root_id"])
+        self.assertIn(("get_channel_by_name", "workspace", "general"), mm.lookups)
+
+    def test_channel_url_posts_to_resolved_id(self) -> None:
+        mm = FakeMM(named_channels={"general": {"id": "chan-general"}})
+        url = f"https://{self.HOST}/tinkertank/channels/general"
+        rc, _, err = self._invoke(
+            mm, ["mm-bridge", "post", "--channel", url, "hello"],
+            session_id=None,
+        )
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(mm.posted[0]["channel_id"], "chan-general")
+        self.assertIn(("get_channel_by_name", "tinkertank", "general"), mm.lookups)
+
+    def test_url_with_trailing_slash_and_query_resolves(self) -> None:
+        mm = FakeMM(named_channels={"general": {"id": "chan-general"}})
+        url = f"https://{self.HOST}/team/channels/general?x=1#anchor"
+        rc, _, _ = self._invoke(
+            mm, ["mm-bridge", "post", "--channel", url, "hello"],
+            session_id=None,
+        )
+        self.assertEqual(rc, 0)
+        self.assertEqual(mm.posted[0]["channel_id"], "chan-general")
+
+    # -- id fast path ----------------------------------------------------
+
+    def test_26_char_id_used_verbatim_without_lookup(self) -> None:
+        mm = FakeMM()
+        rc, _, _ = self._invoke(
+            mm, ["mm-bridge", "post", "--channel", self.ID26, "hello"],
+            session_id=None,
+        )
+        self.assertEqual(rc, 0)
+        self.assertEqual(mm.posted[0]["channel_id"], self.ID26)
+        for kind, *rest in mm.lookups:
+            self.assertNotIn(kind, ("get_channel_by_name", "get_post"))
+
+    # -- permalink -------------------------------------------------------
+
+    def test_permalink_posts_to_post_channel_and_root(self) -> None:
+        mm = FakeMM(post_by_id={"p1": {
+            "id": "p1", "channel_id": "chan-link", "root_id": "root1",
+        }})
+        url = f"https://{self.HOST}/team/pl/p1"
+        rc, _, err = self._invoke(
+            mm, ["mm-bridge", "post", "--channel", url, "in the thread"],
+            session_id=None,
+        )
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(mm.posted[0]["channel_id"], "chan-link")
+        self.assertEqual(mm.posted[0]["root_id"], "root1")
+
+    def test_permalink_on_a_root_post_replies_in_its_thread(self) -> None:
+        mm = FakeMM(post_by_id={"rootx": {
+            "id": "rootx", "channel_id": "chan-link", "root_id": "",
+        }})
+        url = f"https://{self.HOST}/team/pl/rootx"
+        rc, _, err = self._invoke(
+            mm, ["mm-bridge", "post", "--channel", url, "level"],
+            session_id=None,
+        )
+        self.assertEqual(rc, 0, err)
+        self.assertEqual(mm.posted[0]["channel_id"], "chan-link")
+        # A root post's permalink names the thread it anchors, so the post
+        # replies INSIDE that thread (root_id = the post itself).
+        self.assertEqual(mm.posted[0]["root_id"], "rootx")
+        self.assertIn(("get_post", "rootx"), mm.lookups)
+
+    def test_permalink_with_explicit_thread_prefers_thread(self) -> None:
+        mm = FakeMM(post_by_id={"p1": {
+            "id": "p1", "channel_id": "chan-link", "root_id": "root1",
+        }})
+        url = f"https://{self.HOST}/team/pl/p1"
+        rc, _, _ = self._invoke(
+            mm, [
+                "mm-bridge", "post", "--channel", url,
+                "--thread", "explicit-root", "hi",
+            ],
+            session_id=None,
+        )
+        self.assertEqual(rc, 0)
+        self.assertEqual(mm.posted[0]["channel_id"], "chan-link")
+        self.assertEqual(mm.posted[0]["root_id"], "explicit-root")
+
+    # -- --thread permalinks ---------------------------------------------
+
+    def test_thread_permalink_resolves_root(self) -> None:
+        mm = FakeMM(post_by_id={"p1": {
+            "id": "p1", "channel_id": "chan-x", "root_id": "thread-root",
+        }})
+        url = f"https://{self.HOST}/team/pl/p1"
+        rc, _, _ = self._invoke(
+            mm, [
+                "mm-bridge", "post", "--channel", "c1", "--thread", url, "hi",
+            ],
+            session_id=None,
+        )
+        self.assertEqual(rc, 0)
+        self.assertEqual(mm.posted[0]["channel_id"], "c1")
+        self.assertEqual(mm.posted[0]["root_id"], "thread-root")
+
+    def test_thread_permalink_foreign_host_refused(self) -> None:
+        mm = FakeMM(post_by_id={"p1": {
+            "id": "p1", "channel_id": "chan-x", "root_id": "thread-root",
+        }})
+        url = f"https://other.example/team/pl/p1"
+        rc, _, err = self._invoke(
+            mm, [
+                "mm-bridge", "post", "--channel", "c1", "--thread", url, "hi",
+            ],
+            session_id=None,
+        )
+        self.assertEqual(rc, 2)
+        self.assertIn("other.example", err)
+        self.assertEqual(mm.posted, [])
+
+    # -- error paths -----------------------------------------------------
+
+    def test_channel_url_foreign_host_refused_no_post(self) -> None:
+        mm = FakeMM(named_channels={"general": {"id": "chan-general"}})
+        url = f"https://other.example/team/channels/general"
+        rc, _, err = self._invoke(
+            mm, ["mm-bridge", "post", "--channel", url, "hello"],
+            session_id=None,
+        )
+        self.assertEqual(rc, 2)
+        self.assertIn("other.example", err)
+        self.assertIn(self.HOST, err)
+        self.assertEqual(mm.posted, [])
+
+    def test_unknown_slug_nothing_posted_membership_hint(self) -> None:
+        mm = FakeMM(lookup_404=True)
+        rc, _, err = self._invoke(
+            mm, ["mm-bridge", "post", "--channel", "ghost-chan", "hello"],
+            session_id=None,
+        )
+        self.assertEqual(rc, 2)
+        self.assertIn("ghost-chan", err)
+        self.assertIn("member", err.lower())
+        self.assertEqual(mm.posted, [])
+
+    def test_unknown_permalink_nothing_posted(self) -> None:
+        mm = FakeMM(lookup_404=True)
+        url = f"https://{self.HOST}/team/pl/p1"
+        rc, _, err = self._invoke(
+            mm, ["mm-bridge", "post", "--channel", url, "hello"],
+            session_id=None,
+        )
+        self.assertEqual(rc, 2)
+        self.assertIn("p1", err)
+        self.assertEqual(mm.posted, [])
 
 
 if __name__ == "__main__":
