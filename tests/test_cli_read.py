@@ -50,6 +50,8 @@ class FakeMM:
     post_by_id: dict = field(default_factory=dict)
     # Simulate a 404 from the two lookups above.
     channel_lookup_404: bool = False
+    # Simulate a lookup response with no usable "id" key.
+    channel_lookup_empty: bool = False
     post_lookup_404: bool = False
 
     def login(self) -> None:
@@ -83,6 +85,8 @@ class FakeMM:
             raise RuntimeError(
                 f"404 NOT FOUND: channel '{channel_name}' in team '{team_name}'"
             )
+        if self.channel_lookup_empty:
+            return {}
         if channel_name in self.named_channels:
             return self.named_channels[channel_name]
         # Identity fallback keeps legacy bare-slug tests green: the slug IS
@@ -621,6 +625,109 @@ class ChannelAndPermalinkRefReadTests(ReadCommandTests):
         self.assertIn("other.example", err)
         for c in mm.calls:
             self.assertNotEqual(c[0], "get_post")
+
+
+class RefRefinementReadTests(ReadCommandTests):
+    """Reviewer fixes A–D: no silent fallback to the unresolved string.
+
+    A — slug/permalink refs need a logged-in client (ids don't):
+       without one, resolving them as their raw value is the original
+       URL-as-id defect re-entering through the new code path;
+    B — a lookup response without a usable id is an error, not a fallback;
+    C — a bare slug with no configured team is an honest error, not a
+       "unknown-team" 404;
+    D — a channel URL in --thread is a usage error, not a post id.
+    """
+
+    HOST = "mm.example"
+    ID26 = "a1b2c3d4e5f6g7h8i9j0k1l2m3"  # exactly 26 × [a-z0-9]
+    URL = "https://mm.example/tinkertank/channels/general"
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.cfg.mm_url = self.HOST
+
+    # -- A: client required for slug/permalink; id resolves without one ----
+
+    def test_slug_without_client_raises_instead_of_slug_as_id(self) -> None:
+        with self.assertRaises(cli.ChannelResolutionError):
+            cli._resolve_post_anchor(self.cfg, "general", None)
+
+    def test_channel_url_without_client_raises_instead_of_url_as_id(self) -> None:
+        with self.assertRaises(cli.ChannelResolutionError):
+            cli._resolve_post_anchor(self.cfg, self.URL, None)
+
+    def test_permalink_without_client_raises(self) -> None:
+        with self.assertRaises(cli.ChannelResolutionError):
+            cli._resolve_post_anchor(
+                self.cfg, f"https://{self.HOST}/team/pl/p1", None,
+            )
+
+    def test_id_ref_still_resolves_without_a_client(self) -> None:
+        anchor = cli._resolve_post_anchor(self.cfg, self.ID26, None)
+        self.assertEqual(anchor, cli.Anchor(self.ID26))
+
+    # -- B: lookup response without an id is an error ----------------------
+
+    def test_slug_lookup_without_id_in_response_raises(self) -> None:
+        mm = FakeMM()
+        mm.channel_lookup_empty = True
+        mm.posts_by_channel["general"] = [
+            _mk_post("p1", create_at=100, message="would fetch if slug as id"),
+        ]
+        rc, _, err = self._invoke(
+            mm, ["mm-bridge", "read", "--channel", "general"],
+        )
+        self.assertEqual(rc, 2)
+        self.assertIn("general", err)
+        for c in mm.calls:
+            self.assertNotEqual(c[0], ("get_posts", "get_posts_since"))
+
+    # -- C: no configured team → honest error before the lookup ------------
+
+    def test_bare_slug_without_configured_team_raises(self) -> None:
+        self.cfg.mm_team = ""
+        mm = FakeMM()
+        mm.named_channels["general"] = {"id": "chan-general"}
+        mm.posts_by_channel["chan-general"] = [
+            _mk_post("p1", create_at=100, message="hi"),
+        ]
+        rc, _, err = self._invoke(
+            mm, ["mm-bridge", "read", "--channel", "general"],
+        )
+        self.assertEqual(rc, 2)
+        self.assertIn("general", err)
+        self.assertIn("team", err.lower())
+        for c in mm.calls:
+            self.assertNotEqual(c[0], ("get_channel_by_name", "get_posts"))
+
+    # -- D: a channel URL is not a --thread reference -----------------------
+
+    def test_thread_channel_url_rejected_without_fetch(self) -> None:
+        mm = FakeMM()
+        mm.posts_by_channel["c1"] = [_mk_post("p1", create_at=100, message="x")]
+        rc, _, err = self._invoke(mm, [
+            "mm-bridge", "read", "--channel", "c1", "--thread", self.URL,
+        ])
+        self.assertEqual(rc, 2)
+        self.assertIn("thread", err.lower())
+        for c in mm.calls:
+            self.assertNotIn(c[0], ("get_posts", "get_posts_since",
+                                   "get_thread_posts"))
+
+    def test_thread_bare_slug_still_passes_through_as_post_id(self) -> None:
+        mm = FakeMM()
+        mm.thread_posts["some-post-id-like-slug"] = [
+            _mk_post("p1", create_at=100, user_id="u1", message="in thread"),
+        ]
+        mm.users["u1"] = "ada"
+        rc, out, _ = self._invoke(mm, [
+            "mm-bridge", "read", "--channel", "c1",
+            "--thread", "some-post-id-like-slug",
+        ])
+        self.assertEqual(rc, 0)
+        self.assertIn("in thread", out)
+        self.assertIn(("get_thread_posts", "some-post-id-like-slug"), mm.calls)
 
 
 if __name__ == "__main__":

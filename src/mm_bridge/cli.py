@@ -531,9 +531,10 @@ def _validate_channel_ref(cfg: Config, value: str | None) -> ChannelRef | None:
 def _precheck_thread_ref(cfg: Config, value: str | None) -> None:
     """Pure (pre-login) validation of a ``--thread`` value.
 
-    Only a permalink URL can be rejected here (foreign host); post ids
-    and bare slugs are legal syntax either way and the server will reject
-    genuinely bad ids at post time.
+    Rejects before any network use: a channel URL (wrong kind of thing for
+    a thread) and permalink URLs for a foreign host. Post ids and bare
+    slugs are legal syntax either way and the server will reject genuinely
+    bad ids at post time.
     """
     if not value:
         return
@@ -541,33 +542,49 @@ def _precheck_thread_ref(cfg: Config, value: str | None) -> None:
         ref = parse_channel_ref(value)
     except ChannelRefError:
         return  # not a URL → opaque post id, fine
+    if ref.kind == "slug" and ref.host:
+        # It parsed as a channel URL (…/<team>/channels/<slug>) — never a
+        # thread reference.
+        raise ChannelResolutionError(
+            "--thread must be a root post id or a permalink "
+            "(https://host/<team>/pl/<post_id>), not a channel URL "
+            f"({value!r})."
+        )
     if ref.kind == "permalink":
         _assert_same_host(ref, cfg)
 
 
-def _resolve_explicit_anchor(ref: ChannelRef, cfg: Config, mm=None) -> Anchor:
+def _resolve_explicit_anchor(ref: ChannelRef, cfg: Config, mm: MattermostClient | None) -> Anchor:
     """Resolve a parsed ``--channel`` reference to an :class:`Anchor`.
 
-    * ``id``        → used verbatim (zero API calls).
+    * ``id``        → used verbatim; the only kind resolvable without a
+      client (no lookup needed).
     * ``slug``      → ``mm.get_channel_by_name(team, slug)`` against the
       team from the URL, or ``cfg.mm_team`` for a bare slug.
     * ``permalink`` → ``mm.get_post(post_id)``; the post's ``channel_id``
       becomes the channel and its thread root (``root_id``, or the post
       itself if it is a root) becomes the default root.
+
+    Falling back to the raw reference string (slug, URL…) as a channel id
+    would silently re-introduce the URL-as-id defect: every failure mode
+    here raises instead.
     """
     if ref.kind == "id":
         return Anchor(ref.value, None)
     if mm is None:
-        # No client (pure callers, e.g. unit tests of the anchor fallback):
-        # keep the legacy behaviour of treating the slug verbatim as the
-        # channel id. The CLI always resolves with a logged-in client.
-        if ref.kind == "slug":
-            return Anchor(ref.value, None)
         raise ChannelResolutionError(
-            f"{ref.kind!r} references need a Mattermost login to resolve."
+            f"resolving a {ref.kind!r} --channel value ({ref.value!r}) "
+            f"needs a logged-in Mattermost client; a 26-char channel id "
+            f"works without one."
         )
     if ref.kind == "slug":
-        team = ref.team or cfg.mm_team or "unknown-team"
+        team = ref.team or cfg.mm_team
+        if not team:
+            raise ChannelResolutionError(
+                f"no team to resolve channel {ref.slug!r} in: pass a full "
+                f"channel URL (https://host/<team>/channels/<slug>) or set "
+                f"MM_TEAM."
+            )
         try:
             channel = mm.get_channel_by_name(team, ref.slug)
         except Exception as exc:
@@ -576,7 +593,12 @@ def _resolve_explicit_anchor(ref: ChannelRef, cfg: Config, mm=None) -> Anchor:
                 f"{exc}. It may be private or archived, or the bot may not "
                 f"be a member of it."
             ) from exc
-        channel_id = (channel or {}).get("id") or ref.value
+        channel_id = (channel or {}).get("id")
+        if not channel_id:
+            raise ChannelResolutionError(
+                f"server returned no channel id when resolving "
+                f"{ref.slug!r} in team {team!r}."
+            )
         return Anchor(channel_id, None)
     # permalink
     try:
@@ -597,14 +619,14 @@ def _resolve_explicit_anchor(ref: ChannelRef, cfg: Config, mm=None) -> Anchor:
 def _resolve_post_anchor(
     cfg: Config,
     explicit_channel: str | None,
-    mm: MattermostClient | None = None,
+    mm: MattermostClient | None,
 ) -> Anchor:
     """Channel + default root_id for a post/read.
 
     ``--channel`` may be a channel id, a bare slug, a channel URL, or a
-    permalink URL (resolved above, needing a logged-in client for the
-    slug/permalink cases). Without ``--channel``, fall back to the current
-    session's sidecar (which may carry a root_id for thread-forked sessions).
+    permalink URL (the last two need a logged-in client). Without
+    ``--channel``, fall back to the current session's sidecar (which may
+    carry a root_id for thread-forked sessions).
     """
     if explicit_channel:
         ref = _validate_channel_ref(cfg, explicit_channel)
@@ -620,9 +642,10 @@ def _resolve_thread_root(
     """Resolve an explicit ``--thread`` value to a root post id.
 
     A permalink URL resolves to the post's thread root (``root_id``, or the
-    post itself if it is a root) via ``mm.get_post``. Every other value is
-    passed through untouched: it is either a post id, or something the server
-    will validate for us.
+    post itself if it is a root) via ``mm.get_post``. A channel URL is a
+    usage error (a channel is not a thread). Every other value is passed
+    through untouched as a post id: it is either a real id, or something
+    the server will validate for us.
     """
     if not thread:
         return None
@@ -632,6 +655,12 @@ def _resolve_thread_root(
         return thread  # not a URL → opaque post id (server validates)
     _assert_same_host(ref, cfg)
     if ref.kind != "permalink":
+        if ref.kind == "slug" and ref.host:
+            raise ChannelResolutionError(
+                "--thread must be a root post id or a permalink "
+                "(https://host/<team>/pl/<post_id>), not a channel URL "
+                f"({thread!r})."
+            )
         return thread  # explicit post id — use verbatim
     return _resolve_explicit_anchor(ref, cfg, mm).root_id or ref.post_id
 
