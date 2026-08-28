@@ -651,20 +651,30 @@ class RefRefinementReadTests(ReadCommandTests):
 
     def test_slug_without_client_raises_instead_of_slug_as_id(self) -> None:
         with self.assertRaises(cli.ChannelResolutionError):
-            cli._resolve_post_anchor(self.cfg, "general", None)
+            cli._resolve_post_anchor(
+                self.cfg, cli._validate_channel_ref(self.cfg, "general"), None,
+            )
 
     def test_channel_url_without_client_raises_instead_of_url_as_id(self) -> None:
         with self.assertRaises(cli.ChannelResolutionError):
-            cli._resolve_post_anchor(self.cfg, self.URL, None)
+            cli._resolve_post_anchor(
+                self.cfg, cli._validate_channel_ref(self.cfg, self.URL), None,
+            )
 
     def test_permalink_without_client_raises(self) -> None:
         with self.assertRaises(cli.ChannelResolutionError):
             cli._resolve_post_anchor(
-                self.cfg, f"https://{self.HOST}/team/pl/p1", None,
+                self.cfg,
+                cli._validate_channel_ref(
+                    self.cfg, f"https://{self.HOST}/team/pl/p1",
+                ),
+                None,
             )
 
     def test_id_ref_still_resolves_without_a_client(self) -> None:
-        anchor = cli._resolve_post_anchor(self.cfg, self.ID26, None)
+        anchor = cli._resolve_post_anchor(
+            self.cfg, cli._validate_channel_ref(self.cfg, self.ID26), None,
+        )
         self.assertEqual(anchor, cli.Anchor(self.ID26))
 
     # -- B: lookup response without an id is an error ----------------------

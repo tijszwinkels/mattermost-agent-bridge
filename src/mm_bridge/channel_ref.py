@@ -26,6 +26,11 @@ __all__ = ["ChannelRef", "ChannelRefError", "parse_channel_ref"]
 # Mattermost channel and post ids are base36(ish) 26-char lowercase strings.
 _ID_RE = re.compile(r"^[a-z0-9]{26}$")
 
+# Mattermost channel *names* (the URL slug) are lowercase [a-z0-9_-]. Matching
+# the real charset lets a typo fail here, offline, with an honest message —
+# rather than becoming a doomed lookup that 404s as "channel not found".
+_SLUG_RE = re.compile(r"^[a-z0-9_-]+$")
+
 
 class ChannelRefError(ValueError):
     """A ``--channel``/``--thread`` value that is none of id / slug / URL."""
@@ -49,9 +54,7 @@ class ChannelRef:
 
 
 def _is_slug(s: str) -> bool:
-    # Mattermost channel names are lowercase word/slug tokens; anything with
-    # whitespace or path separators is *not* a bare slug.
-    return bool(s) and " " not in s and "/" not in s
+    return bool(_SLUG_RE.match(s))
 
 
 def _url_parts(value: str) -> tuple[str, list[str]] | None:

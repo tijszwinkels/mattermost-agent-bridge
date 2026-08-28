@@ -140,3 +140,35 @@ class ParseErrorTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SlugCharsetTests(unittest.TestCase):
+    """A bare slug must look like a Mattermost channel name.
+
+    Mattermost channel names are ``[a-z0-9_-]+``. Accepting anything without
+    a space or a slash turns a typo into a doomed round-trip that 404s with
+    "channel not found", when the honest answer — available offline — is
+    "that is not a channel name".
+    """
+
+    def test_uppercase_is_rejected(self) -> None:
+        with self.assertRaises(ChannelRefError):
+            parse_channel_ref("Foo")
+
+    def test_punctuation_is_rejected(self) -> None:
+        for value in ("#general", "foo?bar", "foo.bar", "foo:bar", "foo@bar"):
+            with self.subTest(value=value), self.assertRaises(ChannelRefError):
+                parse_channel_ref(value)
+
+    def test_non_ascii_is_rejected(self) -> None:
+        with self.assertRaises(ChannelRefError):
+            parse_channel_ref("général")
+
+    def test_legal_channel_names_still_parse(self) -> None:
+        for value in ("general", "my-channel_2", "a1", "x"):
+            with self.subTest(value=value):
+                self.assertEqual(parse_channel_ref(value).kind, "slug")
+
+    def test_url_slug_segment_obeys_the_same_charset(self) -> None:
+        with self.assertRaises(ChannelRefError):
+            parse_channel_ref("https://mm.example/team/channels/Foo")

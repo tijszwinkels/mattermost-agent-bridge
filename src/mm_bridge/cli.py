@@ -528,20 +528,23 @@ def _validate_channel_ref(cfg: Config, value: str | None) -> ChannelRef | None:
     return ref
 
 
-def _precheck_thread_ref(cfg: Config, value: str | None) -> None:
+def _validate_thread_ref(cfg: Config, value: str | None) -> ChannelRef | None:
     """Pure (pre-login) validation of a ``--thread`` value.
 
     Rejects before any network use: a channel URL (wrong kind of thing for
     a thread) and permalink URLs for a foreign host. Post ids and bare
     slugs are legal syntax either way and the server will reject genuinely
     bad ids at post time.
+
+    Returns the parsed ref so the post-login resolver doesn't parse again
+    (``None`` when there is no value, or when it is an opaque post id).
     """
     if not value:
-        return
+        return None
     try:
         ref = parse_channel_ref(value)
     except ChannelRefError:
-        return  # not a URL → opaque post id, fine
+        return None  # not a URL → opaque post id, fine
     if ref.kind == "slug" and ref.host:
         # It parsed as a channel URL (…/<team>/channels/<slug>) — never a
         # thread reference.
@@ -552,6 +555,7 @@ def _precheck_thread_ref(cfg: Config, value: str | None) -> None:
         )
     if ref.kind == "permalink":
         _assert_same_host(ref, cfg)
+    return ref
 
 
 def _resolve_explicit_anchor(ref: ChannelRef, cfg: Config, mm: MattermostClient | None) -> Anchor:
@@ -618,7 +622,7 @@ def _resolve_explicit_anchor(ref: ChannelRef, cfg: Config, mm: MattermostClient 
 
 def _resolve_post_anchor(
     cfg: Config,
-    explicit_channel: str | None,
+    channel_ref: ChannelRef | None,
     mm: MattermostClient | None,
 ) -> Anchor:
     """Channel + default root_id for a post/read.
@@ -628,16 +632,18 @@ def _resolve_post_anchor(
     ``--channel``, fall back to the current session's sidecar (which may
     carry a root_id for thread-forked sessions).
     """
-    if explicit_channel:
-        ref = _validate_channel_ref(cfg, explicit_channel)
-        return _resolve_explicit_anchor(ref, cfg, mm)
+    if channel_ref is not None:
+        return _resolve_explicit_anchor(channel_ref, cfg, mm)
     return _resolve_anchor_from_session(
         cfg.sidecar_dir, _current_session_id(cfg.sidecar_dir),
     )
 
 
 def _resolve_thread_root(
-    cfg: Config, thread: str | None, mm: MattermostClient | None,
+    cfg: Config,
+    thread: str | None,
+    thread_ref: ChannelRef | None,
+    mm: MattermostClient | None,
 ) -> str | None:
     """Resolve an explicit ``--thread`` value to a root post id.
 
@@ -649,20 +655,12 @@ def _resolve_thread_root(
     """
     if not thread:
         return None
-    try:
-        ref = parse_channel_ref(thread)
-    except ChannelRefError:
-        return thread  # not a URL → opaque post id (server validates)
-    _assert_same_host(ref, cfg)
-    if ref.kind != "permalink":
-        if ref.kind == "slug" and ref.host:
-            raise ChannelResolutionError(
-                "--thread must be a root post id or a permalink "
-                "(https://host/<team>/pl/<post_id>), not a channel URL "
-                f"({thread!r})."
-            )
-        return thread  # explicit post id — use verbatim
-    return _resolve_explicit_anchor(ref, cfg, mm).root_id or ref.post_id
+    if thread_ref is None or thread_ref.kind != "permalink":
+        # Opaque post id (or a bare slug the server will reject). Channel
+        # URLs were already refused pre-login by `_validate_thread_ref`.
+        return thread
+    anchor = _resolve_explicit_anchor(thread_ref, cfg, mm)
+    return anchor.root_id or thread_ref.post_id
 
 
 def _resolve_self_identity(cfg: Config) -> tuple[str, str] | None:
@@ -768,8 +766,8 @@ def cmd_post(args: argparse.Namespace) -> int:
     # and URL refs pointing at a different Mattermost host than MM_URL exit
     # 2 without even logging in.
     try:
-        _validate_channel_ref(cfg, args.channel)
-        _precheck_thread_ref(cfg, args.thread)
+        channel_ref = _validate_channel_ref(cfg, args.channel)
+        thread_ref = _validate_thread_ref(cfg, args.thread)
     except ChannelResolutionError as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 2
@@ -785,7 +783,7 @@ def cmd_post(args: argparse.Namespace) -> int:
     # --thread (post id / permalink URL) now that we are logged in: both
     # need the API for the slug/permalink forms. Usage problems here exit 2.
     try:
-        anchor = _resolve_post_anchor(cfg, args.channel, mm)
+        anchor = _resolve_post_anchor(cfg, channel_ref, mm)
     except NotInMattermostChannel as exc:
         print(
             f"Error: not running inside a Mattermost channel and "
@@ -798,7 +796,7 @@ def cmd_post(args: argparse.Namespace) -> int:
         return 2
 
     try:
-        thread_root = _resolve_thread_root(cfg, args.thread, mm)
+        thread_root = _resolve_thread_root(cfg, args.thread, thread_ref, mm)
     except ChannelResolutionError as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 2
@@ -1066,8 +1064,8 @@ def cmd_read(args: argparse.Namespace) -> int:
     # and URL refs pointing at a different Mattermost host than MM_URL exit
     # 2 without even logging in.
     try:
-        _validate_channel_ref(cfg, args.channel)
-        _precheck_thread_ref(cfg, args.thread)
+        channel_ref = _validate_channel_ref(cfg, args.channel)
+        thread_ref = _validate_thread_ref(cfg, args.thread)
     except ChannelResolutionError as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 2
@@ -1083,7 +1081,7 @@ def cmd_read(args: argparse.Namespace) -> int:
     # --thread (post id / permalink URL) now that we are logged in: both
     # need the API for the slug/permalink forms. Usage problems exit 2.
     try:
-        anchor = _resolve_post_anchor(cfg, args.channel, mm)
+        anchor = _resolve_post_anchor(cfg, channel_ref, mm)
     except NotInMattermostChannel as exc:
         print(
             f"Error: not running inside a Mattermost channel and "
@@ -1096,7 +1094,7 @@ def cmd_read(args: argparse.Namespace) -> int:
         return 2
 
     try:
-        thread_root = _resolve_thread_root(cfg, args.thread, mm)
+        thread_root = _resolve_thread_root(cfg, args.thread, thread_ref, mm)
     except ChannelResolutionError as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 2
