@@ -104,7 +104,7 @@ a dormant channel they need an explicit mention.
 ## Commands the agent (or you) can run
 
 These work inside any session that has a sidecar — i.e. an agent running on the same host
-as the daemon. All of them accept `--channel <id>` to target another channel.
+as the daemon. All of them accept `--channel <channel>` to target another channel — a channel id, a bare slug (resolved against `MM_TEAM`), a channel URL, or a permalink URL (which also targets that post's thread).
 
 | Command | What it does |
 |---|---|

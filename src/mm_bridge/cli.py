@@ -24,6 +24,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
+from urllib.parse import urlsplit
 
 import json
 
@@ -32,6 +33,7 @@ from .agent_harness_client import AgentHarnessClient
 from .bridge import Bridge, resolve_attachment_path
 from .codex_session import find_active_codex_rollout_uuid, iter_session_ids_by_cwd
 from .config import Anchor, ChannelMapping, Config
+from .channel_ref import ChannelRef, ChannelRefError, parse_channel_ref
 from .mm_client import MattermostClient
 
 logger = logging.getLogger(__name__)
@@ -39,6 +41,12 @@ logger = logging.getLogger(__name__)
 
 class NotInMattermostChannel(RuntimeError):
     """Raised when the current Claude session has no MM-bridge sidecar."""
+
+
+class ChannelResolutionError(RuntimeError):
+    """``--channel``/``--thread`` was well-formed but can't be resolved:
+    unknown slug, unknown permalink post, or a URL for a different host.
+    Reported as a usage error (exit 2), not a Mattermost failure (3)."""
 
 
 class StdinError(RuntimeError):
@@ -473,20 +481,186 @@ def cmd_channels(args: argparse.Namespace) -> int:
 _MAX_POST_ATTACHMENTS = 10
 
 
-def _resolve_post_anchor(
-    cfg: Config, explicit_channel: str | None,
-) -> Anchor:
-    """Channel + default root_id for a post.
+def _configured_host(cfg: Config) -> str:
+    """Hostname of the configured Mattermost server (MM_URL), lowercased.
 
-    Explicit ``--channel`` wins with no default root_id. Otherwise fall
-    back to the current session's sidecar (which may carry a root_id
-    for thread-forked sessions).
+    MM_URL is usually a bare host (``localhost``/``mm.example``); tolerate a
+    scheme-prefixed value as well.
     """
-    if explicit_channel:
-        return Anchor(explicit_channel, None)
+    raw = (cfg.mm_url or "").strip()
+    parts = urlsplit(raw)
+    if parts.scheme in ("http", "https") and parts.hostname:
+        return parts.hostname.lower()
+    return urlsplit(f"//{raw}").hostname or raw.lower()
+
+
+def _assert_same_host(ref: ChannelRef, cfg: Config) -> None:
+    """Refuse to resolve a URL that points at a different Mattermost server:
+    the token + team + channel live on cfg.mm_url, so a foreign-host URL
+    can never resolve (and would just 404 with a misleading error)."""
+    if ref.host is None:
+        return  # bare id/slug — no host to compare
+    expected = _configured_host(cfg)
+    if ref.host != expected:
+        raise ChannelResolutionError(
+            f"channel URL host {ref.host!r} does not match the configured "
+            f"Mattermost host {expected!r} (MM_URL={cfg.mm_url!r}); refusing "
+            f"to resolve it."
+        )
+
+
+def _validate_channel_ref(cfg: Config, value: str | None) -> ChannelRef | None:
+    """Pure (pre-login) validation of a ``--channel`` value.
+
+    Parses it and rejects foreign-host URLs *before any network use*:
+    the token and team live on cfg.mm_url, so a URL for another host can
+    never resolve. Returns the parsed ref (or None for no value).
+    """
+    if not value:
+        return None
+    try:
+        ref = parse_channel_ref(value)
+    except ChannelRefError as exc:
+        raise ChannelResolutionError(
+            f"invalid --channel value: {exc}"
+        ) from exc
+    _assert_same_host(ref, cfg)
+    return ref
+
+
+def _validate_thread_ref(cfg: Config, value: str | None) -> ChannelRef | None:
+    """Pure (pre-login) validation of a ``--thread`` value.
+
+    Rejects before any network use: a channel URL (wrong kind of thing for
+    a thread) and permalink URLs for a foreign host. Post ids and bare
+    slugs are legal syntax either way and the server will reject genuinely
+    bad ids at post time.
+
+    Returns the parsed ref so the post-login resolver doesn't parse again
+    (``None`` when there is no value, or when it is an opaque post id).
+    """
+    if not value:
+        return None
+    try:
+        ref = parse_channel_ref(value)
+    except ChannelRefError:
+        return None  # not a URL → opaque post id, fine
+    if ref.kind == "slug" and ref.host:
+        # It parsed as a channel URL (…/<team>/channels/<slug>) — never a
+        # thread reference.
+        raise ChannelResolutionError(
+            "--thread must be a root post id or a permalink "
+            "(https://host/<team>/pl/<post_id>), not a channel URL "
+            f"({value!r})."
+        )
+    if ref.kind == "permalink":
+        _assert_same_host(ref, cfg)
+    return ref
+
+
+def _resolve_explicit_anchor(ref: ChannelRef, cfg: Config, mm: MattermostClient | None) -> Anchor:
+    """Resolve a parsed ``--channel`` reference to an :class:`Anchor`.
+
+    * ``id``        → used verbatim; the only kind resolvable without a
+      client (no lookup needed).
+    * ``slug``      → ``mm.get_channel_by_name(team, slug)`` against the
+      team from the URL, or ``cfg.mm_team`` for a bare slug.
+    * ``permalink`` → ``mm.get_post(post_id)``; the post's ``channel_id``
+      becomes the channel and its thread root (``root_id``, or the post
+      itself if it is a root) becomes the default root.
+
+    Falling back to the raw reference string (slug, URL…) as a channel id
+    would silently re-introduce the URL-as-id defect: every failure mode
+    here raises instead.
+    """
+    if ref.kind == "id":
+        return Anchor(ref.value, None)
+    if mm is None:
+        raise ChannelResolutionError(
+            f"resolving a {ref.kind!r} --channel value ({ref.value!r}) "
+            f"needs a logged-in Mattermost client; a 26-char channel id "
+            f"works without one."
+        )
+    if ref.kind == "slug":
+        team = ref.team or cfg.mm_team
+        if not team:
+            raise ChannelResolutionError(
+                f"no team to resolve channel {ref.slug!r} in: pass a full "
+                f"channel URL (https://host/<team>/channels/<slug>) or set "
+                f"MM_TEAM."
+            )
+        try:
+            channel = mm.get_channel_by_name(team, ref.slug)
+        except Exception as exc:
+            raise ChannelResolutionError(
+                f"could not resolve channel {ref.slug!r} in team {team!r}: "
+                f"{exc}. It may be private or archived, or the bot may not "
+                f"be a member of it."
+            ) from exc
+        channel_id = (channel or {}).get("id")
+        if not channel_id:
+            raise ChannelResolutionError(
+                f"server returned no channel id when resolving "
+                f"{ref.slug!r} in team {team!r}."
+            )
+        return Anchor(channel_id, None)
+    # permalink
+    try:
+        post = mm.get_post(ref.post_id)
+    except Exception as exc:
+        raise ChannelResolutionError(
+            f"could not resolve post {ref.post_id!r} from permalink: {exc}."
+        ) from exc
+    channel_id = (post or {}).get("channel_id")
+    if not channel_id:
+        raise ChannelResolutionError(
+            f"permalink post {ref.post_id!r} has no channel_id."
+        )
+    root_id = (post or {}).get("root_id") or (post or {}).get("id") or ref.post_id
+    return Anchor(channel_id, root_id)
+
+
+def _resolve_post_anchor(
+    cfg: Config,
+    channel_ref: ChannelRef | None,
+    mm: MattermostClient | None,
+) -> Anchor:
+    """Channel + default root_id for a post/read.
+
+    ``--channel`` may be a channel id, a bare slug, a channel URL, or a
+    permalink URL (the last two need a logged-in client). Without
+    ``--channel``, fall back to the current session's sidecar (which may
+    carry a root_id for thread-forked sessions).
+    """
+    if channel_ref is not None:
+        return _resolve_explicit_anchor(channel_ref, cfg, mm)
     return _resolve_anchor_from_session(
         cfg.sidecar_dir, _current_session_id(cfg.sidecar_dir),
     )
+
+
+def _resolve_thread_root(
+    cfg: Config,
+    thread: str | None,
+    thread_ref: ChannelRef | None,
+    mm: MattermostClient | None,
+) -> str | None:
+    """Resolve an explicit ``--thread`` value to a root post id.
+
+    A permalink URL resolves to the post's thread root (``root_id``, or the
+    post itself if it is a root) via ``mm.get_post``. A channel URL is a
+    usage error (a channel is not a thread). Every other value is passed
+    through untouched as a post id: it is either a real id, or something
+    the server will validate for us.
+    """
+    if not thread:
+        return None
+    if thread_ref is None or thread_ref.kind != "permalink":
+        # Opaque post id (or a bare slug the server will reject). Channel
+        # URLs were already refused pre-login by `_validate_thread_ref`.
+        return thread
+    anchor = _resolve_explicit_anchor(thread_ref, cfg, mm)
+    return anchor.root_id or thread_ref.post_id
 
 
 def _resolve_self_identity(cfg: Config) -> tuple[str, str] | None:
@@ -576,18 +750,6 @@ def cmd_post(args: argparse.Namespace) -> int:
     cfg = Config.load()
     _require_bot_token(cfg)
 
-    try:
-        anchor = _resolve_post_anchor(cfg, args.channel)
-    except NotInMattermostChannel as exc:
-        print(
-            f"Error: not running inside a Mattermost channel and "
-            f"no --channel given ({exc}).",
-            file=sys.stderr,
-        )
-        return 2
-
-    root_id = _resolve_effective_root(anchor, args.thread, args.no_thread)
-
     # ``allow_empty=True``: post keeps its own empty-body check below, which
     # also honours the empty-body-with-``--file`` case the helper can't see.
     try:
@@ -600,12 +762,46 @@ def cmd_post(args: argparse.Namespace) -> int:
         print("Error: message body is empty.", file=sys.stderr)
         return 2
 
+    # Validate --channel / --thread BEFORE any network use: malformed values
+    # and URL refs pointing at a different Mattermost host than MM_URL exit
+    # 2 without even logging in.
+    try:
+        channel_ref = _validate_channel_ref(cfg, args.channel)
+        thread_ref = _validate_thread_ref(cfg, args.thread)
+    except ChannelResolutionError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 2
+
     mm = _make_mm_client(cfg)
     try:
         mm.login()
     except Exception as exc:
         print(f"Error: could not log into Mattermost: {exc}", file=sys.stderr)
         return 3
+
+    # Resolve --channel (id / bare slug / channel URL / permalink URL) and
+    # --thread (post id / permalink URL) now that we are logged in: both
+    # need the API for the slug/permalink forms. Usage problems here exit 2.
+    try:
+        anchor = _resolve_post_anchor(cfg, channel_ref, mm)
+    except NotInMattermostChannel as exc:
+        print(
+            f"Error: not running inside a Mattermost channel and "
+            f"no --channel given ({exc}).",
+            file=sys.stderr,
+        )
+        return 2
+    except ChannelResolutionError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 2
+
+    try:
+        thread_root = _resolve_thread_root(cfg, args.thread, thread_ref, mm)
+    except ChannelResolutionError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 2
+
+    root_id = _resolve_effective_root(anchor, thread_root, args.no_thread)
 
     try:
         max_bytes = mm.get_max_file_size()
@@ -849,18 +1045,6 @@ def cmd_read(args: argparse.Namespace) -> int:
     cfg = Config.load()
     _require_bot_token(cfg)
 
-    try:
-        anchor = _resolve_post_anchor(cfg, args.channel)
-    except NotInMattermostChannel as exc:
-        print(
-            f"Error: not running inside a Mattermost channel and "
-            f"no --channel given ({exc}).",
-            file=sys.stderr,
-        )
-        return 2
-
-    root_id = _resolve_effective_root(anchor, args.thread, args.no_thread)
-
     since_ms: int | None = None
     if args.since:
         try:
@@ -876,12 +1060,46 @@ def cmd_read(args: argparse.Namespace) -> int:
         limit = min(max(args.n, 1), cfg.catch_up_max_n)
         uncapped = False
 
+    # Validate --channel / --thread BEFORE any network use: malformed values
+    # and URL refs pointing at a different Mattermost host than MM_URL exit
+    # 2 without even logging in.
+    try:
+        channel_ref = _validate_channel_ref(cfg, args.channel)
+        thread_ref = _validate_thread_ref(cfg, args.thread)
+    except ChannelResolutionError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 2
+
     mm = _make_mm_client(cfg)
     try:
         mm.login()
     except Exception as exc:
         print(f"Error: could not log into Mattermost: {exc}", file=sys.stderr)
         return 3
+
+    # Resolve --channel (id / bare slug / channel URL / permalink URL) and
+    # --thread (post id / permalink URL) now that we are logged in: both
+    # need the API for the slug/permalink forms. Usage problems exit 2.
+    try:
+        anchor = _resolve_post_anchor(cfg, channel_ref, mm)
+    except NotInMattermostChannel as exc:
+        print(
+            f"Error: not running inside a Mattermost channel and "
+            f"no --channel given ({exc}).",
+            file=sys.stderr,
+        )
+        return 2
+    except ChannelResolutionError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 2
+
+    try:
+        thread_root = _resolve_thread_root(cfg, args.thread, thread_ref, mm)
+    except ChannelResolutionError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 2
+
+    root_id = _resolve_effective_root(anchor, thread_root, args.no_thread)
 
     try:
         if root_id:
@@ -1337,12 +1555,20 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p_post.add_argument(
         "--channel",
-        help="Channel id. Defaults to the current session's channel.",
+        help=(
+            "Channel id, bare slug, channel URL "
+            "(…/<team>/channels/<slug>), or permalink URL (…/<team>/pl/<post>) — "
+            "the last also posts into that post's thread. Defaults to the "
+            "current session's channel."
+        ),
     )
     thread_group = p_post.add_mutually_exclusive_group()
     thread_group.add_argument(
         "--thread", metavar="ROOT_POST_ID",
-        help="Post as a reply inside this thread.",
+        help=(
+            "Post as a reply inside this thread. A root post id or a "
+            "permalink URL (…/<team>/pl/<post>) whose post's thread root is used."
+        ),
     )
     thread_group.add_argument(
         "--no-thread", action="store_true",
@@ -1362,12 +1588,20 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p_read.add_argument(
         "--channel",
-        help="Channel id. Defaults to the current session's channel.",
+        help=(
+            "Channel id, bare slug (resolved against the configured team), "
+            "channel URL (…/<team>/channels/<slug>), or permalink URL "
+            "(…/<team>/pl/<post>) — the last also reads that post's thread "
+            "unless --no-thread is given. Defaults to the current session's channel."
+        ),
     )
     read_thread_group = p_read.add_mutually_exclusive_group()
     read_thread_group.add_argument(
         "--thread", metavar="ROOT_POST_ID",
-        help="Read only posts inside this thread.",
+        help=(
+            "Read only posts inside this thread. A root post id or a "
+            "permalink URL (…/<team>/pl/<post>) whose post's thread root is used."
+        ),
     )
     read_thread_group.add_argument(
         "--no-thread", action="store_true",

@@ -44,6 +44,15 @@ class FakeMM:
     files: dict = field(default_factory=dict)
     logged_in: bool = False
     calls: list = field(default_factory=list)
+    # channel slug → channel record, for ``--channel`` slug/URL resolution.
+    named_channels: dict = field(default_factory=dict)
+    # post id → post record, for permalink resolution (``--channel``/``--thread``).
+    post_by_id: dict = field(default_factory=dict)
+    # Simulate a 404 from the two lookups above.
+    channel_lookup_404: bool = False
+    # Simulate a lookup response with no usable "id" key.
+    channel_lookup_empty: bool = False
+    post_lookup_404: bool = False
 
     def login(self) -> None:
         self.logged_in = True
@@ -69,6 +78,26 @@ class FakeMM:
 
     def get_file_info(self, file_id: str) -> dict:
         return self.files.get(file_id, {"id": file_id})
+
+    def get_channel_by_name(self, team_name: str, channel_name: str) -> dict:
+        self.calls.append(("get_channel_by_name", team_name, channel_name))
+        if self.channel_lookup_404:
+            raise RuntimeError(
+                f"404 NOT FOUND: channel '{channel_name}' in team '{team_name}'"
+            )
+        if self.channel_lookup_empty:
+            return {}
+        if channel_name in self.named_channels:
+            return self.named_channels[channel_name]
+        # Identity fallback keeps legacy bare-slug tests green: the slug IS
+        # the resolved id.
+        return {"id": channel_name, "name": channel_name}
+
+    def get_post(self, post_id: str) -> dict:
+        self.calls.append(("get_post", post_id))
+        if self.post_lookup_404 or post_id not in self.post_by_id:
+            raise RuntimeError(f"404 NOT FOUND: post '{post_id}'")
+        return self.post_by_id[post_id]
 
 
 class ParseSinceTests(unittest.TestCase):
@@ -201,7 +230,9 @@ class ReadCommandTests(unittest.TestCase):
             mm, ["mm-bridge", "read", "--channel", "c1", "--since", "2h"],
         )
         self.assertEqual(rc, 0)
-        self.assertEqual(mm.calls[0][0], "get_posts_since")
+        calls = [c for c in mm.calls
+                 if c[0] not in ("get_user", "get_channel_by_name")]
+        self.assertEqual(calls[0][0], "get_posts_since")
 
     # ---------- filtering / ordering ----------
 
@@ -391,6 +422,322 @@ class ReadCommandTests(unittest.TestCase):
         )
         self.assertEqual(rc, 0)
         self.assertEqual(out.strip(), "")
+
+
+class ChannelAndPermalinkRefReadTests(ReadCommandTests):
+    """``--channel`` / ``--thread`` accept a slug, channel URL, or permalink:
+
+    * 26-char ``[a-z0-9]{26}`` string → channel/post id, used verbatim;
+    * bare slug → resolved against the configured team (cfg.mm_team);
+    * channel URL ``.../<team>/channels/<slug>`` → resolved against
+      that team in the URL;
+    * permalink URL ``.../<team>/pl/<post_id>`` → channel AND thread root
+      come from the post; ``--thread`` (explicit) wins, ``--no-thread``
+      reads the whole channel;
+    * URLs whose host doesn't match the configured MM host are refused
+      (exit 2) before any login / network call;
+    * unknown slug / permalink → friendly error, exit 2, nothing posted.
+    """
+
+    HOST = "mm.example"
+    ID26 = "a1b2c3d4e5f6g7h8i9j0k1l2m3"  # exactly 26 × [a-z0-9] (24 would be a slug!)
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.cfg.mm_url = self.HOST
+
+    def _mk_user_and_post(self, mm: FakeMM) -> None:
+        mm.users["u-1"] = "ada"
+
+    # -- slug -----------------------------------------------------------
+
+    def test_bare_slug_resolves_against_configured_team(self) -> None:
+        mm = FakeMM()
+        mm.named_channels["general"] = {"id": "chan-general"}
+        mm.posts_by_channel["chan-general"] = [
+            _mk_post("p1", create_at=100, message="hi from general"),
+        ]
+        rc, out, _ = self._invoke(mm, ["mm-bridge", "read", "--channel", "general"])
+        self.assertEqual(rc, 0)
+        self.assertIn("hi from general", out)
+        self.assertIn(("get_channel_by_name", "workspace", "general"), mm.calls)
+        self.assertIn(("get_posts", "chan-general", 50), mm.calls)
+
+    def test_channel_url_uses_team_and_slug_from_url(self) -> None:
+        mm = FakeMM()
+        mm.named_channels["general"] = {"id": "chan-general"}
+        mm.posts_by_channel["chan-general"] = [
+            _mk_post("p1", create_at=100, message="from tinkertank"),
+        ]
+        url = f"https://{self.HOST}/tinkertank/channels/general"
+        rc, out, _ = self._invoke(mm, ["mm-bridge", "read", "--channel", url])
+        self.assertEqual(rc, 0)
+        self.assertIn("from tinkertank", out)
+        self.assertIn(("get_channel_by_name", "tinkertank", "general"), mm.calls)
+
+    # -- id fast path ----------------------------------------------------
+
+    def test_26_char_id_used_verbatim_without_lookup(self) -> None:
+        mm = FakeMM()
+        mm.posts_by_channel[self.ID26] = [_mk_post("p1", create_at=100, message="by id")]
+        rc, out, _ = self._invoke(mm, ["mm-bridge", "read", "--channel", self.ID26])
+        self.assertEqual(rc, 0)
+        self.assertIn("by id", out)
+        self.assertIn(("get_posts", self.ID26, 50), mm.calls)
+        for c in mm.calls:
+            self.assertNotEqual(c[0], "get_channel_by_name")
+            self.assertNotEqual(c[0], "get_post")
+
+    # -- permalink -------------------------------------------------------
+
+    def _permalink_post(self, mm: FakeMM, post_id: str = "p1", root_id: str = "root1") -> None:
+        mm.post_by_id[post_id] = {
+            "id": post_id, "channel_id": "chan-link", "root_id": root_id,
+        }
+        mm.thread_posts[root_id] = [
+            _mk_post("p2", create_at=100, message="in the permalined thread"),
+        ]
+        mm.posts_by_channel["chan-link"] = [
+            _mk_post("p3", create_at=90, message="channel-level"),
+        ]
+
+    def test_permalink_resolves_channel_and_thread(self) -> None:
+        mm = FakeMM()
+        self._permalink_post(mm)
+        url = f"https://{self.HOST}/team/pl/p1"
+        rc, out, err = self._invoke(mm, ["mm-bridge", "read", "--channel", url])
+        self.assertEqual(rc, 0, err)
+        self.assertIn("in the permalined thread", out)
+        self.assertNotIn("channel-level", out)
+        self.assertIn(("get_post", "p1"), mm.calls)
+        self.assertIn(("get_thread_posts", "root1"), mm.calls)
+
+    def test_permalink_on_a_root_post_uses_the_post_itself(self) -> None:
+        mm = FakeMM()
+        mm.post_by_id["rootx"] = {
+            "id": "rootx", "channel_id": "chan-link", "root_id": "",
+        }
+        mm.thread_posts["rootx"] = [
+            _mk_post("p9", create_at=100, message="root itself"),
+        ]
+        url = f"https://{self.HOST}/team/pl/rootx"
+        rc, out, err = self._invoke(mm, ["mm-bridge", "read", "--channel", url])
+        self.assertEqual(rc, 0, err)
+        self.assertIn("root itself", out)
+        self.assertIn(("get_thread_posts", "rootx"), mm.calls)
+
+    def test_permalink_with_explicit_thread_prefers_thread(self) -> None:
+        mm = FakeMM()
+        self._permalink_post(mm)
+        mm.thread_posts["explicit-root"] = [
+            _mk_post("p4", create_at=100, message="explicit thread"),
+        ]
+        url = f"https://{self.HOST}/team/pl/p1"
+        rc, out, _ = self._invoke(mm, [
+            "mm-bridge", "read", "--channel", url, "--thread", "explicit-root",
+        ])
+        self.assertEqual(rc, 0)
+        self.assertIn("explicit thread", out)
+        self.assertIn(("get_thread_posts", "explicit-root"), mm.calls)
+        # The permalink post WAS still fetched (it carried the channel).
+        self.assertIn(("get_post", "p1"), mm.calls)
+
+    def test_permalink_with_no_thread_reads_the_whole_channel(self) -> None:
+        mm = FakeMM()
+        self._permalink_post(mm)
+        url = f"https://{self.HOST}/team/pl/p1"
+        rc, out, _ = self._invoke(mm, [
+            "mm-bridge", "read", "--channel", url, "--no-thread",
+        ])
+        self.assertEqual(rc, 0)
+        self.assertIn("channel-level", out)
+        self.assertNotIn("in the permalined thread", out)
+        self.assertIn(("get_post", "p1"), mm.calls)
+        self.assertIn(("get_posts", "chan-link", 50), mm.calls)
+        for c in mm.calls:
+            self.assertNotEqual(c[0], "get_thread_posts")
+
+    # -- error paths -----------------------------------------------------
+
+    def test_foreign_host_url_refused_without_network(self) -> None:
+        mm = FakeMM()
+        mm.named_channels["general"] = {"id": "chan-general"}
+        url = f"https://other.example/tinkertank/channels/general"
+        rc, _, err = self._invoke(mm, ["mm-bridge", "read", "--channel", url])
+        self.assertEqual(rc, 2)
+        self.assertIn("other.example", err)
+        self.assertIn(self.HOST, err)
+        self.assertFalse(mm.logged_in)
+        for c in mm.calls:
+            self.assertNotIn(c[0], ("get_posts", "get_posts_since",
+                                    "get_thread_posts", "get_channel_by_name",
+                                    "get_post"))
+
+    def test_unknown_slug_exits_2_with_membership_hint(self) -> None:
+        mm = FakeMM()
+        mm.channel_lookup_404 = True
+        rc, _, err = self._invoke(mm, ["mm-bridge", "read", "--channel", "ghost-chan"])
+        self.assertEqual(rc, 2)
+        self.assertIn("ghost-chan", err)
+        self.assertIn("workspace", err)
+        self.assertIn("member", err.lower())
+
+    def test_unknown_permalink_post_exits_2(self) -> None:
+        mm = FakeMM()
+        mm.post_lookup_404 = True
+        url = f"https://{self.HOST}/team/pl/missing"
+        rc, _, err = self._invoke(mm, ["mm-bridge", "read", "--channel", url])
+        self.assertEqual(rc, 2)
+        self.assertIn("missing", err)
+
+    def test_malformed_channel_arg_exits_2(self) -> None:
+        for bad in (
+            f"https://{self.HOST}/",           # URL with no segment path
+            "not a url at all /",               # bare token with spaces/slash
+            "mm.example/t/channels/s",           # schemeless URL-like thing
+        ):
+            mm = FakeMM()
+            rc, _, err = self._invoke(mm, ["mm-bridge", "read", "--channel", bad])
+            self.assertEqual(rc, 2, (bad, err))
+            self.assertIn("channel", err.lower())
+
+    def test_thread_permalink_root_resolved(self) -> None:
+        mm = FakeMM()
+        self._permalink_post(mm)
+        mm.posts_by_channel["c1"] = [_mk_post("g1", create_at=100, message="ignored")]
+        url = f"https://{self.HOST}/team/pl/p1"
+        rc, out, _ = self._invoke(mm, [
+            "mm-bridge", "read", "--channel", "c1", "--thread", url,
+        ])
+        self.assertEqual(rc, 0)
+        self.assertIn("in the permalined thread", out)
+        self.assertIn(("get_post", "p1"), mm.calls)
+        self.assertIn(("get_thread_posts", "root1"), mm.calls)
+
+    def test_thread_permalink_foreign_host_refused(self) -> None:
+        mm = FakeMM()
+        mm.posts_by_channel["c1"] = [_mk_post("g2", create_at=100, message="x")]
+        url = f"https://other.example/team/pl/p1"
+        rc, _, err = self._invoke(mm, [
+            "mm-bridge", "read", "--channel", "c1", "--thread", url,
+        ])
+        self.assertEqual(rc, 2)
+        self.assertIn("other.example", err)
+        for c in mm.calls:
+            self.assertNotEqual(c[0], "get_post")
+
+
+class RefRefinementReadTests(ReadCommandTests):
+    """Reviewer fixes A–D: no silent fallback to the unresolved string.
+
+    A — slug/permalink refs need a logged-in client (ids don't):
+       without one, resolving them as their raw value is the original
+       URL-as-id defect re-entering through the new code path;
+    B — a lookup response without a usable id is an error, not a fallback;
+    C — a bare slug with no configured team is an honest error, not a
+       "unknown-team" 404;
+    D — a channel URL in --thread is a usage error, not a post id.
+    """
+
+    HOST = "mm.example"
+    ID26 = "a1b2c3d4e5f6g7h8i9j0k1l2m3"  # exactly 26 × [a-z0-9]
+    URL = "https://mm.example/tinkertank/channels/general"
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.cfg.mm_url = self.HOST
+
+    # -- A: client required for slug/permalink; id resolves without one ----
+
+    def test_slug_without_client_raises_instead_of_slug_as_id(self) -> None:
+        with self.assertRaises(cli.ChannelResolutionError):
+            cli._resolve_post_anchor(
+                self.cfg, cli._validate_channel_ref(self.cfg, "general"), None,
+            )
+
+    def test_channel_url_without_client_raises_instead_of_url_as_id(self) -> None:
+        with self.assertRaises(cli.ChannelResolutionError):
+            cli._resolve_post_anchor(
+                self.cfg, cli._validate_channel_ref(self.cfg, self.URL), None,
+            )
+
+    def test_permalink_without_client_raises(self) -> None:
+        with self.assertRaises(cli.ChannelResolutionError):
+            cli._resolve_post_anchor(
+                self.cfg,
+                cli._validate_channel_ref(
+                    self.cfg, f"https://{self.HOST}/team/pl/p1",
+                ),
+                None,
+            )
+
+    def test_id_ref_still_resolves_without_a_client(self) -> None:
+        anchor = cli._resolve_post_anchor(
+            self.cfg, cli._validate_channel_ref(self.cfg, self.ID26), None,
+        )
+        self.assertEqual(anchor, cli.Anchor(self.ID26))
+
+    # -- B: lookup response without an id is an error ----------------------
+
+    def test_slug_lookup_without_id_in_response_raises(self) -> None:
+        mm = FakeMM()
+        mm.channel_lookup_empty = True
+        mm.posts_by_channel["general"] = [
+            _mk_post("p1", create_at=100, message="would fetch if slug as id"),
+        ]
+        rc, _, err = self._invoke(
+            mm, ["mm-bridge", "read", "--channel", "general"],
+        )
+        self.assertEqual(rc, 2)
+        self.assertIn("general", err)
+        for c in mm.calls:
+            self.assertNotEqual(c[0], ("get_posts", "get_posts_since"))
+
+    # -- C: no configured team → honest error before the lookup ------------
+
+    def test_bare_slug_without_configured_team_raises(self) -> None:
+        self.cfg.mm_team = ""
+        mm = FakeMM()
+        mm.named_channels["general"] = {"id": "chan-general"}
+        mm.posts_by_channel["chan-general"] = [
+            _mk_post("p1", create_at=100, message="hi"),
+        ]
+        rc, _, err = self._invoke(
+            mm, ["mm-bridge", "read", "--channel", "general"],
+        )
+        self.assertEqual(rc, 2)
+        self.assertIn("general", err)
+        self.assertIn("team", err.lower())
+        for c in mm.calls:
+            self.assertNotEqual(c[0], ("get_channel_by_name", "get_posts"))
+
+    # -- D: a channel URL is not a --thread reference -----------------------
+
+    def test_thread_channel_url_rejected_without_fetch(self) -> None:
+        mm = FakeMM()
+        mm.posts_by_channel["c1"] = [_mk_post("p1", create_at=100, message="x")]
+        rc, _, err = self._invoke(mm, [
+            "mm-bridge", "read", "--channel", "c1", "--thread", self.URL,
+        ])
+        self.assertEqual(rc, 2)
+        self.assertIn("thread", err.lower())
+        for c in mm.calls:
+            self.assertNotIn(c[0], ("get_posts", "get_posts_since",
+                                   "get_thread_posts"))
+
+    def test_thread_bare_slug_still_passes_through_as_post_id(self) -> None:
+        mm = FakeMM()
+        mm.thread_posts["some-post-id-like-slug"] = [
+            _mk_post("p1", create_at=100, user_id="u1", message="in thread"),
+        ]
+        mm.users["u1"] = "ada"
+        rc, out, _ = self._invoke(mm, [
+            "mm-bridge", "read", "--channel", "c1",
+            "--thread", "some-post-id-like-slug",
+        ])
+        self.assertEqual(rc, 0)
+        self.assertIn("in thread", out)
+        self.assertIn(("get_thread_posts", "some-post-id-like-slug"), mm.calls)
 
 
 if __name__ == "__main__":

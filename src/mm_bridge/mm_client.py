@@ -243,6 +243,17 @@ class MattermostClient:
     def get_channel(self, channel_id: str) -> dict:
         return self._driver.channels.get_channel(channel_id)
 
+    def get_channel_by_name(self, team_name: str, channel_name: str) -> dict:
+        """Resolve a channel slug to its record (id, name, ...).
+
+        Uses GET /teams/name/{team}/channels/name/{channel}, which works for
+        private channels the bot is a member of (unlike the public listing).
+        Raises on 404 (unknown name, not a member, or archived).
+        """
+        return self._driver.channels.get_channel_by_name_for_team_name(
+            team_name, channel_name,
+        )
+
     def get_channel_members(self, channel_id: str) -> list[dict]:
         """Return membership records (user_id + roles) for `channel_id`."""
         return self._driver.channels.get_channel_members(channel_id)

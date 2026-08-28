@@ -64,6 +64,9 @@ class FakeChannelsApi:
     pre-staged pages from ``page_responses``."""
     page_responses: list[list[dict]] = field(default_factory=list)
     calls: list[tuple[str, dict]] = field(default_factory=list)
+    # slug → channel record, for get_channel_by_name_for_team_name.
+    named: dict = field(default_factory=dict)
+    name_calls: list[tuple[str, str]] = field(default_factory=list)
 
     def get_public_channels_for_team(self, team_id, params=None):
         self.calls.append((team_id, dict(params or {})))
@@ -74,6 +77,14 @@ class FakeChannelsApi:
                 "the last staged response"
             )
         return self.page_responses[idx]
+
+    def get_channel_by_name_for_team_name(
+        self, team_name, channel_name, include_deleted=False,
+    ):
+        self.name_calls.append((team_name, channel_name))
+        if channel_name in self.named:
+            return self.named[channel_name]
+        return {"id": channel_name, "name": channel_name}
 
 
 @dataclass
@@ -454,3 +465,19 @@ def test_ws_connect_passes_heartbeat_to_aiohttp():
     # reconnects and silently stalled MM events. Drift here should be
     # an explicit decision, not a silent edit.
     assert captured_kwargs["heartbeat"] == 30
+
+
+def test_get_channel_by_name_delegates_to_name_endpoint():
+    """"--channel <slug>" resolution must hit
+    GET /teams/name/{team}/channels/name/{channel} via the driver,
+    passing the team + slug through verbatim."""
+    driver = FakeDriver()
+    driver.channels.named["meshenger-v2"] = {
+        "id": "chan-mesh", "name": "meshenger-v2",
+    }
+    client = _make_client_with_driver(driver)
+
+    ch = client.get_channel_by_name("tinkertank", "meshenger-v2")
+
+    assert ch["id"] == "chan-mesh"
+    assert driver.channels.name_calls == [("tinkertank", "meshenger-v2")]
