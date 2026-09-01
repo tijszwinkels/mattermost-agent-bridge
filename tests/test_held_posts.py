@@ -64,6 +64,25 @@ class HeldPostTest(unittest.TestCase):
         h = HeldPost(post={"id": "p1"}, username="tijs", held_at_ms=0)
         self.assertEqual(h.timestamp(), "??:??")
 
+    def test_render_includes_attachment_notes_above_the_message(self):
+        h = held("p1", message="see attached")
+        line = h.render(["[User attached file: /tmp/x/notes.txt]"])
+        self.assertIn("notes.txt", line)
+        self.assertLess(line.index("notes.txt"), line.index("see attached"))
+
+    def test_render_of_an_empty_post_is_empty(self):
+        # A post that was only a bot mention renders to nothing, so the
+        # flush can skip it rather than send a stamped blank line.
+        self.assertEqual(held("p1", message="").render(), "")
+
+    def test_summary_is_the_first_line_only(self):
+        h = held("p1", message="first\nsecond")
+        self.assertTrue(h.summary().endswith("first…"))
+        self.assertNotIn("second", h.summary())
+
+    def test_summary_of_a_single_line_post_has_no_ellipsis(self):
+        self.assertFalse(held("p1", message="just one").summary().endswith("…"))
+
     def test_json_round_trip(self):
         h = held("p1", message="hello", username="bittern")
         again = HeldPost.from_json(json.loads(json.dumps(h.to_json())))

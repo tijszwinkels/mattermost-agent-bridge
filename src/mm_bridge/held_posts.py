@@ -117,6 +117,17 @@ class HeldPost:
             return ""
         return f"{self.timestamp()} {self.username}: " + "\n".join(parts)
 
+    def summary(self) -> str:
+        """One-line form for a listing (``.queue``, ``mm-bridge inbox``).
+
+        Listings wrap each entry in a backtick span, so a multi-line post
+        would break the Markdown — and a wall of quoted text stops being a
+        listing. The ellipsis marks that there is more.
+        """
+        line = self.render()
+        first, sep, _rest = line.partition("\n")
+        return f"{first}…" if sep else first
+
     def to_json(self) -> dict:
         return {
             "held_at_ms": self.held_at_ms,

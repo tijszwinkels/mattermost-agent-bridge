@@ -1219,7 +1219,7 @@ def cmd_inbox(args: argparse.Namespace) -> int:
     where = anchor.channel_id + (f" (thread {anchor.root_id})" if anchor.root_id else "")
     print(f"{len(held)} post(s) held for {where}, not yet delivered:")
     for h in held:
-        print(f"  {h.render()}")
+        print(f"  {h.summary()}")
     return 0
 
 

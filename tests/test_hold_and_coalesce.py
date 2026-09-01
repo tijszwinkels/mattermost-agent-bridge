@@ -351,6 +351,22 @@ class QueueCommandTests(_HoldTestCase):
         self.assertIn(".queue", self.last_post())
         self.assertEqual(self.held_ids(), ["p1", "p2"])  # nothing dropped
 
+    async def test_queue_listing_keeps_each_post_to_one_line(self):
+        # The listing wraps each entry in a backtick span, so a multi-line
+        # post would break the Markdown — and a wall of text isn't a
+        # "listing" anyway. First line, marked as truncated.
+        self.run_live()
+        self.bridge.mm.users["u1"] = {"id": "u1", "username": "tijs"}
+        await self.bridge._on_mm_posted(
+            self.post("p1", "first line\nsecond line\nthird line"),
+        )
+        await self.bridge._on_mm_posted(self.post("p2", ".queue"))
+
+        body = self.last_post()
+        self.assertIn("first line", body)
+        self.assertNotIn("second line", body)
+        self.assertIn("…", body)
+
     async def test_queue_appears_in_help(self):
         from mm_bridge import commands
         self.assertIn(".queue", commands.help_text())

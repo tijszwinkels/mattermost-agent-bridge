@@ -3725,7 +3725,7 @@ class Bridge:
             )
             return
 
-        listing = "\n".join(f"• `{h.render()}`" for h in held)
+        listing = "\n".join(f"• `{h.summary()}`" for h in held)
         if not wants_clear:
             self._post_cmd_reply(
                 channel_id,
