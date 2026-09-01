@@ -4079,6 +4079,12 @@ class Bridge:
         An unknown `kind` is refused (state unchanged) rather than stored:
         every reader — the fleet renderer, the nag sweep, the CLI — assumes
         `kind in KINDS`, and a typo must not be able to break them.
+
+        **Never raises.** A caller's own error handling must not be derailed
+        by bookkeeping — F3 calls this from its run-failure surfacing, and a
+        raise here would swallow the warning post it still owes the channel.
+        A session with no state yet (or no state file write) is fine: the
+        state is created, and a failed persist is logged, not propagated.
         """
         prev = self.mapping.get_state(session_id)
         if kind not in KINDS:
@@ -4087,13 +4093,18 @@ class Bridge:
                 kind, session_id[:8], ", ".join(KINDS),
             )
             return prev
-        self.mapping.set_state(session_id, SessionState(
-            kind=kind,
-            on=(on or None),
-            note=(note or None),
-            set_at=time.time(),
-            source=source,
-        ))
+        try:
+            self.mapping.set_state(session_id, SessionState(
+                kind=kind,
+                on=(on or None),
+                note=(note or None),
+                set_at=time.time(),
+                source=source,
+            ))
+        except Exception:
+            logger.exception(
+                "Failed to persist session state %s for %s", kind, session_id[:8],
+            )
         self._nagged_levels.pop(session_id, None)
         return prev
 
@@ -4164,11 +4175,15 @@ class Bridge:
         """
         prev = self.mapping.get_state(session_id)
         now = time.time()
-        self.mapping.set_state(
-            session_id,
-            replace(prev, set_at=now) if prev is not None
-            else SessionState(DEFAULT_KIND, set_at=now),
-        )
+        try:
+            self.mapping.set_state(
+                session_id,
+                replace(prev, set_at=now) if prev is not None
+                else SessionState(DEFAULT_KIND, set_at=now),
+            )
+        except Exception:
+            # Run lifecycle handling must never die on bookkeeping.
+            logger.exception("Failed to re-stamp state for %s", session_id[:8])
         self._nagged_levels.pop(session_id, None)
 
     def _session_has_active_run(self, session_id: str) -> bool:

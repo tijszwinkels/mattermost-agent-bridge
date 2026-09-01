@@ -63,11 +63,24 @@ class SessionState:
     def describe(self) -> str:
         """The state column: ``awaiting → lead``, ``idle``, ``blocked``.
 
-        The note is deliberately NOT folded in here. One rule — the note
+        An agent's note is deliberately NOT folded in: one rule — the note
         always lives in its own column — beats a rule that depends on
         whether `on` happens to be set.
+
+        The one exception is a BRIDGE-classified block. Round F3 calls
+        ``set_session_state(sid, "blocked", note="<class> (<provider>, HTTP
+        <status>)", source="bridge")``, where the note's first token is a
+        machine vocabulary term (`quota_exhausted`, `rate_limited`, `auth`,
+        `context_overflow`, `harness_process`, `unknown`). Surfacing it in
+        the state column is what lets a lead see WHY a lane is stuck without
+        reading across to the note. An agent-declared note is prose, not a
+        class, so it is never promoted.
         """
-        return f"{self.kind} → {self.on}" if self.on else self.kind
+        if self.on:
+            return f"{self.kind} → {self.on}"
+        if self.kind == "blocked" and self.source == "bridge" and self.note:
+            return f"blocked ({self.note.split()[0]})"
+        return self.kind
 
     def to_json(self) -> dict:
         out: dict[str, Any] = {"kind": self.kind, "set_at": self.set_at,

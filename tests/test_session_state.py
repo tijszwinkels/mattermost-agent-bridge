@@ -39,6 +39,24 @@ class SessionStateModelTests(unittest.TestCase):
             SessionState("blocked", note="quota").describe(), "blocked",
         )
 
+    def test_a_bridge_classified_block_names_its_class(self) -> None:
+        """F3 contract: `note` starts with the failure class, and the state
+        column surfaces it so a lead sees WHY without reading the note."""
+        s = SessionState("blocked", note="quota_exhausted (anthropic, HTTP 529)",
+                         source="bridge")
+        self.assertEqual(s.describe(), "blocked (quota_exhausted)")
+
+    def test_an_agent_declared_block_stays_bare(self) -> None:
+        """An agent's prose note is not a class name, so it is not promoted."""
+        s = SessionState("blocked", note="waiting on the DB migration",
+                         source="agent")
+        self.assertEqual(s.describe(), "blocked")
+
+    def test_a_bridge_block_with_no_note_stays_bare(self) -> None:
+        self.assertEqual(
+            SessionState("blocked", source="bridge").describe(), "blocked",
+        )
+
     def test_round_trip_through_json(self) -> None:
         s = SessionState("awaiting", on="lead", note="M0 gate",
                          set_at=1756704000.0, source="agent")

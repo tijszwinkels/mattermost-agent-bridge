@@ -195,7 +195,14 @@ anyway.
 | assistant text block with `<state/>` | `set_session_state(sid, kind, on, note, source="agent")` | declared |
 | assistant text block **without** a tag | `set_session_state(sid, "idle", source="agent")` | `idle` |
 | `run.started` | re-stamp `set_at`, clear episode bookkeeping | unchanged |
-| F3 (next round) | `set_session_state(sid, "blocked", note=…, source="bridge")` | `blocked` |
+| F3 (next round) | `set_session_state(sid, "blocked", note="<class> (<provider>, HTTP <status>)", source="bridge")` | `blocked` |
+
+F3's `<class>` vocabulary (`quota_exhausted | rate_limited | auth |
+context_overflow | harness_process | unknown`) is pinned by the lead. F2
+surfaces its first token in the fleet's state column —
+`blocked (quota_exhausted)` — while an agent-declared `blocked` stays bare,
+because agent prose is not a class name. `set_session_state` never raises, so
+F3's own error handling cannot be derailed by our bookkeeping.
 
 Applied per **assistant text block**, in `_handle_assistant_text_block`, right
 after `directives.extract`. A multi-block reply therefore ends in the state its
@@ -248,12 +255,14 @@ must not block the event loop (R8).
 | err | `-` (F3 seam) | — |
 
 M0 proposed zero GETs, arguing the tracker is reconciled every watchdog tick.
-The lead rejected that on the evidence: `_typing_watchdog_tick` early-returns
-when `self.typing` is unset (bridge.py:892) and otherwise iterates only
-`self.typing.running_sessions()` (:896). A session whose `run.started` event
-was lost never enters `active_run_by_session`, so it never enters that list
-either — F1's own C1 finding — and with the typing indicator off *nothing*
-reconciles. The tracker can therefore be stale in both directions, and a fleet
+The lead rejected that on the evidence: `_typing_watchdog_tick` iterates only
+`self.typing.running_sessions()` (bridge.py:896). A session whose `run.started`
+event was lost never enters `active_run_by_session`, so it never enters that
+list either — F1's own C1 finding — and is never reconciled. (The lead
+corrected their own wording afterwards: the `self.typing`-unset early return
+at :892 covers only the pre-login window, since the indicator is created
+unconditionally at :568. The ruling stands on the lost-`run.started` leg
+alone.) The tracker can therefore be stale in both directions, and a fleet
 that shows a working builder as `idle` is precisely the lie this feature
 exists to remove.
 

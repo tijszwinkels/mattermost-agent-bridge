@@ -158,6 +158,41 @@ class StateApiTests(_F2TestCase):
         self.bridge.set_session_state("s1", "nonsense")
         self.assertEqual(self.state().kind, "awaiting")
 
+    async def test_f3_can_block_a_session_that_has_no_state_yet(self):
+        """F3 calls this from run-failure surfacing, possibly before the
+        session has ever declared anything."""
+        prev = self.bridge.set_session_state(
+            "s1", "blocked", note="quota_exhausted (anthropic, HTTP 529)",
+            source="bridge",
+        )
+        self.assertIsNone(prev)
+        s = self.state()
+        assert s is not None
+        self.assertEqual((s.kind, s.source), ("blocked", "bridge"))
+
+    async def test_the_state_api_never_raises_into_its_caller(self):
+        """F3 asserts that a raising API must not swallow its warning post."""
+        def boom():
+            raise OSError("disk full")
+
+        self.bridge.mapping.save = boom
+        try:
+            self.bridge.set_session_state("s1", "blocked", source="bridge")
+        except Exception as exc:  # pragma: no cover - the assertion is the point
+            self.fail(f"set_session_state raised {exc!r}")
+
+    async def test_an_unmapped_session_is_a_no_op_not_a_crash(self):
+        self.assertIsNone(self.bridge.set_session_state("ghost", "blocked"))
+
+    async def test_a_bridge_block_is_replaced_by_the_next_turns_tag(self):
+        """Normal rules apply afterwards (lead ruling)."""
+        self.bridge.set_session_state(
+            "s1", "blocked", note="rate_limited (anthropic, HTTP 429)",
+            source="bridge",
+        )
+        await self.reply("recovered, carrying on")
+        self.assertEqual(self.state().kind, "idle")
+
     async def test_state_survives_a_restart(self):
         """R4: the declared state is durable; only nag bookkeeping is not."""
         self.bridge.set_session_state("s1", "awaiting", on="lead", note="M0")
@@ -266,6 +301,26 @@ class FleetViewTests(_FleetTestCase):
         line = next(ln for ln in (await self.fleet()).splitlines()
                     if "grebe" in ln)
         self.assertIn("held: 1", line)
+
+    async def test_a_bridge_classified_block_names_its_class_in_the_row(self):
+        self.bridge.set_session_state(
+            "s-kestrel", "blocked",
+            note="quota_exhausted (anthropic, HTTP 529)", source="bridge",
+        )
+        line = next(ln for ln in (await self.fleet()).splitlines()
+                    if "kestrel" in ln)
+        self.assertIn("blocked (quota_exhausted)", line)
+        self.assertIn("note: quota_exhausted (anthropic, HTTP 529)", line)
+
+    async def test_an_agent_declared_block_shows_its_note_verbatim(self):
+        self.bridge.set_session_state(
+            "s-kestrel", "blocked", note="waiting on the DB migration",
+        )
+        line = next(ln for ln in (await self.fleet()).splitlines()
+                    if "kestrel" in ln)
+        self.assertIn("blocked ", line)
+        self.assertNotIn("blocked (", line)
+        self.assertIn("note: waiting on the DB migration", line)
 
     async def test_a_dormant_child_is_shown_not_hidden(self):
         self.bridge.mapping.unlink(Anchor("c-kestrel"))

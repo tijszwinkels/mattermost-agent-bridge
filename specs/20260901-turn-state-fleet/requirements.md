@@ -55,9 +55,30 @@ Bridge.set_session_state(
 ) -> SessionState | None    # returns the PREVIOUS state
 ```
 
-3.2 `source` ∈ `"agent" | "bridge"`. F3 calls it as
-`set_session_state(sid, "blocked", note="anthropic 529", source="bridge")` —
-**one call, no other integration** (R3).
+3.2 `source` ∈ `"agent" | "bridge"`. **Pinned vocabulary contract with F3**
+(lead, 2026-09-01): F3 calls it exactly once, from its run-failure surfacing:
+
+```python
+set_session_state(session_id, "blocked", on=None,
+                  note="<class> (<provider>, HTTP <status>)", source="bridge")
+```
+
+with `<class>` ∈ `quota_exhausted | rate_limited | auth | context_overflow |
+harness_process | unknown`, and provider/status omitted when unknown. F2's
+side of the contract:
+
+* a **bridge-sourced** `blocked` renders as `blocked (<first token of note>)`
+  — e.g. `blocked (quota_exhausted)`;
+* an **agent-sourced** `blocked` renders as bare `blocked` with its note
+  verbatim in the note column (agent prose is not a class name);
+* the note column carries the full note in both cases;
+* normal rules apply afterwards — `run.started` re-stamps, and the next text
+  block's tag (or its absence → `idle`) replaces it.
+
+3.2.1 `set_session_state` **never raises** and tolerates a session with no
+state yet (it creates one). F3 asserts that a raising API must not swallow
+the warning post it still owes the channel; a non-raising API makes that
+trivially true.
 
 3.3 **A reply with no `<state/>` tag sets `idle`.** That is the zero-migration
 rule: today's agents emit no tag, so every turn ends idle, which is exactly
@@ -200,11 +221,13 @@ and `mm-bridge fleet --all` render every mapped session.
 
 6.3 **One bounded parallel probe pass (R8, lead condition C1).** The run
 tracker alone is **not** trustworthy for display: `_typing_watchdog_tick`
-early-returns when `self.typing` is unset (bridge.py:892) and otherwise sweeps
-only `self.typing.running_sessions()` (:896), so a session whose `run.started`
-was lost — or any session at all with the typing indicator off — is never
-reconciled. A fleet that renders a working builder as `idle` is the exact lie
-this feature exists to remove.
+sweeps only `self.typing.running_sessions()` (bridge.py:896), so a session
+whose `run.started` event was lost never enters `active_run_by_session`, never
+enters that list, and is therefore never reconciled. (The lead's original
+wording also cited `self.typing` being unset at :892; the indicator is created
+unconditionally after login at :568, so that leg is only the pre-login window
+— the ruling stands on the lost-`run.started` leg alone.) A fleet that renders
+a working builder as `idle` is the exact lie this feature exists to remove.
 
 So `.fleet` issues ONE parallel probe pass (`asyncio.gather`) over the rows it
 will display, each probe individually bounded so the total is ≈2 s, off the

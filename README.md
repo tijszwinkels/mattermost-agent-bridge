@@ -184,7 +184,9 @@ wagtail   blocked           3h 12m   note: quota     held: 1   err: -
 Claims sit next to observations on purpose: `working` comes from the harness (probed in
 one bounded parallel pass, `?` when the answer is inconclusive) and `held` from the hold
 buffer, so a stale claim is visible *as* a stale claim. `.fleet all` widens to every mapped
-session. `err:` is a placeholder for provider-error classification, which lands next round.
+session. `err:` is a placeholder for provider-error classification, which lands next round;
+when it does, a bridge-classified block reads `blocked (quota_exhausted)` while an
+agent-declared one stays bare with its note alongside.
 
 **The nag.** The bridge is the only always-awake party, and a post into a channel *is* a
 turn. So a session that stays `awaiting` longer than `awaiting_nag_after_seconds` (default
