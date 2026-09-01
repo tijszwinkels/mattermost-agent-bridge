@@ -4,11 +4,21 @@ Ruling R4: the classifier is DATA. One signature table, each row motivated by
 a real string, and adding a provider is one row + one test. These tests are
 the "+ one test" half of that contract.
 
-The two incident strings below are reconstructed around the fragments recorded
-in the round brief ("DAILY LIMIT (HTTP 403)" on OpenRouter, 2026-08-31; 429
-"session usage limit" on ollama-cloud, 2026-09-01). The quoted fragments are
-verbatim from the brief; the surrounding JSON/prose is representative of what
-those providers emit, not a transcript.
+The two incident strings below are VERBATIM, recovered by the lead from the two
+pi session logs (`~/.pi/agent/sessions/…2026-08-29T13-51-14…_8122f578….jsonl`
+= Wagtail/OpenRouter; `…2026-08-31T13-41-32…_7c984a73….jsonl` = Linnet/ollama)
+and supplied at M1. They are also the exact shape pi writes to stderr — see
+`design.md` § Which stream carries a provider error, where the same
+`<status>: <body>` line is reproduced from a live pi run.
+
+Three things about the real strings that reconstructions would have missed:
+
+  - the provider name appears ONLY inside a URL (`openrouter.ai`, `ollama.com`),
+    never as a bare word;
+  - the status arrives as a leading `403:` / `429:` prefix, and `"code"` is 403
+    in one and **null** in the other, so the prefix is the only reliable source;
+  - incident 2 carries a username and a ref UUID, and incident 1 a 64-hex key
+    id. Only the key id is a credential — see `RealIncidentRedactionTests`.
 """
 from __future__ import annotations
 
@@ -19,12 +29,16 @@ from mm_bridge.backend_errors import classify_failure
 # ── The two recorded incidents (Meshenger V2 program, pi backend) ──────────
 
 INCIDENT_OPENROUTER_403 = (
-    'openrouter: 403 Forbidden - {"error":{"code":403,'
-    '"message":"Key limit exceeded: daily limit reached"}}'
+    '403: {"message":"Key limit exceeded (daily limit). Manage it using '
+    'https://openrouter.ai/workspaces/default/keys/'
+    '2c37c23c5f934dba18d3a24cabd51368be82d67d490774a121c0ae55abbbc4b6",'
+    '"code":403}'
 )
 INCIDENT_OLLAMA_429 = (
-    'ollama: 429 Too Many Requests - {"error":"session usage limit reached, '
-    'try again later"}'
+    '429: {"message":"you (tijszwinkels) have reached your session usage limit, '
+    'upgrade for higher limits: https://ollama.com/upgrade or add extra usage: '
+    'https://ollama.com/settings (ref: 56b1e3fb-e6b4-45b6-a0ca-45cf641755cf)",'
+    '"type":"api_error","param":null,"code":null}'
 )
 
 
@@ -46,6 +60,44 @@ class IncidentTests(unittest.TestCase):
     def test_a_403_daily_limit_is_never_mistaken_for_auth(self):
         """Row order is load-bearing: quota is tested before auth."""
         self.assertEqual(classify_failure(INCIDENT_OPENROUTER_403).kind, "quota_exhausted")
+
+    def test_status_survives_a_null_code_field(self):
+        """Incident 2 has `"code":null`; the leading `429:` is the only source."""
+        self.assertEqual(classify_failure(INCIDENT_OLLAMA_429).status, 429)
+
+    def test_provider_is_found_inside_a_url(self):
+        """Neither incident names its provider as a bare word."""
+        self.assertEqual(classify_failure(INCIDENT_OPENROUTER_403).provider, "openrouter")
+        self.assertEqual(classify_failure(INCIDENT_OLLAMA_429).provider, "ollama")
+
+
+class RealIncidentRedactionTests(unittest.TestCase):
+    """What must be masked, and what must deliberately survive.
+
+    Lead ruling at M1: mask the key id, keep the UUID and the username — they
+    are not secrets, and a ref UUID is exactly what an operator would quote to
+    the provider's support. Recorded as a test so the decision is explicit
+    rather than an accident of the regexes.
+    """
+
+    KEY_ID = "2c37c23c5f934dba18d3a24cabd51368be82d67d490774a121c0ae55abbbc4b6"
+
+    def test_the_64_hex_key_id_is_masked(self):
+        self.assertNotIn(self.KEY_ID, classify_failure(INCIDENT_OPENROUTER_403).detail)
+        self.assertNotIn(self.KEY_ID[:24], classify_failure(INCIDENT_OPENROUTER_403).detail)
+
+    def test_masking_the_key_id_does_not_cost_the_classification(self):
+        f = classify_failure(INCIDENT_OPENROUTER_403)
+        self.assertEqual(f.kind, "quota_exhausted")
+        self.assertEqual(f.provider, "openrouter")
+        self.assertEqual(f.status, 403)
+
+    def test_the_ref_uuid_survives(self):
+        detail = classify_failure(INCIDENT_OLLAMA_429).detail
+        self.assertIn("56b1e3fb-e6b4-45b6-a0ca-45cf641755cf", detail)
+
+    def test_the_username_survives(self):
+        self.assertIn("tijszwinkels", classify_failure(INCIDENT_OLLAMA_429).detail)
 
 
 class SignatureRowTests(unittest.TestCase):
@@ -155,9 +207,25 @@ class StatusExtractionTests(unittest.TestCase):
     def test_absent_status_is_none(self):
         self.assertIsNone(classify_failure("something went wrong").status)
 
+    def test_leading_status_colon_prefix(self):
+        """pi composes `<status>: <body>` — the shape both incidents arrive in."""
+        self.assertEqual(classify_failure('429: {"message":"nope"}').status, 429)
+
+    def test_leading_status_before_a_json_body(self):
+        """The openai SDK composes `<status> <body>` with no colon."""
+        self.assertEqual(classify_failure('403 {"error":{"code":403}}').status, 403)
+
+    def test_degraded_no_body_form(self):
+        """pi/openai when the body can't be folded in: `403 status code (no body)`."""
+        self.assertEqual(classify_failure("403 status code (no body)").status, 403)
+
     def test_a_plain_number_is_not_read_as_a_status(self):
         """`500 tokens` must not become HTTP 500."""
         self.assertIsNone(classify_failure("used 500 tokens this turn").status)
+
+    def test_a_leading_plain_number_is_not_read_as_a_status(self):
+        """Even in leading position, a bare count is not a status code."""
+        self.assertIsNone(classify_failure("500 tokens used this turn").status)
 
 
 class StderrTailTests(unittest.TestCase):

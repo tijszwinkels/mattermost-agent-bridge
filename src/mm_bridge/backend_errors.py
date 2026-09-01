@@ -141,7 +141,9 @@ class _Signature:
 # broken key to go hunting for.
 _SIGNATURES: tuple[_Signature, ...] = (
     _Signature(QUOTA_EXHAUSTED, "daily limit", "daily quota",
-               "incident 2026-08-31: openrouter 403 'Key limit exceeded: daily limit'"),
+               "incident 2026-08-31 (verbatim): 403: {\"message\":\"Key limit "
+               "exceeded (daily limit). Manage it using "
+               "https://openrouter.ai/workspaces/default/keys/<id>\",\"code\":403}"),
     _Signature(QUOTA_EXHAUSTED, "monthly limit", "monthly quota",
                "openrouter/anthropic monthly caps, same 403 shape as the daily one"),
     _Signature(QUOTA_EXHAUSTED, "quota exceeded", "quota exceeded",
@@ -152,8 +154,10 @@ _SIGNATURES: tuple[_Signature, ...] = (
                "openrouter prepaid balance hitting zero"),
     _Signature(QUOTA_EXHAUSTED, "credit balance", "credit balance too low",
                "anthropic: 'Your credit balance is too low to access the API'"),
-    _Signature(RATE_LIMITED, "usage limit", "usage limit",
-               "incident 2026-09-01: ollama-cloud 429 'session usage limit'"),
+    _Signature(RATE_LIMITED, "usage limit", "session usage limit",
+               "incident 2026-09-01 (verbatim): 429: {\"message\":\"you "
+               "(<user>) have reached your session usage limit, upgrade for "
+               "higher limits: https://ollama.com/upgrade …\"}"),
     _Signature(RATE_LIMITED, "rate limit", "rate limit",
                "every provider's 429 body"),
     _Signature(RATE_LIMITED, "too many requests", "too many requests",
@@ -178,7 +182,11 @@ _SIGNATURES: tuple[_Signature, ...] = (
                "google/vertex phrasing of the same wall"),
 )
 
-# Provider tokens → (canonical name, display name). ``openrouter`` precedes
+# Provider tokens → (canonical name, display name). Matched as bare substrings
+# ON PURPOSE: in BOTH recorded incidents the provider is named only inside a
+# URL ("https://openrouter.ai/workspaces/…", "https://ollama.com/upgrade"),
+# never as a standalone word, so a hostname-only match is the common case and a
+# word-boundary match would have found nothing. ``openrouter`` precedes
 # ``openai`` defensively: the names overlap in the eye if not in substring
 # terms, and a future alias could make the ordering matter for real.
 _PROVIDERS: tuple[tuple[str, str, str], ...] = (
@@ -197,6 +205,14 @@ _PROVIDER_DISPLAY: dict[str, str] = {name: display for _, name, display in _PROV
 # only appears around a real status code — including this repo's own httpx
 # detail shape ("… /v1/sessions -> 500: …").
 _STATUS_PATTERNS: tuple[re.Pattern[str], ...] = (
+    # LEADING status, the shape both recorded incidents actually arrive in.
+    # pi composes `<status>: <body>`; the openai SDK composes `<status> <body>`
+    # with no colon; and when the body can't be folded in, `<status> status
+    # code (no body)`. Each requires a following `:`, `{`/`[` or the literal
+    # "status code", so a leading count ("500 tokens used") is not a status.
+    re.compile(r"^\s*([45]\d\d)\s*:"),
+    re.compile(r"^\s*([45]\d\d)\s+(?=[{\[])"),
+    re.compile(r"^\s*([45]\d\d)\s+status code", re.I),
     re.compile(r"\bHTTP[ /]([45]\d\d)\b", re.I),
     re.compile(r"\bstatus(?:_code)?[\"' ]*[:=][\"' ]*([45]\d\d)\b", re.I),
     re.compile(r"[\"']code[\"']\s*:\s*([45]\d\d)\b"),
@@ -408,3 +424,27 @@ def run_failure_path(data: dict) -> str:
     if isinstance(error, str) and error.strip():
         return PATH_HARNESS_PROCESS
     return PATH_CLI_EXIT
+
+
+def failure_state_note(failure: ProviderFailure, path: str) -> str:
+    """One-line note for round F2's per-session state row.
+
+    Shape pinned with F2 at M1: ``"<class> (<provider>, HTTP <status>)"``, with
+    provider and status omitted when unknown. F2 renders `blocked (<first token
+    of note>)`, so the class MUST come first and must be one of its vocabulary:
+    quota_exhausted | rate_limited | auth | context_overflow | harness_process
+    | unknown.
+
+    `harness_process` is a PATH here, not a class — but when the harness died
+    without the text ever classifying, naming that path is strictly more useful
+    to a fleet view than `unknown`. A real class always wins over it.
+    """
+    kind = failure.kind
+    if kind == UNKNOWN and path == PATH_HARNESS_PROCESS:
+        kind = "harness_process"
+    parts: list[str] = []
+    if failure.provider:
+        parts.append(failure.provider)
+    if failure.status is not None:
+        parts.append(f"HTTP {failure.status}")
+    return f"{kind} ({', '.join(parts)})" if parts else kind
