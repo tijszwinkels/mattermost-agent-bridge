@@ -249,6 +249,31 @@ class StderrTailTests(unittest.TestCase):
         self.assertNotIn("noise one", f.evidence or "")
         self.assertNotIn("noise two", f.evidence or "")
 
+    def test_status_and_provider_come_from_the_evidence_line(self):
+        """C5: on the REAL path the incident line is in the TAIL, not the
+        detail — and the leading `429:` is then no longer at the start of the
+        combined text. Both incidents must still yield their status."""
+        for line, provider, status in (
+            (INCIDENT_OPENROUTER_403, "openrouter", 403),
+            (INCIDENT_OLLAMA_429, "ollama", 429),
+        ):
+            with self.subTest(provider=provider):
+                f = classify_failure(
+                    "CLI exited with a non-zero status (1).", stderr_tail=(line,),
+                )
+                self.assertEqual(f.provider, provider)
+                self.assertEqual(f.status, status)
+
+    def test_the_bridges_own_detail_never_supplies_a_status_over_the_evidence(self):
+        """A status in the harness's exception text must not override the
+        provider's own words when those are what classified the failure."""
+        f = classify_failure(
+            "HTTPStatusError: harness POST /v1/runs -> 500: gateway",
+            stderr_tail=(INCIDENT_OLLAMA_429,),
+        )
+        self.assertEqual(f.kind, "rate_limited")
+        self.assertEqual(f.status, 429)
+
     def test_detail_wins_over_the_tail_when_it_already_classifies(self):
         f = classify_failure(INCIDENT_OPENROUTER_403, stderr_tail=(INCIDENT_OLLAMA_429,))
         self.assertEqual(f.kind, "quota_exhausted")

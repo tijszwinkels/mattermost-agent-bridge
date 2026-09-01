@@ -272,6 +272,19 @@ class StderrClassificationTests(_BridgeTestCase):
         self.assertIn("`pi` backend", msg)
         self.assertIn("Nothing will retry it", msg)
 
+    async def test_incident_two_end_to_end_shows_its_status(self):
+        """C5, at the level the operator actually sees it."""
+        self._pi_session()
+        await self._run_started("run-1")
+        await self._stderr(INCIDENT_OLLAMA_429)
+        await self._run_failed("run-1", {"returncode": 1})
+
+        msg = _warnings(self.bridge)[-1]
+        self.assertIn("rate limit", msg.lower())
+        self.assertIn("ollama", msg.lower())
+        self.assertIn("HTTP 429", msg)
+        self.assertIn("`pi` backend", msg)
+
     async def test_c1_the_raw_tail_is_never_quoted(self):
         """C1: at most the single matched line, and never a credential."""
         self._pi_session()
@@ -470,6 +483,7 @@ class StateSeamTests(_BridgeTestCase):
         self.assertIsNone(on)
         self.assertEqual(source, "bridge")
         self.assertEqual(note, "quota_exhausted (openrouter, HTTP 403)")
+        self.assertIn("HTTP 403", note, "C5: the status must survive the tail path")
         self.assertTrue(note.startswith("quota_exhausted"), "F2 renders the first token")
 
     async def test_a_raising_f2_api_never_swallows_the_warning(self):

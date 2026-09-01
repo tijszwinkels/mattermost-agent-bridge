@@ -303,13 +303,25 @@ def classify_failure(
                 hit, evidence = found, safe_line
                 break
 
-    # Provider and status are read from whatever text we actually have, even
-    # when the class is `unknown` — naming the provider is useful on its own.
-    haystack = safe_detail if evidence is None else f"{safe_detail}\n{evidence}"
+    # Provider and status come from ONE text: the evidence line when the tail
+    # is what classified the failure, otherwise the detail. Never the two
+    # concatenated.
+    #
+    # WHY that matters (C5): the leading `<status>:` prefix that pi writes is
+    # only a status when it is at the START of the line. Concatenating
+    # "CLI exited with a non-zero status (1)." in front of the stderr line
+    # moves it, and incident 2 — whose body carries `"code":null` — then had no
+    # readable status at all, so the channel said "(ollama: session usage
+    # limit)" with the 429 silently dropped. Incident 1 only survived by luck,
+    # because its body happens to repeat `"code":403`.
+    #
+    # It is also the truthful rule: a status in the bridge's own error text is
+    # not the provider's status, and must never be reported as though it were.
+    source = safe_detail if evidence is None else evidence
     return ProviderFailure(
         kind=hit.kind if hit else UNKNOWN,
-        provider=_extract_provider(haystack),
-        status=_extract_status(haystack),
+        provider=_extract_provider(source),
+        status=_extract_status(source),
         detail=safe_detail,
         evidence=evidence,
         label=hit.label if hit else None,
