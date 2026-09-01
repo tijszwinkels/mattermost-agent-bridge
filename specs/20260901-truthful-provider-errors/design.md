@@ -1,0 +1,212 @@
+# Truthful provider errors — Design
+
+## 1. Root cause: a shadowed method, not a bad default
+
+`class Bridge` defines `_backend_for_channel` **twice**:
+
+| Line | Added by | Purpose | Fallback when unknown |
+|------|----------|---------|-----------------------|
+| `bridge.py:1662` | `6bf1dd2` *feat(bridge): surface backend-invocation failures in the channel* | Name the backend in **error messages** | `None` → template degrades to "the backend" ✅ |
+| `bridge.py:4076` | `4f32a2b` *feat(bridge): write Resume line into channel header on claim + startup* | Pick a backend for the **Resume command** | `self.config.default_backend` → `"claude"` |
+
+Python keeps the **last** definition in the class body. Proven, not assumed:
+
+```
+$ uv run python -c "import inspect; from mm_bridge.bridge import Bridge; \
+    print(inspect.getsourcelines(Bridge._backend_for_channel)[1])"
+4076
+```
+
+`config.py:47` → `default_backend: str = "claude"`.
+
+So all three error-surfacing call sites — `bridge.py:2036` (create_run),
+`bridge.py:2495` (catch-up), `bridge.py:4557` (`run.failed`) — silently inherited the
+**resume** resolver's guess. The error path was written to say "the backend" when it
+didn't know; the shadowing turned "I don't know" into a confident **"claude"**.
+
+Each resolver's fallback is *correct for its own caller*: a Resume command must name
+some backend to be runnable, so guessing the default is right there. An error message
+must never invent a fact. One name, two incompatible contracts.
+
+This is the same class of bug as PR #45 (`47d5c7c`, "live session meta wins over a
+token-less Channel Purpose"): a reader that treats a cold cache as evidence.
+
+### Why the Purpose cache is cold in the incident
+
+`purpose_by_channel` is populated when this daemon handled an invite/fork/spawn.
+Channels created by `mm-bridge spawn --backend pi`, or any channel after a daemon
+restart, hit resolution step 2/3 — and a Purpose written without an explicit backend
+token resolves to `default_backend`. The pi session's *own record* in agent-harness
+knew the truth the whole time (`Session.backend`, `models.py:9`).
+
+### Fix
+
+Split the two contracts and delete the accidental shadowing:
+
+- **`_backend_for_resume(channel_id)`** — the current `:4076` body verbatim, renamed.
+  Keeps the `default_backend` fallback. Only caller: `_resume_meta_for`.
+- **`_backend_for_error(session_id, channel_id)`** — async, truthful. Resolution order:
+  1. live harness session meta (`harness.get_session(session_id)["backend"]`,
+     `agent_harness_client.py:152`) — the source of truth, per PR #45's ruling;
+  2. cached `PurposeConfig.backend`;
+  3. re-parsed Mattermost Purpose;
+  4. **`None`** — never `default_backend`.
+
+Harness backend names are wire names (`claude-code`); normalise through
+`purpose._BACKEND_ALIASES` (`purpose.py:23`) so the channel sees `claude`, not
+`claude-code`. Reuse, do not re-implement. *(DRY)*
+
+The two session bootstrap/restart sites (`bridge.py:1397`, `:1642`) already pass
+`cfg.backend` — a real, known value. Unchanged.
+
+## 2. Second gap: the classifier has nothing to classify
+
+`run.failed` payloads, from `agent-harness` `orchestrator.py`:
+
+| Line | Payload | When |
+|------|---------|------|
+| `:579` | `{"error", "error_type"}` | run process failed to **start** |
+| `:603` | `{"error", "error_type"}` | process died **while active** |
+| `:629` | `{"returncode"}` | CLI **exited non-zero on its own** |
+
+No backend identity, and — for the incident shape — **no provider text**. A pi run that
+hits OpenRouter 403 exits non-zero, so the bridge sees only
+`"CLI exited with a non-zero status (1)."`. A classifier over that string alone
+classifies the real incident as `unknown`. That is not good enough.
+
+The provider's actual message goes to `process.stderr` events
+(`orchestrator.py:814`, `{"text": ...}`). The bridge already **receives** them — it
+streams `/v1/events` with only an `after` cursor, no server-side type filter
+(`agent_harness_client.py:346`) — and then **drops** them at the dispatch `else:`
+branch (`bridge.py:3845`, `logger.debug("Unhandled agent-harness event %s")`).
+
+**Design S1 — bounded stderr tail.** Route `process.stderr` into a per-session ring
+buffer (default: last 20 lines, hard-capped at 4 KiB, cleared on run terminal and on
+session teardown). On `run.failed`, classify over `run_failure_detail(data)` **plus**
+the buffered tail. Bridge-side only; no harness change (R2); no network round-trip in
+the failure path (a quota failure often coincides with an unhealthy harness).
+
+*Alternative considered and rejected:* pull `GET /v1/sessions/{id}/events` on failure.
+Cleaner memory profile, but adds an HTTP call to the one path most likely to be
+degraded, and needs a new client method. **Rejected** — S1 is strictly cheaper.
+
+**N3 guard:** the tail feeds the *classifier* only. The channel renders the matched
+class + provider + status code, never a raw stderr dump.
+
+> **⚠️ Flagged to the lead.** S1 is the only part of this design that adds a new event
+> subscription rather than reshaping existing text. Without it, the two motivating
+> incidents both classify as `unknown` and F3 delivers a correct backend name and a
+> correct retry sentence but **not** the "quota, not a bug" signal. Lead ruling
+> requested at M0.
+
+## 3. Classifier — data, not code (R4)
+
+`backend_errors.py` gains one table. Each row carries the string that motivated it.
+Order matters: the first matching row wins, so `quota_exhausted` is tested before
+`rate_limited` before `auth` (a 403 daily-limit must not read as an auth failure).
+
+| # | Class | Signatures (substring, case-folded) | Motivating string |
+|---|-------|-------------------------------------|-------------------|
+| 1 | `quota_exhausted` | `daily limit`, `monthly limit`, `quota exceeded`, `insufficient_quota`, `out of credits`, `credit balance` | **Incident 1** — OpenRouter 403 *"Key limit exceeded: daily limit"* |
+| 2 | `rate_limited` | `rate limit`, `usage limit`, `too many requests`, `overloaded`, `429` | **Incident 2** — ollama-cloud 429 *"session usage limit"* |
+| 3 | `auth` | `invalid api key`, `no auth credentials`, `unauthorized`, `authentication_error`, `401` | Rotated/absent key |
+| 4 | `context_overflow` | `context length`, `maximum context`, `prompt is too long`, `too many tokens` | Long session death |
+| 5 | `unknown` | — (fallback) | Everything else |
+
+HTTP status is extracted separately (`403`, `429`, …) and reported when present, so
+`quota_exhausted` + `403` and `rate_limited` + `429` both read precisely.
+
+Providers, same shape — one row each: `openrouter`, `ollama`, `anthropic`, `openai`,
+`google`. No provider named → `None` → omitted from the message.
+
+```python
+@dataclass(frozen=True)
+class ProviderFailure:
+    kind: str                 # one of the five classes
+    provider: str | None
+    status: int | None
+    detail: str               # condensed, as today
+```
+
+`classify_failure(detail: str) -> ProviderFailure` — pure, no Bridge, no I/O (N1).
+
+## 4. Retry truth, verified per path (R3, R5)
+
+Both paths were read, not assumed.
+
+### Path A — `create_run` raised (`bridge.py:2026`, `:2049`)
+
+The message was **never accepted** by the harness. The bridge calls
+`_enqueue_silent_drop(channel_id, thread_root, post)` (`:2262`), which retains the post
+and replays it as a **catch-up block** on the *next* forwarded message
+(`_peek_silent_drops_as_block`, `:2283`).
+
+That is **not a retry**: nothing re-runs on its own, and the replay only happens when
+the user next mentions the bot. It is also not a guarantee — `initial_catch_up_n <= 0`
+disables the queue entirely, and `_forget_channel_silent_drops` (`:1209`, `:1528`,
+`:1599`, `:3786`) wipes it on session recreate.
+
+**Wording (true in every case):**
+
+> ⚠️ Provider limit hit (OpenRouter: daily quota, HTTP 403) on the `pi` backend. Your
+> message was **NOT processed** and won't retry by itself — repost it once the limit
+> resets, or `.model` / `.backend` to switch.
+
+### Path B — `run.failed` (`bridge.py:4536`)
+
+The message **was** accepted; the run then died. Terminal in the harness
+(`repository.py:433` → status `failed`); a grep of `orchestrator.py` / `api.py` finds
+**no retry or requeue** anywhere — the only `retry` hit is a queue-full 429 *message*
+(`api.py:324`). `_surface_run_failure` does **not** enqueue a silent drop, so the post
+is gone.
+
+**Wording:**
+
+> ⚠️ Provider limit hit (OpenRouter: daily quota, HTTP 403) on the `pi` backend. Your
+> message reached the model but the run died before finishing — anything already posted
+> above is all there is. Nothing will retry it; repost once the limit resets, or
+> `.model` / `.backend` to switch.
+
+> **⚠️ Flagged to the lead.** The brief's example sentence ("was NOT processed") is
+> Path A's truth. The two recorded incidents are almost certainly **Path B** (the pi
+> CLI exits non-zero *after* accepting the turn), so their honest wording is the one
+> above. "Anything already posted above is all there is" is preferred over R5's
+> "partial work may exist" because it is true whether or not the run produced output,
+> and needs no new per-run output tracking. Lead ruling requested.
+
+### Unknown class (R6)
+
+Today's template and detail text, unchanged, **plus** the path's retry sentence.
+
+## 5. State seam (F2 round)
+
+One helper, one call site, guarded:
+
+```python
+def _note_run_failure(self, session_id: str, failure: ProviderFailure) -> None:
+    """Publish a classified failure to round F2's per-session state API.
+
+    WHY guarded: F2 (`feat/turn-state-fleet`) owns `set_session_state`; this
+    branch must stand alone on `main`, where that API does not exist yet. When
+    F2 lands the guard falls through and `.fleet` shows `blocked (quota)` with
+    no further change here.
+    """
+    setter = getattr(self, "set_session_state", None)
+    if setter is None:
+        return
+    ...
+```
+
+Called from `_surface_run_failure` only. Wiring completes when F2 lands; until then
+it is a proven no-op (T10).
+
+## 6. Commit plan (M1)
+
+1. `docs(spec)` — this directory.
+2. `test` — red: the misattribution reproduction (T1).
+3. `fix(bridge)` — split `_backend_for_error` / `_backend_for_resume` (T2, T3).
+4. `feat(backend_errors)` — classifier table + `ProviderFailure` (T4–T6).
+5. `feat(bridge)` — stderr tail feeding classification (S1, pending lead GO).
+6. `feat(bridge)` — reworked messages at both sites (T7–T9).
+7. `feat(bridge)` — the guarded state seam (T10).
+8. `docs` — README/CLAUDE.md if operator-visible wording changed.
