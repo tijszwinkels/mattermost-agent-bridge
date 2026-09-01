@@ -52,6 +52,11 @@ Split the two contracts and delete the accidental shadowing:
   3. re-parsed Mattermost Purpose;
   4. **`None`** — never `default_backend`.
 
+  Lead condition: step 1 must be **best-effort and bounded**. Path A is often
+  "harness unreachable", and the warning has to post promptly either way, so a raising
+  `get_session` falls through to the Purpose backend (and to `None` → "the backend"
+  when that is absent too).
+
 Harness backend names are wire names (`claude-code`); normalise through
 `purpose._BACKEND_ALIASES` (`purpose.py:23`) so the channel sees `claude`, not
 `claude-code`. Reuse, do not re-implement. *(DRY)*
@@ -93,11 +98,22 @@ degraded, and needs a new client method. **Rejected** — S1 is strictly cheaper
 **N3 guard:** the tail feeds the *classifier* only. The channel renders the matched
 class + provider + status code, never a raw stderr dump.
 
-> **⚠️ Flagged to the lead.** S1 is the only part of this design that adds a new event
-> subscription rather than reshaping existing text. Without it, the two motivating
-> incidents both classify as `unknown` and F3 delivers a correct backend name and a
-> correct retry sentence but **not** the "quota, not a bug" signal. Lead ruling
-> requested at M0.
+> **✅ Lead ruling (M0): S1 ACCEPTED** — "without it the feature ships its least
+> valuable half; with it the bridge classifies over data it already receives." Three
+> conditions, all implemented red-first:
+>
+> - **C1 — never quote the raw tail.** At most the single matched line, through
+>   `condense_error_detail` *and* `redaction.redact_secrets` (`sk-…`, `Bearer …`,
+>   `key=`/`token=` values, long hex/base64 runs). Redaction runs FIRST, on all text,
+>   so no path reaches the channel unmasked.
+> - **C2 — clear on `run.started` too**, not only on terminal + teardown. A run that
+>   dies must never classify on the previous run's stderr.
+> - **C3 — bounded and cheap.** 20 lines / 4 KiB per session, updated synchronously in
+>   the SSE handler, stderr never logged above `debug`.
+>
+> The lead additionally ruled that the two **exception-shaped** `run.failed` variants
+> (`orchestrator.py:579`, `:603`) carry their own truth — "the harness could not start
+> or drive the CLI" — which today's wording buries. Hence `PATH_HARNESS_PROCESS`.
 
 ## 3. Classifier — data, not code (R4)
 
@@ -167,12 +183,14 @@ is gone.
 > above is all there is. Nothing will retry it; repost once the limit resets, or
 > `.model` / `.backend` to switch.
 
-> **⚠️ Flagged to the lead.** The brief's example sentence ("was NOT processed") is
-> Path A's truth. The two recorded incidents are almost certainly **Path B** (the pi
-> CLI exits non-zero *after* accepting the turn), so their honest wording is the one
-> above. "Anything already posted above is all there is" is preferred over R5's
-> "partial work may exist" because it is true whether or not the run produced output,
-> and needs no new per-run output tracking. Lead ruling requested.
+> **✅ Lead ruling (M0): ACCEPTED with one edit.** "Your message reached the model"
+> was replaced with **"The run started but died before finishing"** — a run can die
+> before any model call (auth at the first request), so the message must not claim
+> what the bridge cannot know. "Anything already posted above is all there is" was
+> kept, agreed as true regardless of output and needing no new per-run tracking.
+> Path A keeps the brief's sentence verbatim, and the reading that the silent-drop
+> replay is neither a retry nor guaranteed — so it must not be promised — was
+> confirmed.
 
 ### Unknown class (R6)
 
@@ -206,7 +224,10 @@ it is a proven no-op (T10).
 2. `test` — red: the misattribution reproduction (T1).
 3. `fix(bridge)` — split `_backend_for_error` / `_backend_for_resume` (T2, T3).
 4. `feat(backend_errors)` — classifier table + `ProviderFailure` (T4–T6).
-5. `feat(bridge)` — stderr tail feeding classification (S1, pending lead GO).
-6. `feat(bridge)` — reworked messages at both sites (T7–T9).
-7. `feat(bridge)` — the guarded state seam (T10).
-8. `docs` — README/CLAUDE.md if operator-visible wording changed.
+5. `feat(bridge)` — the guarded state seam (T10).
+6. `docs` — README.
+
+As shipped, commits 3–4 merged: deleting the shadowed method and rewiring its three
+callers is one atomic change, and the stderr routing rides with it because the same
+`run.failed` site both resolves the backend and reads the tail. The state seam and the
+two pure modules (`redaction`, `stderr_tail`) are separate commits.

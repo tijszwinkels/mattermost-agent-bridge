@@ -41,6 +41,25 @@ post in a bridged channel can drive it. Treat channel membership like shell acce
   automatically on the first message.)
 - **`@b3mo leave`** sends the bot out of the channel.
 
+### When a turn fails
+
+A failed turn always tells you three things: which backend actually ran, what
+kind of failure it was, and **whether your message will be retried** (it never
+is — nothing in the bridge retries automatically).
+
+```
+⚠️ Provider limit hit (OpenRouter: daily quota, HTTP 403) on the `pi` backend.
+The run started but died before finishing — anything already posted above is
+all there is. Nothing will retry it; repost it once the limit resets, or
+`.model` / `.backend` to switch.
+```
+
+Recognised classes are provider quota, rate limit, auth, and context overflow;
+anything else keeps the raw error text. A failure that never reached the
+backend says so instead ("Your message was NOT processed"). Provider errors are
+read from the CLI's stderr, and at most one line of it is quoted back, with
+credentials masked.
+
 A channel the bot has joined but nobody has engaged yet is **dormant**: no session, no
 model, no cost. Configure it (`.model`, `.backend`, `.autorespond`) before the first real
 message and those settings — stored in the Channel Purpose — apply when the session is
