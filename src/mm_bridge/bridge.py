@@ -448,6 +448,70 @@ def describe_allowed_roots(
     return ", ".join(labels)
 
 
+def fleet_targets(
+    channel_id: str,
+    by_id: dict[str, dict],
+    mapping: ChannelMapping,
+    *,
+    all_sessions: bool = False,
+) -> list[tuple[Anchor, str | None, str]]:
+    """Resolve the (anchor, session, title) triples a fleet view covers.
+
+    Module-level and mapping-injected so the `.fleet` dot-command and
+    `mm-bridge fleet` agree on what a "child" is by construction — the CLI
+    reads the same persisted mapping out of process.
+
+    Children are the channels whose header starts with
+    ``Parent: ~<this channel's slug>~`` — the header `mm-bridge spawn`
+    writes (`spawn.format_parent_header`). A PREFIX match, not equality:
+    a spawn from a thread appends ``([thread](permalink))``.
+
+    A child with no mapped session is included with ``session=None``.
+    "The channel exists and nothing is running there" is exactly the fact
+    a lead needs; hiding it would make a dead lane look like no lane.
+    """
+    if all_sessions:
+        chosen = sorted(
+            by_id,
+            key=lambda cid: (by_id[cid].get("display_name")
+                             or by_id[cid].get("name") or cid),
+        )
+        chosen = [cid for cid in chosen
+                  if any(a.channel_id == cid
+                         for a in mapping.session_to_anchor.values())]
+    else:
+        me = by_id.get(channel_id) or {}
+        slug = me.get("name") or ""
+        if not slug:
+            logger.warning(
+                "Fleet view: no channel slug for %s — cannot find children",
+                channel_id,
+            )
+            return []
+        prefix = spawn.format_parent_header(slug)
+        chosen = sorted(
+            (cid for cid, c in by_id.items()
+             if (c.get("header") or "").startswith(prefix)),
+            key=lambda cid: (by_id[cid].get("display_name")
+                             or by_id[cid].get("name") or cid),
+        )
+
+    targets: list[tuple[Anchor, str | None, str]] = []
+    for cid in chosen:
+        title = (by_id[cid].get("display_name")
+                 or by_id[cid].get("name") or cid)
+        channel_anchor = Anchor(cid)
+        targets.append(
+            (channel_anchor, mapping.get_session(channel_anchor), title)
+        )
+        # Thread forks are sessions in their own right (R9), so they get
+        # their own row under the channel they live in.
+        for sid, anchor in sorted(mapping.session_to_anchor.items()):
+            if anchor.channel_id == cid and anchor.is_thread:
+                targets.append((anchor, sid, f"{title} (thread)"))
+    return targets
+
+
 class Bridge:
     """Mediates Mattermost ↔ agent-harness traffic."""
 
@@ -3612,57 +3676,9 @@ class Bridge:
     def _fleet_targets(
         self, channel_id: str, by_id: dict[str, dict], *, all_sessions: bool,
     ) -> list[tuple[Anchor, str | None, str]]:
-        """Resolve the (anchor, session, title) triples a fleet view covers.
-
-        Children are the channels whose header starts with
-        ``Parent: ~<this channel's slug>~`` — the header `mm-bridge spawn`
-        writes (`spawn.format_parent_header`). A PREFIX match, not equality:
-        a spawn from a thread appends ``([thread](permalink))``.
-
-        A child with no mapped session is included with ``session=None``.
-        "The channel exists and nothing is running there" is exactly the fact
-        a lead needs; hiding it would make a dead lane look like no lane.
-        """
-        if all_sessions:
-            chosen = sorted(
-                by_id,
-                key=lambda cid: (by_id[cid].get("display_name")
-                                 or by_id[cid].get("name") or cid),
-            )
-            chosen = [cid for cid in chosen
-                      if any(a.channel_id == cid
-                             for a in self.mapping.session_to_anchor.values())]
-        else:
-            me = by_id.get(channel_id) or {}
-            slug = me.get("name") or ""
-            if not slug:
-                logger.warning(
-                    "Fleet view: no channel slug for %s — cannot find children",
-                    channel_id,
-                )
-                return []
-            prefix = spawn.format_parent_header(slug)
-            chosen = sorted(
-                (cid for cid, c in by_id.items()
-                 if (c.get("header") or "").startswith(prefix)),
-                key=lambda cid: (by_id[cid].get("display_name")
-                                 or by_id[cid].get("name") or cid),
-            )
-
-        targets: list[tuple[Anchor, str | None, str]] = []
-        for cid in chosen:
-            title = (by_id[cid].get("display_name")
-                     or by_id[cid].get("name") or cid)
-            channel_anchor = Anchor(cid)
-            targets.append(
-                (channel_anchor, self.mapping.get_session(channel_anchor), title)
-            )
-            # Thread forks are sessions in their own right (R9), so they get
-            # their own row under the channel they live in.
-            for sid, anchor in sorted(self.mapping.session_to_anchor.items()):
-                if anchor.channel_id == cid and anchor.is_thread:
-                    targets.append((anchor, sid, f"{title} (thread)"))
-        return targets
+        return fleet_targets(
+            channel_id, by_id, self.mapping, all_sessions=all_sessions,
+        )
 
     async def _fleet_rows(
         self, channel_id: str, *, all_sessions: bool = False,
