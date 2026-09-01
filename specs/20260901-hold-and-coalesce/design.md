@@ -15,6 +15,7 @@ All line references are against base `3e28e53`.
 | `tests/doubles.py` | **EDIT** — reaction recording on `FakeMattermostClient`. |
 | `tests/test_hold_and_coalesce.py` | **NEW** — R11 matrix. |
 | `tests/test_cli_inbox.py` | **NEW** — R8. |
+| `README.md` | **EDIT** — state-file schema says v3; it is v5 (line 274). |
 | `agent-harness` | **NO CHANGE** (R1). |
 
 ## 1. Data structures
@@ -52,7 +53,7 @@ class HeldPostStore:
     # buffer API — all synchronous, so hold decisions stay atomic (§4)
     def add(self, anchor: Anchor, held: HeldPost) -> bool   # False = at cap
     def peek(self, anchor: Anchor) -> list[HeldPost]
-    def take(self, anchor: Anchor) -> list[HeldPost]        # pop + persist
+    def discard(self, anchor: Anchor, ids: set[str]) -> None  # by post id
     def clear(self, anchor: Anchor) -> list[HeldPost]       # for `.queue clear`
     def forget_channel(self, channel_id: str) -> None       # teardown
     def anchors(self) -> list[Anchor]
@@ -165,16 +166,20 @@ async def _deliver_to_session(
 ) -> bool:
 ```
 
-Both callers use it:
+Both callers use it, with **different** failure contracts:
 
-* `_forward_user_post` — single live post (`on_failure_requeue=[post]`).
-* `_flush_held` — coalesced body (`on_failure_requeue=[h.post for h in held]`).
+* `_forward_user_post` — single live post, `on_failure_requeue=[post]`.
+  Unchanged from today: a failed send calls `_enqueue_silent_drop` so the
+  user's message is replayed as catch-up on the next successful forward.
+* `_flush_held` — coalesced body, `on_failure_requeue=[]`. The held posts are
+  *already* durably buffered, so requeueing them as silent drops would
+  duplicate them. Instead the flush simply does not `discard` them (§2.8) and
+  the next trigger retries. This is lead condition **C2**.
 
-`on_failure_requeue` preserves today's contract that a failed send does not
-lose the user's message: the existing code calls `_enqueue_silent_drop` for
-the post it failed to deliver. The flush path does the same for every post in
-the batch, so a harness outage degrades a coalesced flush into a replayable
-catch-up block rather than a silent loss.
+The return value is `True` on a successful `create_run` and `False` on any
+failure, which is what lets the flush decide whether to discard.
+`_deliver_to_session` keeps ownership of the user-facing error post
+(`format_backend_error`) so both paths report identically.
 
 ### 2.3 Flush trigger T1 — terminal SSE events
 
@@ -196,18 +201,71 @@ without a terminal event reaching the bridge: after
 `_active_run_is_alive(session_id)` returns False it stops typing and pops
 `active_run_by_session`. The same branch flushes.
 
-This trigger is what makes T1 non-load-bearing: **every** live run starts
-typing (`run.started` → `_start_typing_for_activity`, bridge.py:3888, which
-requires only a mapped anchor — and every held post comes from a mapped
-anchor), so any session with held posts is on the watchdog's sweep list.
-No additional reaper task is needed; adding one would be a second
-timer with no case of its own.
+**Correction (lead condition C1).** M0 claimed this trigger covers every held
+anchor because `run.started` always starts typing. That claim does not hold,
+and the code says so: `_typing_watchdog_tick` early-returns when
+`self.typing` is unset (bridge.py:813) and iterates only
+`self.typing.running_sessions()`. If `run.started` itself was lost, the
+session never enters `active_run_by_session`, so the tick takes the
+**silence-stop** branch (bridge.py:830-838), stops the typing loop, and the
+session drops off the sweep list *while its run is still alive*. Lose both
+lifecycle events and T1, T2 and T3 are all blind. T4 exists for that hole.
 
-### 2.5 Flush trigger T3 — post-enqueue liveness re-check
+### 2.5 Flush trigger T4 — periodic held-anchor sweep (C1)
+
+A second phase of the same watchdog task — `_run_typing_watchdog` calls
+`_typing_watchdog_tick()` and then `_sweep_held_anchors()`. No new timer, so
+the M0 "no reaper task" omission stands; what changes is that the existing
+tick now covers `running_sessions() ∪ sessions-with-held-posts` rather than
+the typing set alone.
+
+```python
+async def _sweep_held_anchors(self) -> None:
+    # Reconcile anchors with held posts whose run lifecycle went missing,
+    # and retry flushes that failed.
+    #
+    # Deliberately independent of the typing watchdog's sweep list: a
+    # session whose `run.started` was lost is stopped by the silence branch
+    # and leaves `running_sessions()` while its run is still alive, so a
+    # typing-scoped sweep would never look at it again (C1). Note the
+    # absence of a `self.typing` guard for the same reason — held posts must
+    # reconcile even with no typing indicator at all.
+    #
+    # Probe discipline mirrors `_typing_watchdog_tick`: at most one harness
+    # GET per session per `typing_stop_after_silence_seconds`, and only
+    # while a buffer is non-empty, so an idle daemon costs nothing.
+    if not len(self._held):
+        return
+    timeout = self.config.typing_stop_after_silence_seconds
+    now = time.monotonic()
+    for anchor in self._held.anchors():
+        if anchor in self._flushing:
+            continue                        # a flush is already looping
+        session_id = self.mapping.get_session(anchor)
+        if not session_id:
+            await self._flush_held(anchor)  # -> the no-session warn path
+            continue
+        last = self._held_probe_ts.get(session_id)
+        if last is not None and now - last <= timeout:
+            continue
+        self._held_probe_ts[session_id] = now
+        if not await self._active_run_is_alive(session_id):
+            await self._flush_held(anchor)
+```
+
+`_held_probe_ts` is popped on flush and on teardown so it stays bounded by
+the number of anchors currently holding posts.
+
+Because `_active_run_is_alive` returns False on *every* failure mode (404,
+HTTP error, unreachable harness), this sweep is also the **retry engine** for
+§2.8: a flush that failed against a dead harness is retried on the next
+sweep, and keeps being retried until it lands.
+
+### 2.6 Flush trigger T3 — post-enqueue liveness re-check
 
 See §4.3.
 
-### 2.6 `_flush_held` — the coalesced run
+### 2.7 `_flush_held` — the coalesced run
 
 ```python
 async def _flush_held(self, anchor: Anchor) -> None:
@@ -217,10 +275,13 @@ async def _flush_held(self, anchor: Anchor) -> None:
 1. Guard: `anchor in self._flushing` → return (a flush is already looping).
 2. Mark `self._flushing.add(anchor)`; `try/finally` discards it.
 3. Loop while the buffer is non-empty:
-   1. `held = self._held.take(anchor)` (synchronous pop + persist).
+   1. `held = self._held.peek(anchor)` — **peek, not pop**. The buffer is
+      only discarded once delivery has succeeded (§2.8 / C2).
    2. Resolve `session_id = self.mapping.get_session(anchor)`.
       None → requirements §3.7: log `warning` with authors+timestamps, post a
-      channel warning naming them, drop out of the loop.
+      channel warning naming them, `clear` the anchor, break. (Here the posts
+      *are* dropped, loudly and by name — there is no session left to deliver
+      them to, and retrying forever would be the strand C2 forbids.)
    3. For each `HeldPost`, in order: download attachments into the session
       cwd (reusing `_save_mm_attachments`, one cwd lookup for the whole
       batch), call `posters.note_post` to keep the tracker accurate, and
@@ -230,13 +291,39 @@ async def _flush_held(self, anchor: Anchor) -> None:
       spoke last.
    5. Build the body: single post → the one line; N > 1 → header + lines +
       `[End of held posts]`.
-   6. `await self._deliver_to_session(...)` with
+   6. `ok = await self._deliver_to_session(...)` with
       `first_message=channel_id in self._awaiting_first_forward`.
-   7. On success, swap ⏳ → ✅ on each post (best-effort).
+   7. **On success only**: `self._held.discard(anchor, delivered_ids)` and
+      swap ⏳ → ✅ on each post (best-effort). Discarding by *id* — not
+      popping the whole anchor — is what makes step (1)'s peek safe against
+      posts that arrived during the awaits of step (3).
+   8. **On failure**: leave the buffer untouched and `break`. §2.8.
 4. The `while` re-check in (3) is §4.4: posts that arrived during the awaits
    are flushed in a second iteration rather than racing their own run.
 
-### 2.7 `.queue`
+### 2.8 Flush failure — the buffer is the retry queue (C2)
+
+```
+create_run raises  →  posts stay held (memory AND disk)
+                   →  format_backend_error posted in-channel
+                   →  T1 / T2 / T3 / T4 retries; T4 guarantees a retry
+```
+
+The T3 direction makes this the *expected* interaction, not an exotic one:
+`_active_run_is_alive` returns False when the harness is unreachable, so the
+bridge deliberately flushes into the exact state that can fail. Without C2
+that would consume the buffer and post an error — a loss. With C2 the sweep
+(§2.5) retries until the harness is back.
+
+**One carve-out** (requirements §3.9): `HarnessResumeUnsupported` is
+*permanent* — that session can never accept a run, so retrying would strand
+the posts and re-post the warning every sweep interval. In that case only,
+the held posts are moved into `_silent_drops` (replayed verbatim as a
+catch-up block on the next successful forward) and the existing "can't resume
+this external session" warning is posted once. That is exactly what the
+single-post path does today (bridge.py:2022), applied to N posts.
+
+### 2.9 `.queue`
 
 `commands.py` gains one spec, appended to `_SPECS` (insertion order drives
 `.help`):
@@ -253,7 +340,7 @@ CommandSpec(
 `_cmd_queue(channel_id, session_id, parsed.arg, thread_root)`. `.queue clear`
 is the only accepted argument; anything else replies with the usage line.
 
-### 2.8 Reactions
+### 2.10 Reactions
 
 ```python
 def add_reaction(self, post_id: str, emoji_name: str) -> None:
@@ -343,7 +430,7 @@ than strands — the conservative direction.
 
 ### 4.4 Flush re-entrancy
 
-Covered in §2.6 (3)/(4) and `_should_hold`'s `_flushing` check. A post
+Covered in §2.7 (3)/(4) and `_should_hold`'s `_flushing` check. A post
 arriving during a flush is held and picked up by the flush's own loop, so it
 can never submit a run that overtakes the flush's `create_run`.
 
@@ -508,28 +595,53 @@ harness (`tests/doubles.py:336`). `FakeAgentHarnessClient` already records
 `create_run` calls and serves `list_session_runs`, which is exactly what the
 liveness probe and the "one run, not three" assertions need.
 
-The 16 rows of requirements §12.1, each written red-first. Two need new
+The 18 rows of requirements §12.1, each written red-first. Three need new
 double surface:
 
 * `FakeMattermostClient.add_reaction` / `remove_reaction` recording into a
   `reactions: dict[post_id, set[str]]` for test 13.
 * `FakeAgentHarnessClient.list_session_runs` returning a **terminal** row
-  while `active_run_by_session` still says live — the T3 fixture for test 9.
+  while `active_run_by_session` still says live — the T3 fixture for test 9
+  and the C1 fixture for test 17.
+* `FakeAgentHarnessClient.create_run` raising on demand — the C2 fixture for
+  test 18.
+
+Test 17 (C1) is the one that would have caught the M0 coverage error: it
+holds a post, then removes **every** in-memory trace of the run (no
+`active_run_by_session` entry, typing loop stopped — the state a lost
+`run.started` leaves behind) and asserts `_sweep_held_anchors()` still
+delivers. Test 18 (C2) asserts the on-disk buffer is byte-identical after a
+failed flush, then that a second sweep delivers it.
 
 `tests/test_cli_inbox.py` writes a holds file directly and runs `cmd_inbox`
 against it — no daemon, no MM, matching how `test_cli_read.py` drives
 `cmd_read`.
 
-## 10. Open questions for the lead
+## 10. M0 gate outcome
 
-1. **Unconditional `HH:MM username:` on held posts** (requirements §3.3) —
-   this bypasses `PosterTracker`, so a single-human channel now sees a
-   username prefix it would not see today. Recommended anyway: the timestamp
-   is the payload, and a naked line hides the staleness. Confirm.
-2. **Local-time `HH:MM`** (§3.5) rather than UTC.
-3. **Single held post keeps the timestamp line** — only the header and the
-   `[End of held posts]` marker are dropped, per "flushes without the
-   multi-post header".
-4. **`✅` on delivery** is a second reaction API call per post. Kept (R9 says
-   in scope if cheap), but it is the one piece that is pure polish and the
-   cheapest thing to cut if the lead wants a smaller diff.
+**GO given.** All four open questions **confirmed** by the lead:
+
+1. Unconditional `HH:MM username:` on held posts (bypassing `PosterTracker`)
+   — the timestamp is the payload; a uniformly-attributed block beats a
+   mixed-prefix one. `note_post` bookkeeping stays.
+2. Daemon-local `HH:MM`, not UTC.
+3. A single held post keeps its stamp line; only the header and the
+   `[End of held posts]` marker are dropped.
+4. `✅` on delivery kept; overflow ordering accepted as the R6 degenerate
+   case, with the loud warn.
+
+Brief corrections accepted: state schema **v5** (the "v3" came from
+`README.md:274`, which this PR corrects), sibling `held_posts.json` with
+atomic replace, full post envelopes, and flush-to-the-anchor's-current-session.
+
+**Two conditions folded into M1:**
+
+* **C1** — the T4 sweep must reconcile held anchors *regardless of typing-loop
+  state*. §2.4 (the corrected claim) and §2.5 (the sweep).
+* **C2** — a failed flush keeps the posts held and retries. §2.2 (the split
+  failure contract) and §2.8.
+
+**One new [decision] raised by C2**, flagged rather than baked in silently:
+the `HarnessResumeUnsupported` carve-out (§2.8, requirements §3.9). It
+departs from C2's letter ("posts remain held") to honor its intent, because
+that failure is permanent and retrying it forever *is* the strand C2 forbids.

@@ -46,7 +46,7 @@ twice. Defensive: the warming-queue replay path re-dispatches post dicts.
 normal forwarding pipeline: attribution, attachment download at flush time,
 silent-drop peek, first-message preamble rules unchanged.
 
-3.2 Flush is triggered from **three** places:
+3.2 Flush is triggered from **four** places:
 
 * **T1 — run-terminal SSE event.** `_on_harness_run_lifecycle` for any of
   `HARNESS_RUN_TERMINAL_EVENTS` (`run.completed` / `run.failed` /
@@ -55,7 +55,12 @@ silent-drop peek, first-message preamble rules unchanged.
   probe (`_typing_watchdog_tick` → `_active_run_is_alive` returns False)
   already pops `active_run_by_session` when it finds a run that died without
   a terminal event reaching us. It flushes too.
-* **T3 — post-enqueue liveness re-check.** See §4.
+* **T3 — post-enqueue liveness re-check.** See §4.3.
+* **T4 — periodic held-anchor sweep** (lead condition **C1**). A second
+  phase of the existing watchdog tick that reconciles anchors with held
+  posts **regardless of typing-loop state**. §4.5 explains why T2 alone is
+  not sufficient; design §2.5 gives the rate-limit discipline. T4 is also
+  the retry engine for §3.8.
 
 3.3 **Body format.** With more than one held post:
 
@@ -90,6 +95,28 @@ flush), the held posts are **not silently dropped**: the bridge logs at
 `warning` with the full author/timestamp list and posts a channel warning
 naming them.
 
+3.8 **Flush failure** (lead condition **C2**). When the flush's own
+`create_run` raises, the held posts **stay held** — the buffer is not
+discarded, in memory or on disk:
+
+* a loud channel error via `format_backend_error` (the shape the single-post
+  path already uses);
+* the next trigger — T1, T2, T3 or the T4 sweep — retries the delivery;
+* the T3 probe direction makes this the *expected* interaction: an
+  unreachable harness makes `_active_run_is_alive` return False, so the
+  bridge flushes into precisely the state that can fail. C1 + C2 together
+  make the sweep the retry engine: no strand, no loss, no silent drop.
+
+3.9 **The one non-transient failure.** `HarnessResumeUnsupported` means the
+session can *never* accept a run, so retrying forever would strand the posts
+and re-post the warning every sweep interval. In that single case the held
+posts are moved into `_silent_drops` — where they are replayed verbatim as a
+catch-up block on the next successful forward — and the existing "can't
+resume this external session" warning is posted once. That is exactly what
+the single-post path does today (bridge.py:2022), applied to N posts.
+**[decision]** — a deliberate carve-out from §3.8's "posts remain held",
+honoring its intent (no strand, no loss) rather than its letter.
+
 ## 4. The enqueue/terminal race (R3)
 
 4.1 **The race.** A post is held on the strength of a liveness check; the run
@@ -117,6 +144,17 @@ posts to that anchor are held (not eagerly submitted), and the flush re-checks
 the buffer when it finishes, looping if new posts arrived. Without this, a
 post arriving during a flush's `await`s would race its own `create_run`
 ahead of the flush's and reorder the conversation.
+
+4.5 **Why T2 alone does not cover held anchors** (lead condition C1).
+`_typing_watchdog_tick` early-returns when `self.typing` is unset
+(bridge.py:813) and sweeps only `self.typing.running_sessions()`. A session
+whose `run.started` was lost never enters `active_run_by_session`, so the
+tick's silence-stop branch (bridge.py:830-838) stops its typing loop and the
+session **leaves the sweep list while its run is still alive**. Lost
+`run.started` *and* lost terminal event ⇒ T1 blind, T2 blind, T3 long past ⇒
+posts stranded until the next inbound post to that anchor. T4 closes this by
+sweeping `running_sessions() ∪ sessions-with-held-posts` under the same probe
+rate-limit discipline, in the same watchdog task — no new timer.
 
 ## 5. Durability (R4)
 
@@ -261,6 +299,8 @@ before the code that makes it pass:
 | 14 | `mm-bridge inbox` renders held / `(empty)` | R8 |
 | 15 | Warming-queue posts land held and flush as one | R10 |
 | 16 | Attachments on held posts download at flush time | R3 |
+| 17 | Both lifecycle events lost (no `run.started`, no terminal, typing loop gone) ⇒ the T4 sweep flushes within one interval | C1 |
+| 18 | Flush's `create_run` raises ⇒ buffer unchanged on disk, error posted, next sweep delivers | C2 |
 
 12.2 Full suite green at FINAL (`uv run -m pytest`), with before/after counts
 reported. Baseline at branch point (`3e28e53`): **1022 passed, 1 skipped, 42
