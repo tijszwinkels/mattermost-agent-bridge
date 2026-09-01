@@ -115,6 +115,57 @@ class + provider + status code, never a raw stderr dump.
 > (`orchestrator.py:579`, `:603`) carry their own truth — "the harness could not start
 > or drive the CLI" — which today's wording buries. Hence `PATH_HARNESS_PROCESS`.
 
+## 2b. Which stream carries a provider error (pi) — verified
+
+The lead required this before S1 could be claimed to cover the two motivating
+incidents: the harness publishes only **stderr** (`orchestrator.py:814`); stdout is an
+unpublished heartbeat. If pi wrote provider errors to stdout, S1 would miss exactly the
+failures it exists for.
+
+**Result: pi writes provider errors to STDERR and exits 1.** Outcome (a) — S1 covers the
+pi incidents as designed.
+
+Reproduce it with no credentials and no external calls. A throwaway config dir
+(`PI_CODING_AGENT_DIR`) registers a `faux` provider pointing at a local server that
+returns the real OpenRouter 403 body:
+
+```sh
+# server: 403 + {"error":{"message":"Key limit exceeded (daily limit). …"}}
+PI_OFFLINE=1 PI_CODING_AGENT_DIR=/tmp/pi-stream-test \
+  pi -p -nt --no-session --offline \
+     --provider faux --model faux/faux-model "hi" \
+     >/tmp/out.txt 2>/tmp/err.txt </dev/null
+```
+
+Observed (pi 0.84.2):
+
+| | |
+|---|---|
+| exit code | `1` → the harness emits `run.failed {"returncode": 1}` — the incident shape |
+| stdout | **0 bytes** |
+| stderr | `403: {"message":"Key limit exceeded (daily limit). Manage it using https://openrouter.ai/workspaces/default/keys/2c37…c4b6","code":403}` |
+
+That stderr line is the lead's recorded incident string, character for character. The
+`<status>: <body>` composition comes from pi's `normalizeProviderError`
+(`@earendil-works/pi-ai/dist/utils/error-body.js`), which probes the SDK error object for
+a status and a raw body precisely because provider bodies otherwise collapse to the
+opaque `"403 status code (no body)"` form of `openai/core/error.js:makeMessage`.
+
+**Two methodological notes**, because the first attempts were misleading:
+
+1. `PI_OFFLINE=1` / `--offline` and a closed stdin are required. Without them pi hangs on
+   a startup catalog fetch — the 60 s hang the lead hit, and which my first two runs
+   reproduced. It is a startup artefact, not error-path behaviour.
+2. A **control run was mandatory** to establish that. With `MODE=ok` the same invocation
+   returns `exit 0`, stdout `pong`, and the local server logs one request. The first
+   control failed with the server seeing *zero* requests, which is what exposed the
+   startup hang; without it I would have wrongly concluded that pi swallows provider
+   errors.
+
+The degraded `403 status code (no body)` form is also reachable (when the body has no
+`{"error": …}` envelope for the SDK to fold in). It classifies as `unknown` with the
+status still extracted — an honest degradation, and covered by a test.
+
 ## 3. Classifier — data, not code (R4)
 
 `backend_errors.py` gains one table. Each row carries the string that motivated it.
@@ -123,17 +174,34 @@ Order matters: the first matching row wins, so `quota_exhausted` is tested befor
 
 | # | Class | Signatures (substring, case-folded) | Motivating string |
 |---|-------|-------------------------------------|-------------------|
-| 1 | `quota_exhausted` | `daily limit`, `monthly limit`, `quota exceeded`, `insufficient_quota`, `out of credits`, `credit balance` | **Incident 1** — OpenRouter 403 *"Key limit exceeded: daily limit"* |
-| 2 | `rate_limited` | `rate limit`, `usage limit`, `too many requests`, `overloaded`, `429` | **Incident 2** — ollama-cloud 429 *"session usage limit"* |
+| 1 | `quota_exhausted` | `daily limit`, `monthly limit`, `quota exceeded`, `insufficient_quota`, `out of credits`, `credit balance` | **Incident 1 (verbatim)** — `403: {"message":"Key limit exceeded (daily limit). Manage it using https://openrouter.ai/…"}` |
+| 2 | `rate_limited` | `usage limit`, `rate limit`, `too many requests`, `overloaded` | **Incident 2 (verbatim)** — `429: {"message":"you (<user>) have reached your session usage limit, upgrade … https://ollama.com/upgrade …","code":null}` |
 | 3 | `auth` | `invalid api key`, `no auth credentials`, `unauthorized`, `authentication_error`, `401` | Rotated/absent key |
 | 4 | `context_overflow` | `context length`, `maximum context`, `prompt is too long`, `too many tokens` | Long session death |
 | 5 | `unknown` | — (fallback) | Everything else |
 
-HTTP status is extracted separately (`403`, `429`, …) and reported when present, so
-`quota_exhausted` + `403` and `rate_limited` + `429` both read precisely.
+HTTP status is extracted separately. The real strings forced two corrections a
+reconstruction would have missed:
 
-Providers, same shape — one row each: `openrouter`, `ollama`, `anthropic`, `openai`,
-`google`. No provider named → `None` → omitted from the message.
+- **The status arrives as a leading `403:` / `429:` prefix.** Incident 1 also carries
+  `"code":403`, but incident 2 carries `"code":null` — the prefix is the only reliable
+  source. Three anchored patterns cover pi's `<status>: <body>`, the SDK's
+  `<status> <body>`, and the degraded `<status> status code (no body)`. Each requires a
+  following `:`, `{`/`[` or the literal "status code", so a leading count
+  ("500 tokens used") is still not read as a status — there is a test for both directions.
+- **The provider is named only inside a URL** (`openrouter.ai`, `ollama.com`) in BOTH
+  incidents, never as a bare word. Provider rows are therefore matched as plain
+  substrings, which subsumes hostname matching; a word-boundary match would have found
+  nothing.
+
+Providers, one row each: `openrouter`, `ollama`, `anthropic`, `openai`, `google`
+(`gemini` aliased onto it). No provider named → `None` → omitted from the message.
+
+**Redaction decisions on the real strings** (lead ruling, M1): the 64-hex key id in
+incident 1 IS masked; the ref UUID and the username in incident 2 are NOT — they are not
+credentials, and a ref UUID is exactly what an operator would quote to provider support.
+Both directions are pinned by tests so the outcome is a decision, not an accident of the
+regexes.
 
 ```python
 @dataclass(frozen=True)
@@ -217,6 +285,21 @@ def _note_run_failure(self, session_id: str, failure: ProviderFailure) -> None:
 
 Called from `_surface_run_failure` only. Wiring completes when F2 lands; until then
 it is a proven no-op (T10).
+
+**Call shape**, pinned with F2 (Nuthatch) at M1 — no longer an assumption:
+
+```python
+set_session_state(session_id, "blocked", on=None,
+                  note="<class> (<provider>, HTTP <status>)", source="bridge")
+```
+
+`on=None` (F2 owns the on/off lifecycle and creates the row if missing), and the note's
+FIRST TOKEN is the class because F2 renders `blocked (<first token>)`. Class vocabulary:
+`quota_exhausted | rate_limited | auth | context_overflow | harness_process | unknown`;
+provider and status are omitted when unknown. `harness_process` is a *path* in this
+design rather than a class, so it is used as the class token only when the text never
+classified — a real class always wins over it. F2 guarantees the API never raises; the
+raising-API test is kept anyway, since it pins *this* side of the seam.
 
 ## 6. Commit plan (M1)
 
