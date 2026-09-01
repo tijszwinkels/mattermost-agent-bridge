@@ -178,6 +178,30 @@ posts stranded until the next inbound post to that anchor. T4 closes this by
 sweeping `running_sessions() ∪ sessions-with-held-posts` under the same probe
 rate-limit discipline, in the same watchdog task — no new timer.
 
+4.6 **The session-swap window** (lead condition **C4**). A third race, on a
+seam the M0 design never looked at. `_restart_session_with_config` (`.model` /
+`.backend` / `.cwd`) and `_replace_external_session` both do:
+
+```
+mapping.unlink(anchor)  →  await typing.stop(old)  →  await create_session()  →  mapping.link(new)
+```
+
+Across that window `mapping.get_session(anchor)` is `None`, and the T4 sweep
+runs every `typing_refresh_seconds` (**3 s** by default). The sweep reads the
+transient `None` as "the session went away" and takes §3.7 — abandoning the
+entire backlog. Loud, so not a *silent* drop, but a drop; and session creation
+routinely takes longer than one sweep interval, while `.model` during a live
+run is an ordinary operator move. `warming_up_sessions[channel_id]` does not
+cover it: `_restart_session_with_config` sets that only *after* the
+`typing.stop` await, and `_replace_external_session` never sets it in its own
+body at all.
+
+Requirement: **no path that unlinks an anchor and relinks it after an await
+may let the sweep abandon its held posts, and the marker that protects them
+must be in place before the first await after the unlink.** Once the anchor is
+relinked, the backlog is delivered to its *new* owner — that is design §1's
+promise, and waiting for the next sweep would only make it late.
+
 ## 5. Durability (R4)
 
 5.1 Held posts **survive a daemon restart**. Today a post to a busy session
@@ -323,6 +347,12 @@ before the code that makes it pass:
 | 16 | Attachments on held posts download at flush time | R3 |
 | 17 | Both lifecycle events lost (no `run.started`, no terminal, typing loop gone) ⇒ the T4 sweep flushes within one interval | C1 |
 | 18 | Flush's `create_run` raises ⇒ buffer unchanged on disk, error posted, next sweep delivers | C2 |
+| 19 | Sweep during a `.model` restart ⇒ backlog intact | C4 |
+| 20 | After the relink ⇒ backlog delivered to the NEW session | C4 |
+| 21 | The guard is set before the FIRST await after the unlink | C4 |
+| 22 | A failed restart ⇒ backlog stays with the restored old session | C4 |
+| 23 | Sweep during an external-session replacement ⇒ backlog intact | C4 |
+| 24 | `.leave` with a backlog names what it dropped | nit |
 
 12.2 Full suite green at FINAL (`uv run -m pytest`), with before/after counts
 reported. Baseline at branch point (`3e28e53`): **1022 passed, 1 skipped, 42

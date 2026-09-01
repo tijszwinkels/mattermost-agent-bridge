@@ -6,6 +6,7 @@ covers (R1-R12 from the round brief, C1/C2 from the M0 gate).
 
 from __future__ import annotations
 
+import asyncio
 import json
 import tempfile
 import unittest
@@ -869,6 +870,178 @@ class WarmingQueueTests(_HoldTestCase):
         self.assertIn("2 posts arrived", bridge.harness.sent[0][1])
 
 
+# ───────────────────────── C4. The restart window ─────────────────────────
+
+
+class RestartWindowTests(_HoldTestCase):
+    """A session restart unlinks the anchor and relinks it after two awaits.
+
+    `_restart_session_with_config` and `_replace_external_session` both do
+    `mapping.unlink(anchor)` → `await typing.stop(old)` →
+    `await harness.create_session(...)` → `mapping.link(new)`. The held-anchor
+    sweep runs every `typing_refresh_seconds` (3s), and mid-window
+    `mapping.get_session(anchor)` is None — which reads as "session gone" and
+    abandons the whole backlog. Session creation routinely takes longer than
+    one sweep interval, and `.model` while a run is live is an ordinary
+    operator move.
+    """
+
+    def _config(self, backend="claude"):
+        from mm_bridge import purpose
+        return purpose.PurposeConfig(backend=backend, model=None, cwd=None)
+
+    async def _await_gate(self, event, task=None):
+        """Wait for a gate, but never hang: surface the restart task's own
+        exception instead of blocking the suite forever."""
+        try:
+            await asyncio.wait_for(event.wait(), timeout=5)
+        except asyncio.TimeoutError:
+            if task is not None and task.done():
+                task.result()  # re-raise whatever killed it
+            raise AssertionError("restart never reached create_session")
+
+    def _gated_create_session(self, entered, release, session_id="s2"):
+        async def blocking_create_session(**kwargs):
+            entered.set()
+            await release.wait()
+            return {
+                "id": session_id, "backend": kwargs.get("backend"),
+                "project": {"path": "/tmp/proj"}, "origin": "harness",
+            }
+        return blocking_create_session
+
+    async def test_sweep_during_a_config_restart_keeps_the_backlog(self):
+        self.run_live()
+        await self.bridge._on_mm_posted(self.post("p1", "before the restart"))
+        self.assertEqual(self.held_ids(), ["p1"])
+
+        entered, release = asyncio.Event(), asyncio.Event()
+        self.bridge.harness.create_session = self._gated_create_session(
+            entered, release,
+        )
+        task = asyncio.create_task(
+            self.bridge._restart_session_with_config("c1", "s1", self._config()),
+        )
+        await self._await_gate(entered, task)
+
+        # Mid-window: the anchor genuinely has no session.
+        self.assertIsNone(self.bridge.mapping.get_session(Anchor("c1")))
+        self.bridge._held_probe_ts.clear()
+        await self.bridge._sweep_held_anchors()
+
+        self.assertEqual(self.held_ids(), ["p1"], "backlog abandoned mid-restart")
+        release.set()
+        await task
+
+    async def test_the_backlog_is_delivered_to_the_new_session(self):
+        self.run_live()
+        self.bridge.mm.users["u1"] = {"id": "u1", "username": "tijs"}
+        await self.bridge._on_mm_posted(self.post("p1", "survive the restart"))
+
+        entered, release = asyncio.Event(), asyncio.Event()
+        self.bridge.harness.create_session = self._gated_create_session(
+            entered, release,
+        )
+        task = asyncio.create_task(
+            self.bridge._restart_session_with_config("c1", "s1", self._config()),
+        )
+        await self._await_gate(entered, task)
+        release.set()
+        await task
+
+        self.assertEqual(self.bridge.mapping.get_session(Anchor("c1")), "s2")
+        self.assertEqual(
+            [sid for sid, _ in self.bridge.harness.sent], ["s2"],
+        )
+        self.assertIn("survive the restart", self.bodies()[0])
+        self.assertEqual(self.held_ids(), [])
+
+    async def test_the_guard_is_in_place_before_the_first_await(self):
+        # The window opens at `mapping.unlink`, and the FIRST await after it
+        # is `typing.stop` — not `create_session`. A marker set later would
+        # leave a real (if narrow) hole.
+        from mm_bridge.typing_indicator import TypingIndicator
+        self.bridge.typing = TypingIndicator(self.bridge.mm, refresh_s=0.01)
+        self.run_live()
+        await self.bridge._on_mm_posted(self.post("p1", "x"))
+
+        seen = {}
+        original_stop = self.bridge.typing.stop
+
+        async def recording_stop(session_id):
+            guard = getattr(self.bridge, "_held_is_protected", None)
+            seen["protected"] = bool(guard and guard(Anchor("c1")))
+            seen["unlinked"] = (
+                self.bridge.mapping.get_session(Anchor("c1")) is None
+            )
+            return await original_stop(session_id)
+
+        self.bridge.typing.stop = recording_stop
+        entered, release = asyncio.Event(), asyncio.Event()
+        self.bridge.harness.create_session = self._gated_create_session(
+            entered, release,
+        )
+        task = asyncio.create_task(
+            self.bridge._restart_session_with_config("c1", "s1", self._config()),
+        )
+        await self._await_gate(entered, task)
+        release.set()
+        await task
+
+        self.assertTrue(seen.get("unlinked"), "expected the anchor unlinked")
+        self.assertTrue(seen.get("protected"), "guard not set before first await")
+
+    async def test_a_failed_restart_keeps_the_backlog_for_the_old_session(self):
+        self.run_live()
+        await self.bridge._on_mm_posted(self.post("p1", "still mine"))
+
+        async def failing_create_session(**kwargs):
+            raise RuntimeError("harness down")
+
+        self.bridge.harness.create_session = failing_create_session
+        await self.bridge._restart_session_with_config("c1", "s1", self._config())
+
+        # The old mapping is restored, so the backlog belongs to it again.
+        self.assertEqual(self.bridge.mapping.get_session(Anchor("c1")), "s1")
+        self.bridge._held_probe_ts.clear()
+        self.bridge.harness.session_runs_meta["s1"] = []
+        await self.bridge._sweep_held_anchors()
+        self.assertEqual(
+            [sid for sid, _ in self.bridge.harness.sent], ["s1"],
+        )
+
+    async def test_sweep_during_an_external_replacement_keeps_the_backlog(self):
+        # `_replace_external_session` has the same unlink→await→link shape.
+        self.bridge._external_sessions.add("s1")
+        self.run_live()
+        self.bridge._held.add(
+            Anchor("c1"),
+            __import__("mm_bridge.held_posts", fromlist=["HeldPost"]).HeldPost(
+                post=self.post("p0", "held before adoption"),
+                username="tijs", held_at_ms=1_788_000_000_000,
+            ),
+            session_id="s1",
+        )
+
+        entered, release = asyncio.Event(), asyncio.Event()
+        self.bridge.harness.create_session = self._gated_create_session(
+            entered, release, session_id="s3",
+        )
+        task = asyncio.create_task(self.bridge._replace_external_session(
+            "c1", "s1", self.post("p1", "adopt me"), "adopt me",
+        ))
+        await self._await_gate(entered, task)
+
+        self.assertIsNone(self.bridge.mapping.get_session(Anchor("c1")))
+        self.bridge._held_probe_ts.clear()
+        await self.bridge._sweep_held_anchors()
+
+        self.assertEqual(self.held_ids(), ["p0"], "backlog abandoned mid-adoption")
+        release.set()
+        await task
+        self.assertEqual(self.bridge.mapping.get_session(Anchor("c1")), "s3")
+
+
 # ───────────────────────── Teardown hygiene ───────────────────────────────
 
 
@@ -880,6 +1053,26 @@ class TeardownTests(_HoldTestCase):
         await self.bridge._leave_channel("c1", "s1", farewell=None)
 
         self.assertEqual(self.held_ids(), [])
+
+    async def test_leaving_names_the_held_posts_it_drops(self):
+        # "An explicit drop is still never a silent one" — a `.leave` with a
+        # backlog is exactly that, and the channel is still readable.
+        self.run_live()
+        self.bridge.mm.users["u1"] = {"id": "u1", "username": "tijs"}
+        await self.bridge._on_mm_posted(self.post("p1", "orphan"))
+
+        await self.bridge._leave_channel("c1", "s1", farewell=None)
+
+        self.assertTrue(
+            any("tijs" in p.message for p in self.bridge.mm.posted),
+            [p.message for p in self.bridge.mm.posted],
+        )
+
+    async def test_leaving_with_an_empty_buffer_says_nothing_extra(self):
+        await self.bridge._leave_channel("c1", "s1", farewell=None)
+        self.assertEqual(
+            [p.message for p in self.bridge.mm.posted if "held" in p.message], [],
+        )
 
     async def test_being_removed_from_a_channel_forgets_its_held_posts(self):
         self.run_live()

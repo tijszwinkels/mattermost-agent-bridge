@@ -445,7 +445,43 @@ Covered in §2.7 (3)/(4) and `_should_hold`'s `_flushing` check. A post
 arriving during a flush is held and picked up by the flush's own loop, so it
 can never submit a run that overtakes the flush's `create_run`.
 
-### 4.5 Accepted, documented non-closures
+### 4.5 The session-swap window (C4)
+
+The two session-replacement paths unlink an anchor and relink it only after
+two awaits. `_flush_held` guards on `_held_is_protected(anchor)`, and both
+paths run inside `_anchor_relink_window(anchor)` — an async context manager
+entered **before the unlink**, so no await after it can be unprotected.
+
+```python
+async with self._anchor_relink_window(Anchor(channel_id)):
+    self.mapping.unlink(Anchor(channel_id))
+    ...
+    await self.typing.stop(old_session_id)      # first await
+    session = await self.harness.create_session(...)   # >> 3s, routinely
+    self.mapping.link(Anchor(channel_id), session_id)
+# window closed — now the anchor has an owner again
+if self.mapping.get_session(Anchor(channel_id)):
+    await self._flush_held(Anchor(channel_id))
+```
+
+Two choices worth naming:
+
+* **The guard lives in `_flush_held`, not in the sweep.** One choke point, so
+  the terminal event (T1), the watchdog (T2), the post-enqueue probe (T3) and
+  the sweep (T4) all inherit it — including any future caller.
+* **Entering before the unlink, not after.** Protecting slightly early is
+  harmless: the anchor still points at its old session, and the only effect is
+  that a flush waits for the swap to finish — which is what we want, since the
+  replacement is the conversation's new owner. Entering *after* would leave
+  exactly the hole C4 describes, because the first await comes immediately.
+
+The explicit flush after the window is what makes the delivery deterministic
+rather than up to one sweep interval late, and it runs **before**
+`_flush_queued` so the older held posts precede the newer ones that arrived
+during the restart. On a failed restart the old mapping is restored, so the
+same call delivers the backlog back to the still-live old session.
+
+### 4.6 Accepted, documented non-closures
 
 | Case | Behaviour | Why acceptable |
 | --- | --- | --- |

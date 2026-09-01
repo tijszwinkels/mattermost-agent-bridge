@@ -7,6 +7,7 @@ import logging
 import re
 import time
 from collections import deque
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 
@@ -544,6 +545,11 @@ class Bridge:
         # would overtake the flush's own `create_run` and reorder the
         # conversation.
         self._flushing: set[Anchor] = set()
+        # Anchors whose session is being swapped — unlinked, and not yet
+        # relinked to the replacement. `mapping.get_session` reads None across
+        # that window, which the sweep would take as "session gone" and use to
+        # abandon the backlog. See `_anchor_relink_window`.
+        self._relinking: set[Anchor] = set()
         # Monotonic timestamp of the last harness liveness probe per session,
         # for the held-anchor sweep. Same rate-limit discipline as the typing
         # watchdog (one probe per silence window), so a long-held anchor can't
@@ -1588,56 +1594,66 @@ class Bridge:
         # against the same dead session. Per-session bookkeeping for the
         # old id is safe to drop now: even if replacement fails, the old
         # session is by definition unreachable from MM.
-        self.mapping.unlink(Anchor(channel_id))
-        self._end_tool_use_run(old_session_id)
-        self.posters.forget(old_session_id)
-        self._forget_channel_silent_drops(channel_id)
-        self._session_triggerer.pop(old_session_id, None)
-        self._recent_harness_sends.pop(old_session_id, None)
-        self._external_sessions.discard(old_session_id)
-        if self.typing:
-            await self.typing.stop(old_session_id)
-        try:
-            self.mm.post_message(
+        # Everything from here to the relink runs with the anchor
+        # session-less. Protect its held posts across that window BEFORE
+        # the first await, or the sweep abandons the backlog mid-adoption.
+        async with self._anchor_relink_window(Anchor(channel_id)):
+            self.mapping.unlink(Anchor(channel_id))
+            self._end_tool_use_run(old_session_id)
+            self.posters.forget(old_session_id)
+            self._forget_channel_silent_drops(channel_id)
+            self._session_triggerer.pop(old_session_id, None)
+            self._recent_harness_sends.pop(old_session_id, None)
+            self._external_sessions.discard(old_session_id)
+            if self.typing:
+                await self.typing.stop(old_session_id)
+            try:
+                self.mm.post_message(
+                    channel_id,
+                    ":arrows_counterclockwise: Previous session is no longer reachable from "
+                    "Mattermost. Starting a fresh session for this channel.",
+                )
+            except Exception:
+                logger.debug("Failed to post adoption notice", exc_info=True)
+            await self._start_invited_session(
                 channel_id,
-                ":arrows_counterclockwise: Previous session is no longer reachable from "
-                "Mattermost. Starting a fresh session for this channel.",
+                initial_message=message,
+                awaits_first_message=False,
+                post_welcome=False,
+                exclude_post_id=post.get("id"),
+                post=post,
             )
-        except Exception:
-            logger.debug("Failed to post adoption notice", exc_info=True)
-        await self._start_invited_session(
-            channel_id,
-            initial_message=message,
-            awaits_first_message=False,
-            post_welcome=False,
-            exclude_post_id=post.get("id"),
-            post=post,
-        )
 
-        # Commit the "old session is gone" state ONLY if the replacement
-        # actually produced a fresh mapping. ``_start_invited_session``
-        # logs+returns on harness/MM failure without raising and without
-        # linking; if we'd ``mark_adopted``'d the old id eagerly, the
-        # next bootstrap would skip auto-recovery for the still-mapped
-        # channel and the operator would have to surgically edit
-        # ``state.json`` to recover.
-        new_session_id = self.mapping.get_session(Anchor(channel_id))
-        if new_session_id and new_session_id != old_session_id:
-            self.mapping.mark_adopted(old_session_id)
-            # Stop the bootstrap recovery path from re-spawning a fresh
-            # channel for this session id on the next restart.
-            self._known_sessions.add(old_session_id)
-        else:
-            # Replacement failed — restore the old mapping so the next MM
-            # post re-enters this path and retries. ``_start_invited_session``
-            # has already posted a user-visible warning on its own error path.
-            self.mapping.link(Anchor(channel_id), old_session_id)
-            self._external_sessions.add(old_session_id)
-            logger.warning(
-                "Replacement of external session %s failed — restored old "
-                "mapping for retry on next MM post",
-                old_session_id[:12],
-            )
+            # Commit the "old session is gone" state ONLY if the replacement
+            # actually produced a fresh mapping. ``_start_invited_session``
+            # logs+returns on harness/MM failure without raising and without
+            # linking; if we'd ``mark_adopted``'d the old id eagerly, the
+            # next bootstrap would skip auto-recovery for the still-mapped
+            # channel and the operator would have to surgically edit
+            # ``state.json`` to recover.
+            new_session_id = self.mapping.get_session(Anchor(channel_id))
+            if new_session_id and new_session_id != old_session_id:
+                self.mapping.mark_adopted(old_session_id)
+                # Stop the bootstrap recovery path from re-spawning a fresh
+                # channel for this session id on the next restart.
+                self._known_sessions.add(old_session_id)
+            else:
+                # Replacement failed — restore the old mapping so the next MM
+                # post re-enters this path and retries. ``_start_invited_session``
+                # has already posted a user-visible warning on its own error path.
+                self.mapping.link(Anchor(channel_id), old_session_id)
+                self._external_sessions.add(old_session_id)
+                logger.warning(
+                    "Replacement of external session %s failed — restored old "
+                    "mapping for retry on next MM post",
+                    old_session_id[:12],
+                )
+
+        # The anchor is linked again — to the replacement, or restored to the
+        # old session. Either way it has an owner now, so deliver anything
+        # that was held across the swap.
+        if self.mapping.get_session(Anchor(channel_id)):
+            await self._flush_held(Anchor(channel_id))
 
     async def _restart_session_with_config(
         self,
@@ -1659,61 +1675,73 @@ class Bridge:
         ``:warning:`` is posted. Callers must not claim success on ``None``.
         """
         previous_cfg = self.purpose_by_channel.get(channel_id)
-        self.mapping.unlink(Anchor(channel_id))
-        self._end_tool_use_run(old_session_id)
-        self.posters.forget(old_session_id)
-        self._forget_channel_silent_drops(channel_id)
-        self._session_triggerer.pop(old_session_id, None)
-        self._recent_harness_sends.pop(old_session_id, None)
-        if self.typing:
-            await self.typing.stop(old_session_id)
-        effective_cwd = self._resolve_purpose_cwd(cfg)
+        # Same unlink -> await -> relink window as the adoption path: the
+        # anchor has no session across `typing.stop` and `create_session`,
+        # and `create_session` routinely outlives one sweep interval.
+        async with self._anchor_relink_window(Anchor(channel_id)):
+            self.mapping.unlink(Anchor(channel_id))
+            self._end_tool_use_run(old_session_id)
+            self.posters.forget(old_session_id)
+            self._forget_channel_silent_drops(channel_id)
+            self._session_triggerer.pop(old_session_id, None)
+            self._recent_harness_sends.pop(old_session_id, None)
+            if self.typing:
+                await self.typing.stop(old_session_id)
+            effective_cwd = self._resolve_purpose_cwd(cfg)
 
-        self.warming_up_sessions[channel_id] = WarmingUpChannel(channel_id)
-        self.purpose_by_channel[channel_id] = cfg
-        session_id: str | None = None
+            self.warming_up_sessions[channel_id] = WarmingUpChannel(channel_id)
+            self.purpose_by_channel[channel_id] = cfg
+            session_id: str | None = None
 
-        try:
-            session = await self.harness.create_session(
-                backend=cfg.backend,
-                model=self._resolve_session_model(cfg),
-                cwd=effective_cwd,
-            )
-            session_id = session.get("id")
-            if not session_id:
-                raise RuntimeError("agent-harness create_session response missing id")
-            self.mapping.link(Anchor(channel_id), session_id)
-            self._known_sessions.add(session_id)
-            # No greeting/warming run: a restart is triggered by `.model` /
-            # `.backend`, which post their own confirmation. Firing the
-            # INVITE_PLACEHOLDER prompt here would burn a run and post a
-            # spurious "Hi! I'm set up…" greeting. The next real user message
-            # becomes the new session's first run.
-            await self._update_resume_purpose(
-                channel_id, session_id, cfg.backend, effective_cwd,
-            )
-        except Exception as exc:
-            logger.exception("Failed to restart agent-harness session for %s", channel_id)
-            # Restore the prior mapping/config so the channel keeps talking to
-            # its old (still-live) session instead of being orphaned — a lost
-            # session would silently drop every subsequent message.
-            self.mapping.link(Anchor(channel_id), old_session_id)
-            if previous_cfg is not None:
-                self.purpose_by_channel[channel_id] = previous_cfg
-            else:
-                self.purpose_by_channel.pop(channel_id, None)
             try:
-                self.mm.post_message(
-                    channel_id,
-                    format_backend_error(
-                        "restart the session", cfg.backend, exception_detail(exc),
-                    ),
+                session = await self.harness.create_session(
+                    backend=cfg.backend,
+                    model=self._resolve_session_model(cfg),
+                    cwd=effective_cwd,
                 )
-            except Exception:
-                logger.debug("Failed to post session-restart error", exc_info=True)
-            session_id = None
-        finally:
-            queued = self.warming_up_sessions.pop(channel_id, None)
+                session_id = session.get("id")
+                if not session_id:
+                    raise RuntimeError("agent-harness create_session response missing id")
+                self.mapping.link(Anchor(channel_id), session_id)
+                self._known_sessions.add(session_id)
+                # No greeting/warming run: a restart is triggered by `.model` /
+                # `.backend`, which post their own confirmation. Firing the
+                # INVITE_PLACEHOLDER prompt here would burn a run and post a
+                # spurious "Hi! I'm set up…" greeting. The next real user message
+                # becomes the new session's first run.
+                await self._update_resume_purpose(
+                    channel_id, session_id, cfg.backend, effective_cwd,
+                )
+            except Exception as exc:
+                logger.exception("Failed to restart agent-harness session for %s", channel_id)
+                # Restore the prior mapping/config so the channel keeps talking to
+                # its old (still-live) session instead of being orphaned — a lost
+                # session would silently drop every subsequent message.
+                self.mapping.link(Anchor(channel_id), old_session_id)
+                if previous_cfg is not None:
+                    self.purpose_by_channel[channel_id] = previous_cfg
+                else:
+                    self.purpose_by_channel.pop(channel_id, None)
+                try:
+                    self.mm.post_message(
+                        channel_id,
+                        format_backend_error(
+                            "restart the session", cfg.backend, exception_detail(exc),
+                        ),
+                    )
+                except Exception:
+                    logger.debug("Failed to post session-restart error", exc_info=True)
+                session_id = None
+            finally:
+                queued = self.warming_up_sessions.pop(channel_id, None)
+        # Held posts predate the restart and are still buffered under this
+        # anchor. Now that it points at the replacement (or, on failure, back
+        # at the old session), deliver them there rather than waiting up to a
+        # sweep interval. Flushed BEFORE the warming queue because they are
+        # OLDER than anything that arrived during the restart — arrival order
+        # is what the coalesced turn promises.
+        if self.mapping.get_session(Anchor(channel_id)):
+            await self._flush_held(Anchor(channel_id))
         # On success, posts target the replacement. On failure, the old
         # mapping above was restored, so re-dispatch there instead of dropping
         # anything that arrived during the failed restart.
@@ -2268,6 +2296,37 @@ class Bridge:
             await self._flush_held(anchor)
         return True
 
+    @asynccontextmanager
+    async def _anchor_relink_window(self, anchor: Anchor):
+        """Protect `anchor`'s held posts while its session is being swapped.
+
+        `_restart_session_with_config` (`.model` / `.backend` / `.cwd`) and
+        `_replace_external_session` both unlink the anchor, then await —
+        `typing.stop`, then `create_session` — before linking the
+        replacement. Across that window `mapping.get_session(anchor)` is
+        None, and `_sweep_held_anchors` runs every `typing_refresh_seconds`
+        (3s by default). Without this marker the sweep reads the transient
+        None as "the session went away" and abandons the whole backlog —
+        loudly, so not a silent drop, but a drop. Session creation routinely
+        takes longer than one sweep interval, and `.model` while a run is in
+        flight is an ordinary operator move.
+
+        Entered BEFORE the unlink so no await after it can be unprotected.
+        Protecting slightly early is harmless: the anchor still points at its
+        old session, and the only effect is that a flush waits for the swap
+        to finish — which is what we want anyway, since the replacement is
+        the conversation's new owner.
+        """
+        self._relinking.add(anchor)
+        try:
+            yield
+        finally:
+            self._relinking.discard(anchor)
+
+    def _held_is_protected(self, anchor: Anchor) -> bool:
+        """True while `anchor`'s held posts must not be flushed or abandoned."""
+        return anchor in self._relinking
+
     async def _maybe_flush_held_for_session(self, session_id: str) -> None:
         """Flush the anchor bound to `session_id`, if it holds anything."""
         anchor = self.mapping.get_anchor(session_id)
@@ -2285,6 +2344,17 @@ class Bridge:
         """
         if anchor in self._flushing:
             return
+        if self._held_is_protected(anchor):
+            # A session swap is in progress for this anchor. `get_session` is
+            # transiently None, which the no-session branch below would read
+            # as "abandon the backlog". Guarding HERE rather than in the sweep
+            # covers every caller — the sweep, the terminal event and the
+            # post-enqueue probe alike. The restart flushes once it relinks.
+            logger.debug(
+                "Deferring flush for %s — session swap in progress",
+                anchor.channel_id,
+            )
+            return
         self._flushing.add(anchor)
         try:
             while True:
@@ -2293,7 +2363,7 @@ class Bridge:
                     return
                 session_id = self.mapping.get_session(anchor)
                 if not session_id:
-                    self._abandon_held(anchor, held)
+                    await self._abandon_held(anchor, held)
                     return
                 if not await self._deliver_held(anchor, session_id, held):
                     return
@@ -2413,7 +2483,7 @@ class Bridge:
                 # so there is nowhere to park them. Name them instead — a
                 # disabled catch-up must not turn a permanent delivery
                 # failure into a silent loss.
-                self._announce_dropped_held(
+                await self._announce_dropped_held(
                     anchor, held,
                     f"the session ({session_id[:8]}) can no longer accept "
                     "messages",
@@ -2428,7 +2498,7 @@ class Bridge:
         )
         return False
 
-    def _abandon_held(
+    async def _abandon_held(
         self, anchor: Anchor, held: list[held_posts.HeldPost],
     ) -> None:
         """Give up on an anchor whose session is gone — loudly, by name.
@@ -2437,11 +2507,11 @@ class Bridge:
         silent strand, so the posts are dropped and the buffer cleared.
         """
         self._held.clear(anchor)
-        self._announce_dropped_held(
+        await self._announce_dropped_held(
             anchor, held, "this channel's session went away",
         )
 
-    def _announce_dropped_held(
+    async def _announce_dropped_held(
         self, anchor: Anchor, held: list[held_posts.HeldPost], reason: str,
     ) -> None:
         """Report held posts that will never be delivered — by author and
@@ -2469,11 +2539,26 @@ class Bridge:
             )
         except Exception:
             logger.debug("Failed to post dropped-holds notice", exc_info=True)
+        # Through `_react_best_effort` like every other reaction: these are
+        # blocking HTTP calls, and clearing a 50-deep anchor inline would
+        # stall the event loop for the whole batch.
         for h in held:
-            try:
-                self.mm.remove_reaction(h.post_id, HELD_REACTION)
-            except Exception:
-                logger.debug("Failed to clear held reaction", exc_info=True)
+            await self._react_best_effort(h.post_id, HELD_REACTION, add=False)
+
+    async def _announce_held_before_leaving(
+        self, anchor: Anchor, reason: str,
+    ) -> None:
+        """Name an anchor's held posts on the way out, if it has any.
+
+        Teardown forgets held posts silently, which is right for
+        `_on_mm_user_removed` (nobody left to tell) but wrong for a
+        deliberate `.leave`: the operator chose to drop a backlog and should
+        see whose messages went with it. No-op on an empty buffer, so an
+        ordinary leave stays quiet.
+        """
+        held = self._held.peek(anchor)
+        if held:
+            await self._announce_dropped_held(anchor, held, reason)
 
     async def _sweep_held_anchors(self) -> None:
         """Reconcile held anchors whose run lifecycle events went missing,
@@ -2526,7 +2611,7 @@ class Bridge:
         for anchor in self._held.anchors():
             session_id = self.mapping.get_session(anchor)
             if not session_id:
-                self._abandon_held(anchor, self._held.peek(anchor))
+                await self._abandon_held(anchor, self._held.peek(anchor))
                 continue
             if await self._active_run_is_alive(session_id):
                 logger.info(
@@ -3046,6 +3131,9 @@ class Bridge:
             removed = self.mapping.unlink(Anchor(channel_id, thread_root))
             self.dead_threads.add((channel_id, thread_root))
             self._forget_thread_silent_drops(channel_id, thread_root)
+            await self._announce_held_before_leaving(
+                Anchor(channel_id, thread_root), "the bot left this thread",
+            )
             self._held.forget_anchor(Anchor(channel_id, thread_root))
             if removed:
                 self._end_tool_use_run(removed)
@@ -4337,6 +4425,12 @@ class Bridge:
                 self.mm.post_message(channel_id, farewell)
             except Exception:
                 pass
+        # Leaving discards this channel's held posts. Name them first —
+        # "an explicit drop is still never a silent one" — and first is
+        # literal: after `remove_self_from_channel` we can't post here.
+        await self._announce_held_before_leaving(
+            Anchor(channel_id), "the bot left this channel",
+        )
         try:
             self.mm.remove_self_from_channel(channel_id)
         except Exception:
