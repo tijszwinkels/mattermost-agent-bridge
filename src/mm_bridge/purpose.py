@@ -25,6 +25,20 @@ _BACKEND_ALIASES: dict[str, str] = {
     "claude code": "claude",
 }
 
+def canonical_backend(token: str | None) -> str | None:
+    """Canonicalise a backend name to the vocabulary the channel speaks.
+
+    agent-harness reports its own wire names (``claude-code``); Channel
+    Purpose, `.backend` and every operator-facing message use the short form
+    (``claude``). Unknown names pass through unchanged — naming a backend we
+    don't recognise is still more truthful than dropping it.
+    """
+    if not token:
+        return None
+    lc = token.strip().lower()
+    return _BACKEND_ALIASES.get(lc, lc) or None
+
+
 # A standalone line equal to this string splits the Channel Purpose into a
 # config section (parsed by `parse()`) and a trailing section reserved for
 # informational content such as the resume-command block written by

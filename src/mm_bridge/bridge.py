@@ -20,10 +20,15 @@ from . import (
     watchdog_notices,
 )
 from .backend_errors import (
+    PATH_NOT_ACCEPTED,
+    classify_failure,
     exception_detail,
     format_backend_error,
+    format_provider_failure,
     run_failure_detail,
+    run_failure_path,
 )
+from .stderr_tail import SessionStderrTails
 from .agent_harness_client import (
     AgentHarnessClient,
     HarnessForkUnsupported,
@@ -499,6 +504,12 @@ class Bridge:
         # message in the same anchor and prepended as a catch-up block
         # so the session sees the preceding conversation it missed.
         self._silent_drops: dict[tuple[str, str | None], deque[dict]] = {}
+        # Last few CLI stderr lines per session with a live run. The harness
+        # reports the commonest provider failure as a bare returncode, so this
+        # is the only place the provider's own words ("403 … daily limit")
+        # appear. Cleared at the start of every run and again when it ends —
+        # see `_on_harness_run_lifecycle`.
+        self._stderr_tails = SessionStderrTails()
         # user_id of the most recent MM post forwarded into each session.
         # Read by `_mention_triggerer_on_done` to @-mention that user when
         # the run ends. Cleared on use, so a single completion event only
@@ -1659,15 +1670,71 @@ class Bridge:
             await self._flush_queued(channel_id, queued.queued_posts)
         return session_id
 
-    def _backend_for_channel(self, channel_id: str) -> str | None:
-        """Backend name configured for ``channel_id``, or ``None`` if unknown.
+    async def _backend_for_error(
+        self, session_id: str | None, channel_id: str,
+    ) -> str | None:
+        """Name the backend that actually ran, or ``None``.
 
-        Read from the cached Channel Purpose config. Used to name the backend
-        in surfaced error messages; ``None`` (external/observer channels with
-        no cached config) degrades the template to a generic "the backend".
+        WHY this is separate from :meth:`_backend_for_resume`: until round F3
+        both jobs shared one method name, and because the resume-oriented
+        definition came LATER in the class body it silently overwrote this one
+        (Python keeps the last). Error messages inherited the resume
+        resolver's `default_backend` guess, so two real incidents blamed
+        `claude` for a `pi` session. A Resume command must name something
+        runnable and may guess; an error message may not. Different
+        contracts — different methods.
+
+        Resolution order, most authoritative first:
+
+        1. The session's own harness record. It knows the backend even when
+           Mattermost never wrote a token (`mm-bridge spawn --backend pi`) —
+           the same "live meta wins over a token-less Purpose" ruling as PR #45.
+        2. The cached `PurposeConfig`.
+        3. The channel's persisted Purpose, re-parsed (the cache is empty
+           after a daemon restart).
+        4. ``None`` → the message says "the backend". Never a default.
+
+        Step 1 is BEST-EFFORT: this runs on paths where the harness is often
+        the thing that just failed, and the warning must post promptly either
+        way.
         """
-        cfg = self.purpose_by_channel.get(channel_id)
-        return cfg.backend if cfg else None
+        if session_id:
+            try:
+                meta = await self.harness.get_session(session_id) or {}
+            except Exception:
+                meta = {}
+                logger.debug(
+                    "backend-for-error: harness meta lookup failed for %s",
+                    session_id[:8], exc_info=True,
+                )
+            wire = meta.get("backend") or meta.get("backendName")
+            canonical = purpose.canonical_backend(wire)
+            if canonical:
+                return canonical
+
+        cached = self.purpose_by_channel.get(channel_id)
+        if cached and cached.backend:
+            return cached.backend
+
+        try:
+            ch = self.mm.get_channel(channel_id)
+        except Exception:
+            logger.debug(
+                "backend-for-error: channel lookup failed for %s",
+                channel_id, exc_info=True,
+            )
+            return None
+        raw = (ch.get("purpose") or "").strip()
+        if not raw:
+            return None
+        parsed = purpose.parse(
+            raw,
+            default_backend="",
+            default_model=None,
+            available_models_for=lambda _b: [],
+            default_autorespond=self.config.default_autorespond,
+        )
+        return parsed.backend or None
 
     def _resolve_session_model(self, cfg: purpose.PurposeConfig) -> str | None:
         """Pick the model to send to ``harness.create_session``.
@@ -2033,10 +2100,11 @@ class Bridge:
             try:
                 self.mm.post(
                     channel_id,
-                    format_backend_error(
-                        "run your message",
-                        self._backend_for_channel(channel_id),
-                        exception_detail(exc),
+                    format_provider_failure(
+                        action="run your message",
+                        backend=await self._backend_for_error(session_id, channel_id),
+                        failure=classify_failure(exception_detail(exc)),
+                        path=PATH_NOT_ACCEPTED,
                     ),
                     root_id=thread_root,
                 )
@@ -2492,10 +2560,11 @@ class Bridge:
             try:
                 self.mm.post(
                     channel_id,
-                    format_backend_error(
-                        "send the catch-up context",
-                        self._backend_for_channel(channel_id),
-                        exception_detail(exc),
+                    format_provider_failure(
+                        action="send the catch-up context",
+                        backend=await self._backend_for_error(session_id, channel_id),
+                        failure=classify_failure(exception_detail(exc)),
+                        path=PATH_NOT_ACCEPTED,
                     ),
                     root_id=thread_root,
                 )
@@ -3842,6 +3911,15 @@ class Bridge:
             await self._on_harness_run_lifecycle(event_type, inner)
         elif event_type in HARNESS_WATCHDOG_EVENTS:
             await self._on_harness_watchdog_event(event_type, inner)
+        elif event_type == "process.stderr":
+            # Buffered, never posted verbatim. A `run.failed` usually arrives
+            # with nothing but a returncode, so these lines are the only
+            # evidence of WHY the CLI died; `classify_failure` reads the tail
+            # and the channel sees at most one redacted line of it.
+            # Only for sessions we could actually post about — that keeps the
+            # buffer to live, mapped sessions instead of every observer run.
+            if session_id and self.mapping.get_anchor(session_id):
+                self._stderr_tails.append(session_id, inner.get("text") or "")
         else:
             logger.debug("Unhandled agent-harness event %s", event_type)
 
@@ -4070,11 +4148,15 @@ class Bridge:
             backend = meta.get("backend") or meta.get("backendName") or None
             cwd = (meta.get("project") or {}).get("path") or meta.get("cwd") or None
         if not backend:
-            backend = self._backend_for_channel(channel_id)
+            backend = self._backend_for_resume(channel_id)
         return backend, cwd
 
-    def _backend_for_channel(self, channel_id: str) -> str | None:
+    def _backend_for_resume(self, channel_id: str) -> str | None:
         """Backend used to resume a session in `channel_id`.
+
+        Guesses `config.default_backend` as a last resort ON PURPOSE: a Resume
+        command has to name something runnable. Do NOT reuse this to attribute
+        an error — see :meth:`_backend_for_error`.
 
         Resolution order:
 
@@ -4509,6 +4591,10 @@ class Bridge:
             self.active_run_by_session[session_id] = (
                 data.get("run_id") or data.get("id")
             )
+            # A failure must never be explained by the PREVIOUS run's stderr:
+            # the operator would be told "quota" about a run that died of
+            # something else entirely.
+            self._stderr_tails.clear(session_id)
             await self._start_typing_for_activity(session_id)
             return
 
@@ -4531,6 +4617,11 @@ class Bridge:
         # NOT ``run.failed``, so this never double-posts with those warnings.
         if event_type == "run.failed":
             await self._surface_run_failure(session_id, data)
+        # AFTER surfacing (it classifies on the tail), and for every terminal
+        # event — so the buffer only ever holds the current run's output. This
+        # runs regardless of mapping, which is why unlinking a session
+        # mid-run can't leak an entry.
+        self._stderr_tails.clear(session_id)
         self._mention_triggerer_on_done(session_id)
 
     async def _surface_run_failure(self, session_id: str, data: dict) -> None:
@@ -4548,16 +4639,25 @@ class Bridge:
             )
             return
         detail = run_failure_detail(data)
+        # The stderr tail is classification input only — never logged above
+        # debug and never posted raw (lead condition C1/C3).
+        failure = classify_failure(
+            detail, stderr_tail=self._stderr_tails.lines(session_id),
+        )
         logger.error(
-            "Harness run failed: session=%s detail=%s", session_id[:8], detail,
+            "Harness run failed: session=%s kind=%s provider=%s status=%s detail=%s",
+            session_id[:8], failure.kind, failure.provider, failure.status, detail,
         )
         try:
             self.mm.post(
                 anchor.channel_id,
-                format_backend_error(
-                    "run your message",
-                    self._backend_for_channel(anchor.channel_id),
-                    detail,
+                format_provider_failure(
+                    action="run your message",
+                    backend=await self._backend_for_error(
+                        session_id, anchor.channel_id,
+                    ),
+                    failure=failure,
+                    path=run_failure_path(data),
                 ),
                 root_id=anchor.root_id,
             )
