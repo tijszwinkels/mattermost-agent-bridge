@@ -1719,7 +1719,11 @@ class Bridge:
             return cached.backend
 
         try:
-            ch = self.mm.get_channel(channel_id)
+            # to_thread: the MM driver is blocking HTTP, and this runs on the
+            # SSE event loop. A slow Mattermost must not stall every other
+            # session's events just because one channel needs its Purpose
+            # re-read (matches the other `self.mm.*` calls on async paths).
+            ch = await asyncio.to_thread(self.mm.get_channel, channel_id)
         except Exception:
             logger.debug(
                 "backend-for-error: channel lookup failed for %s",
