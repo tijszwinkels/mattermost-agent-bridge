@@ -41,6 +41,13 @@ from .agent_harness_client import (
     HarnessRunNotFound,
 )
 from .config import Anchor, ChannelMapping, Config
+from .session_state import (
+    DEFAULT_KIND,
+    KINDS,
+    FleetRow,
+    SessionState,
+    render_fleet,
+)
 from .mm_client import MattermostClient
 from .typing_indicator import TypingIndicator
 
@@ -472,6 +479,15 @@ class Bridge:
         # watchdog (reconcile instead of stop) and the quiet-flip handler
         # (ignore freshness idle-flips mid-run).
         self.active_run_by_session: dict[str, str | None] = {}
+        # Awaiting-nag bookkeeping: session_id → the set of threshold levels
+        # ({1, 2}) already rung for the CURRENT awaiting episode. Deliberately
+        # IN MEMORY only (R4): an episode is identified by its state's
+        # `set_at`, and any state change or `run.started` drops the entry, so
+        # it is bounded by the mapping. A restart therefore re-rings an
+        # already-overdue episode at most once — accepted, and strictly better
+        # than persisting bookkeeping that can go stale against a state which
+        # changed while the daemon was down.
+        self._nagged_levels: dict[str, set[int]] = {}
         # Watchdog notice events (idle/runtime warnings + kills) already posted
         # for the session's CURRENT run, so a harness re-emit doesn't double
         # post. Keyed by session_id → set of event types; at most one run is
@@ -3569,6 +3585,125 @@ class Bridge:
         ]
         self._post_cmd_reply(channel_id, "\n".join(lines), thread_root)
 
+    # ─────────────────── Turn-end session state (F2) ─────────────────────
+
+    def set_session_state(
+        self,
+        session_id: str,
+        kind: str,
+        *,
+        on: str | None = None,
+        note: str | None = None,
+        source: str = "agent",
+    ) -> SessionState | None:
+        """Record `session_id`'s state and return the PREVIOUS one.
+
+        The single entry point for every writer, present and future: the
+        `<state/>` directive (`source="agent"`) and round F3's provider-error
+        classification, which needs exactly one call —
+        ``set_session_state(sid, "blocked", note="anthropic 529",
+        source="bridge")``.
+
+        Setting a state always starts a new awaiting *episode*: the nag
+        bookkeeping is dropped, so a session that re-declares `awaiting` is
+        rung again from zero rather than inheriting the old episode's
+        already-fired levels.
+
+        An unknown `kind` is refused (state unchanged) rather than stored:
+        every reader — the fleet renderer, the nag sweep, the CLI — assumes
+        `kind in KINDS`, and a typo must not be able to break them.
+        """
+        prev = self.mapping.get_state(session_id)
+        if kind not in KINDS:
+            logger.warning(
+                "Refusing unknown session state %r for %s (valid: %s)",
+                kind, session_id[:8], ", ".join(KINDS),
+            )
+            return prev
+        self.mapping.set_state(session_id, SessionState(
+            kind=kind,
+            on=(on or None),
+            note=(note or None),
+            set_at=time.time(),
+            source=source,
+        ))
+        self._nagged_levels.pop(session_id, None)
+        return prev
+
+    def _apply_state_directive(
+        self,
+        session_id: str,
+        channel_id: str,
+        thread_root: str | None,
+        dirs: list[directives.Directive],
+    ) -> None:
+        """Turn a reply's `<state/>` tag (or its absence) into a state.
+
+        Two rules, both load-bearing:
+
+        * **No tag means `idle`.** That is the zero-migration property — an
+          agent that never learns the tag ends every turn idle, which is
+          exactly today's unmodelled behaviour.
+        * **The LAST tag wins.** Quoting an earlier state mid-reply is
+          legitimate prose, so only the final declaration counts.
+
+        Applied per assistant text block. A multi-block reply therefore ends
+        in its last block's state — identical to turn-end semantics with no
+        per-run buffer to keep. Mid-run flapping is invisible: the fleet
+        renders `working` while a run is live, and the nag sweep skips
+        sessions that are running.
+        """
+        states = [d for d in dirs if d.kind == "state"]
+        if not states:
+            self.set_session_state(session_id, DEFAULT_KIND)
+            return
+
+        attrs = states[-1].attrs
+        kind = (attrs.get("kind") or "").strip().lower()
+        if kind not in KINDS:
+            # Stripped from the visible post either way (the parser already
+            # did that), but the state stays put and the agent is told the
+            # vocabulary — silence here would train it to keep guessing.
+            logger.warning(
+                "Unknown <state kind=%r/> from %s — state unchanged",
+                kind, session_id[:8],
+            )
+            self._post_cmd_reply(
+                channel_id,
+                f":warning: Unknown state kind `{kind}` — valid kinds: "
+                + ", ".join(f"`{k}`" for k in KINDS)
+                + ". State unchanged.",
+                thread_root,
+            )
+            return
+
+        self.set_session_state(
+            session_id, kind,
+            on=(attrs.get("on") or "").strip() or None,
+            note=(attrs.get("note") or "").strip() or None,
+        )
+
+    def _restamp_state_for_run(self, session_id: str) -> None:
+        """A run started: restart the wait, keep the claim.
+
+        `run.started` never overwrites the declared kind — `working` is
+        display-only. It does re-stamp `set_at`, because a run means the
+        awaited party *did* engage this session; without the re-stamp a run
+        that dies with no text block (interrupt, provider error) would leave
+        the original `set_at` in place and re-ring level 1 immediately, on a
+        wait that just had activity in it. It also makes the fleet's age
+        column mean literally what it says: time since the state was set or
+        the last run started.
+        """
+        prev = self.mapping.get_state(session_id)
+        now = time.time()
+        self.mapping.set_state(
+            session_id,
+            replace(prev, set_at=now) if prev is not None
+            else SessionState(DEFAULT_KIND, set_at=now),
+        )
+        self._nagged_levels.pop(session_id, None)
+
     def _session_has_active_run(self, session_id: str) -> bool:
         """True if a run is in flight for ``session_id`` (bridge-tracked)."""
         return (
@@ -5081,6 +5216,11 @@ class Bridge:
                 await self._leave_channel(channel_id, session_id, _truncate_for_mm(body))
             return
 
+        # Turn-end state. Applied BEFORE the empty-body return below: a reply
+        # that is nothing but a `<state/>` tag posts nothing and must still
+        # declare its state.
+        self._apply_state_directive(session_id, channel_id, thread_root, dirs)
+
         # <openFile/> directives → attachments
         file_ids: list[str] = []
         warnings: list[str] = []
@@ -5277,6 +5417,7 @@ class Bridge:
             # the operator would be told "quota" about a run that died of
             # something else entirely.
             self._stderr_tails.clear(session_id)
+            self._restamp_state_for_run(session_id)
             await self._start_typing_for_activity(session_id)
             return
 
