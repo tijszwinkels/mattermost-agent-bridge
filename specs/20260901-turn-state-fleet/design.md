@@ -125,7 +125,7 @@ directly. Rejected.
 Recommended. The post is authored for the human's eyes; the turn is submitted
 explicitly through the same tail F1 factored out.
 
-### 3.3 The recommended shape
+### 3.3 The shape (confirmed by the lead)
 
 ```python
 async def _deliver_nag(self, target: Anchor, session_id: str, body: str) -> None:
@@ -163,6 +163,20 @@ Everything this inherits is deliberate:
 
 Visibility to the human is guaranteed by the MM post, which happens first and
 unconditionally.
+
+**Self-identifying body (lead ruling).** The nag body starts `⏰ bridge nag:`.
+When F1 holds it and flushes it later, `HeldPost.render()` prefixes
+`HH:MM <bot-username>: `, and without the marker the woken agent would read a
+bridge doorbell as a peer agent's post.
+
+**Placement by `on` (lead ruling on Q2).** `on="lead"` (or unset) →
+parent channel, delivered as a turn. `on="<known MM username>"` → level 1 goes
+to the **awaiting session's own channel** with the @-mention and **no delivery
+call at all**: `is_own_post` guarantees the post cannot wake the child, and
+the summoned human is where the context is; level 2 escalates to the parent
+channel, mentioning the same user and delivering as a turn so the lead learns
+its builder is stuck on a human. An unknown username is treated as `lead`, and
+the nag says so.
 
 ### 3.4 Ghost-turn safety
 
@@ -223,23 +237,51 @@ equality).
 Called via `asyncio.to_thread` — the MM client is synchronous, and `.fleet`
 must not block the event loop (R8).
 
-### 5.2 Row assembly — zero harness GETs [decision]
+### 5.2 Row assembly — ONE bounded parallel probe pass (lead condition C1)
 
 | Field | Source | Staleness |
 | --- | --- | --- |
 | session | `mapping.get_session(Anchor(cid))` | live |
 | state | `mapping.get_state(sid)` | live |
-| run | `_session_has_active_run(sid)` | ≤ one watchdog tick (3s) |
+| run | harness probe, tracker as fallback | live, or `?` |
 | held | `self._held.peek(anchor)` | live |
 | err | `-` (F3 seam) | — |
 
-R8 permits "at most one batched probe pass with a bounded timeout". F2 uses
-**zero**: `active_run_by_session` is already reconciled against the harness by
-`_typing_watchdog_tick` every `typing_refresh_seconds`, so the tracker is at
-most one tick stale — cheaper *and* fresher than an N-way probe fan-out on a
-command that a lead may run every few minutes. The probe pass stays available
-as a follow-up if a stale row is ever observed in practice; the seam is a
-single function (`_fleet_rows`).
+M0 proposed zero GETs, arguing the tracker is reconciled every watchdog tick.
+The lead rejected that on the evidence: `_typing_watchdog_tick` early-returns
+when `self.typing` is unset (bridge.py:892) and otherwise iterates only
+`self.typing.running_sessions()` (:896). A session whose `run.started` event
+was lost never enters `active_run_by_session`, so it never enters that list
+either — F1's own C1 finding — and with the typing indicator off *nothing*
+reconciles. The tracker can therefore be stale in both directions, and a fleet
+that shows a working builder as `idle` is precisely the lie this feature
+exists to remove.
+
+Shape (`_fleet_rows`, the seam M0 already planned):
+
+```python
+FLEET_PROBE_TIMEOUT_S = 2.0
+
+async def _probe_run_live(self, sid: str) -> bool | None:
+    """True/False from the harness; None = unknown (caller falls back)."""
+    try:
+        return await asyncio.wait_for(
+            self._active_run_is_alive(sid), FLEET_PROBE_TIMEOUT_S)
+    except (asyncio.TimeoutError, Exception):
+        return None
+
+probed = await asyncio.gather(*(self._probe_run_live(s) for s in sids),
+                              return_exceptions=True)
+```
+
+Parallel, so the *total* bound is one timeout (≈2 s), not N of them. A row
+whose probe returns `None` (timeout, error, harness down) falls back to
+`_session_has_active_run(sid)` and is rendered with a trailing `?`, so an
+uncertain row is visibly uncertain rather than quietly wrong.
+
+The **nag sweep does not probe**: it runs every 3 s against every awaiting
+session, and a nag mistakenly sent to a session with a lost `run.started` is
+harmless — it is one post, bounded by every rule in §3.4.
 
 ### 5.3 Rendering
 
@@ -259,7 +301,9 @@ identical output and the test asserts once.
 `mm-bridge fleet [--channel <ref>] [--all] [--json]`, next to `inbox` in
 `cli.py`. Loads `ChannelMapping.load(path, reconcile_sidecars=False)` —
 **never** reconciling, because the CLI must not mutate the daemon's sidecars —
-plus the holds file, plus one `list_bot_channels()` for titles. Same staleness
+plus the holds file, plus one `list_bot_channels()` for titles. It probes the
+harness per row too (best-effort, bounded, local HTTP) and renders `?` on
+failure — unlike the daemon it has no tracker to fall back to. Same staleness
 contract as `inbox`, stated in the docstring.
 
 ## 6. Sweep (R7)

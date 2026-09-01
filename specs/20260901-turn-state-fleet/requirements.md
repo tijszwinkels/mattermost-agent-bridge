@@ -64,9 +64,13 @@ rule: today's agents emit no tag, so every turn ends idle, which is exactly
 today's (unmodelled) behaviour made explicit.
 
 3.4 `working` is **display-only** [decision]. `run.started` never overwrites
-the declared kind; the fleet renders `working` while
-`_session_has_active_run(session_id)` is true and re-shows the declared kind
-when the run ends.
+the declared kind; the fleet renders `working` while the session's run is live
+and re-shows the declared kind when the run ends.
+
+3.4.1 A run that dies **without emitting a text block** (interrupt, provider
+error) therefore leaves the previous state in place, with the `set_at`
+re-stamp from §5.6 — the session reverts to what it last declared, aged from
+the run rather than from before it.
 
 3.5 Every state carries `set_at` (epoch seconds, wall clock — it must survive
 a restart) and `source`.
@@ -91,7 +95,9 @@ v5's `_ingest`.
 4.3 `ChannelMapping.save()` becomes **atomic** (temp file + `os.replace`),
 because F2 adds a concurrent out-of-process reader (`mm-bridge fleet`).
 Without it the CLI could read a half-written file. Mirrors
-`HeldPostStore._save`.
+`HeldPostStore._save`. **Lead condition:** because this is shared-path
+code, it carries its own red tests — the write lands via `os.replace`, and a
+failed write leaves no temp file behind — alongside the v5→v6 load test.
 
 4.4 **Restart story.** Declared states survive. Nag bookkeeping (which
 thresholds already fired for which episode) is **in-memory only**: after a
@@ -113,8 +119,11 @@ session's channel header as `Parent: ~<slug>~` (the header
 3. no parent → the session's **own** channel, with the mention (R5).
 
 5.3 **Body.**
-`⏰ ~<child-slug>~ has been awaiting you for 30 min ("M0 gate")` — the note
-clause is omitted when there is no note.
+`⏰ bridge nag: ~<child-slug>~ has been awaiting you for 30 min ("M0 gate")`
+— the note clause is omitted when there is no note. The `bridge nag:` prefix
+is **required** (lead ruling): when F1 holds the nag and flushes it later it
+renders as `HH:MM <bot-username>: …`, and it must not read as an agent's own
+post.
 
 5.4 **Delivery (R5).** The nag is posted to Mattermost **and** delivered as a
 turn through the normal forwarding tail. Mechanism: create the MM post, then
@@ -123,15 +132,24 @@ route it through the same busy/idle decision a user post takes —
 coalescing folds it into the next flush), else `_deliver_to_session()`. The
 self-post suppression is **not weakened**; see `design.md` §3.
 
-5.5 **Escalation.** At `2 ×` the threshold, ONE further post: the same body
-prefixed with an @-mention. Mentioned party:
-* `on="<username>"` → that user (also at level 1 — a human is only woken by a
-  mention) [decision];
-* otherwise `operator_username` from config;
-* otherwise the most recent non-bot poster in the *awaiting* session's
-  channel.
-* If none can be determined, the escalation posts without a mention and logs
-  a warning — a visible nag beats a silent one.
+5.5 **Escalation and placement.** At `2 ×` the threshold, ONE further post.
+Placement depends on **who** is waited on (lead ruling on Q2):
+
+| `on` | Level 1 | Level 2 |
+| --- | --- | --- |
+| `lead` / unset | parent channel, no mention, **delivered as a turn** | parent channel, @operator mention, delivered as a turn |
+| a known MM username | the **awaiting session's own channel**, @that-user, **no delivery call** | parent channel, @that-user, delivered as a turn |
+| an unknown username | treated as `lead`, and the nag says so | same as `lead` |
+
+Rationale for the level-1 own-channel placement: the own-post drop
+(`is_own_post`) guarantees such a post cannot wake the child session, and the
+human being summoned is where the context is. Level 2 escalates to the parent
+so the lead learns its builder is stuck on a human.
+
+Mention resolution for the `lead` rows: `operator_username` from config;
+otherwise the most recent non-bot poster in the *awaiting* session's channel;
+otherwise the escalation posts without a mention and logs a warning — a
+visible nag beats a silent one.
 
 5.6 **Single-shot per threshold per episode.** An awaiting *episode* is
 identified by `(session_id, set_at)`. Each of levels 1 and 2 fires at most
@@ -180,17 +198,29 @@ and `mm-bridge fleet --all` render every mapped session.
 | held | `len(HeldPostStore.peek(anchor))` — read-only |
 | err | `-` until F3 (column and seam present) |
 
-6.3 **No probe loop (R8).** Row data comes from tracked state
-(`active_run_by_session`, `current_run_id_by_session`), the mapping, and the
-holds file. Channel titles/headers come from **one** `list_bot_channels()`
-call, off the event loop via `asyncio.to_thread`. **[decision]:** F2 issues
-**zero** harness GETs for `.fleet`; the run tracker is already reconciled
-every `typing_refresh_seconds` by the watchdog, so a row can be at most one
-tick stale. Argued in `design.md` §5.
+6.3 **One bounded parallel probe pass (R8, lead condition C1).** The run
+tracker alone is **not** trustworthy for display: `_typing_watchdog_tick`
+early-returns when `self.typing` is unset (bridge.py:892) and otherwise sweeps
+only `self.typing.running_sessions()` (:896), so a session whose `run.started`
+was lost — or any session at all with the typing indicator off — is never
+reconciled. A fleet that renders a working builder as `idle` is the exact lie
+this feature exists to remove.
+
+So `.fleet` issues ONE parallel probe pass (`asyncio.gather`) over the rows it
+will display, each probe individually bounded so the total is ≈2 s, off the
+hot path. A row whose probe times out or errors **falls back to the tracker**
+and is marked `?`. The nag sweep stays tracker-based: it runs every 3 s, and a
+rare nag on a lost-`run.started` session is harmless.
+
+Channel titles/headers come from **one** `list_bot_channels()` call, off the
+event loop via `asyncio.to_thread`.
 
 6.4 A channel with a `Parent:` header but no mapped session renders with state
 `-` (dormant) rather than being hidden: "the channel exists and nothing is
 running there" is exactly the fact a lead needs.
+
+6.4.1 The CLI probes the harness per row, best-effort and bounded (local
+HTTP), falling back to `?` — it has no tracker to fall back to.
 
 6.5 `mm-bridge fleet` reads the same persisted state and prints the same
 columns. Its **staleness contract** is documented in the docstring, like
@@ -243,7 +273,8 @@ implementation. Every gate wait is bounded (F1's `_await_gate` pattern).
 | T8 | `.fleet` shows `working` for a live run and re-shows the declared kind after it ends |
 | T9 | `.fleet` held column reads the F1 buffer |
 | T10 | `.fleet` includes thread-fork rows; `all` widens to every session |
-| T11 | `.fleet` issues zero harness GETs |
+| T11 | `.fleet` probe wins over a stale tracker: tracker idle + harness running → row shows `working` |
+| T11b | probe timeout/error → row falls back to the tracker and is marked `?` |
 | T12 | nag fires at the threshold, **not** one second before |
 | T13 | nag posts to the parent channel and is delivered as a turn |
 | T14 | nag into a BUSY parent is held (F1), not submitted |
@@ -256,6 +287,11 @@ implementation. Every gate wait is bounded (F1's `_await_gate` pattern).
 | T21 | restart: states survive; one re-nag for an already-overdue episode |
 | T22 | no parent header → nag lands in the session's own channel, with mention |
 | T23 | `mm-bridge fleet` renders from disk; corrupt/missing files → empty, rc 0 |
+| T24 | `ChannelMapping.save()` writes atomically (via `os.replace`) |
+| T25 | a failed atomic write leaves no temp file behind |
+| T26 | nag body carries the `bridge nag:` self-identifying prefix |
+| T27 | `on="<user>"` level 1 → own channel, mention, NO delivery call |
+| T28 | unknown `on` username → treated as `lead`, and the nag says so |
 
 9.2 Full suite green at FINAL. Base at `24281c5`: **1135 passed, 1 skipped,
 52 subtests passed**.
