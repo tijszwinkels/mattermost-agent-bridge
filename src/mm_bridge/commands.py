@@ -117,6 +117,11 @@ _SPECS: tuple[CommandSpec, ...] = (
         global_scope=True,
     ),
     CommandSpec(
+        "queue", ".queue [clear]",
+        "Show posts held while the agent was working (`clear` drops them).",
+        session_scoped=True,
+    ),
+    CommandSpec(
         "invite", ".invite <session-id>",
         "Get invited to a session's Mattermost channel (creating it if needed).",
         global_scope=True,

@@ -882,7 +882,13 @@ class DormantChannelTests(_BridgeTestCase):
         self.assertEqual(len(self.bridge.harness.created), 1)
         self.assertEqual(len(self.bridge.harness.sent), 2)
         self.assertTrue(self.bridge.harness.sent[0][1].endswith("first"))
-        self.assertEqual(self.bridge.harness.sent[1][1], "second")
+        # "second" was queued by the warming-up path, replayed after the
+        # mapping existed, and then held-and-coalesced behind the initial
+        # run — so it arrives stamped, exactly once, after "first".
+        self.assertTrue(
+            self.bridge.harness.sent[1][1].endswith("second"),
+            self.bridge.harness.sent[1][1],
+        )
 
     async def test_external_purpose_edit_refreshes_dormant_config(self):
         await self._join_dormant(auto_join=False)
@@ -1721,7 +1727,11 @@ class ForwardingTests(_BridgeTestCase):
         })
 
         self.assertEqual(self.bridge.vd.sent[0], ("s1", "first"))
-        self.assertTrue(self.bridge.vd.sent[1][1].startswith("u-u2: second"))
+        # The second post arrives while the first run is still tracked, so
+        # hold-and-coalesce buffers it and flushes it as a stamped held post
+        # (the harness reports no live run, so the flush is immediate).
+        # Attribution still applies — that's what this test is about.
+        self.assertIn("u-u2: second", self.bridge.vd.sent[1][1])
 
     async def test_mention_only_drops_are_replayed_on_next_mention(self):
         """Non-mentions are held in an in-memory queue and prepended to
@@ -4329,8 +4339,14 @@ class FirstMessageNoConfigTests(_BridgeTestCase):
         self.assertEqual(len(self.bridge.vd.sent), 2)
         session_id = self.bridge.mapping.get_session(Anchor("c1"))
         self.assertEqual(self.bridge.vd.sent[0][0], session_id)
-        # The second message is forwarded verbatim (no preamble on it).
-        self.assertEqual(self.bridge.vd.sent[1][1], "codex, gpt-5.5")
+        # The second message is forwarded verbatim — no preamble, and above
+        # all not parsed as config. It carries a held-post stamp because the
+        # first run was still tracked when it arrived (hold-and-coalesce);
+        # the point of this test is that the CONTENT is untouched.
+        self.assertTrue(
+            self.bridge.vd.sent[1][1].endswith("codex, gpt-5.5"),
+            self.bridge.vd.sent[1][1],
+        )
 
 
 class MergeConfigsTests(_BridgeTestCase):

@@ -98,14 +98,24 @@ class HeldPost:
                          self.held_at_ms, self.post_id)
             return UNKNOWN_TIMESTAMP
 
-    def render(self) -> str:
+    def render(self, notes: list[str] | None = None) -> str:
         """``HH:MM username: body`` — the line a flush contributes per post.
 
         Attribution is unconditional here, unlike the live forward path's
         ``PosterTracker`` logic: a held post's whole point is that it is
         *late*, and a bare body would hide both who said it and when.
+
+        ``notes`` carries the ``[User attached file: …]`` lines produced when
+        the flush downloads this post's attachments. Returns ``""`` when
+        there is nothing to say at all (a post that was only a bot mention),
+        so callers can skip it rather than emit a stamped empty line.
         """
-        return f"{self.timestamp()} {self.username}: {self.message}"
+        parts = [*(notes or [])]
+        if self.message:
+            parts.append(self.message)
+        if not parts:
+            return ""
+        return f"{self.timestamp()} {self.username}: " + "\n".join(parts)
 
     def to_json(self) -> dict:
         return {

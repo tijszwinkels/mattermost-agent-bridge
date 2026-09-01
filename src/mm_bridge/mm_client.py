@@ -353,6 +353,30 @@ class MattermostClient:
             "user_id": user_id,
         })
 
+    def add_reaction(self, post_id: str, emoji_name: str) -> None:
+        """React to `post_id` as the bot.
+
+        Used to mark a post as held (hourglass) and then delivered (check
+        mark). Callers treat reactions as cosmetic and must not let a failure
+        here affect message delivery — see `Bridge._react_best_effort`.
+        """
+        self._driver.reactions.save_reaction(options={
+            "user_id": self.bot_user_id,
+            "post_id": post_id,
+            "emoji_name": emoji_name,
+        })
+
+    def remove_reaction(self, post_id: str, emoji_name: str) -> None:
+        """Remove the bot's `emoji_name` reaction from `post_id`.
+
+        Mattermost has no atomic swap, so a hold→delivered transition is
+        remove-then-add; a crash in between leaves the post with neither
+        reaction, which is cosmetic only.
+        """
+        self._driver.reactions.delete_reaction(
+            self.bot_user_id, post_id, emoji_name,
+        )
+
     def publish_user_typing(
         self, channel_id: str, parent_id: str | None = None
     ) -> None:

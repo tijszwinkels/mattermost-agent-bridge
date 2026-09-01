@@ -186,12 +186,22 @@ class Config:
         cfg.sidecar_dir = _expand(cfg.sidecar_dir)
         # Derived AFTER state_file is expanded so the holds file lands beside
         # whichever state file the operator actually configured.
-        cfg.held_posts_file = (
-            _expand(cfg.held_posts_file) if cfg.held_posts_file
-            else str(Path(cfg.state_file).parent / "held_posts.json")
-        )
+        cfg.held_posts_file = cfg.resolved_held_posts_file()
         cfg.allowed_attachment_roots = [_expand(p) for p in cfg.allowed_attachment_roots]
         return cfg
+
+    def resolved_held_posts_file(self) -> str:
+        """Absolute path for the held-posts file.
+
+        Falls back to a sibling of ``state_file`` when unset, so a relocated
+        state file carries its holds file with it. ``load()`` bakes the
+        result back into the field, but callers that construct a ``Config``
+        directly (tests, embedders) never run ``load()`` — so the Bridge asks
+        for the resolved value rather than trusting the raw field.
+        """
+        if self.held_posts_file:
+            return _expand(self.held_posts_file)
+        return str(Path(_expand(self.state_file)).parent / "held_posts.json")
 
     def default_model_for(self, backend: str | None) -> str | None:
         """Return the configured default model for ``backend``, or ``None``.
