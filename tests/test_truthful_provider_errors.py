@@ -370,5 +370,81 @@ class DeliveryFailureTests(_BridgeTestCase):
         self.assertIn("NOT processed", msg)
 
 
+# ───────────────────────── 5. The F2 state seam ────────────────────────────
+
+
+class StateSeamTests(_BridgeTestCase):
+    """F2 (`feat/turn-state-fleet`) owns `set_session_state`. This branch must
+    stand alone on `main`, where that API does not exist yet."""
+
+    async def test_seam_is_a_no_op_when_f2s_api_is_absent(self):
+        self.assertFalse(hasattr(self.bridge, "set_session_state"))
+        self.bridge.mapping.link(Anchor("c1"), "s1")
+        self.bridge.purpose_by_channel["c1"] = PurposeConfig(
+            backend="pi", model=None, mention_only=False,
+        )
+
+        await self.bridge._on_harness_event(
+            "run.failed",
+            {"event": "run.failed", "data": {"returncode": 1},
+             "session_id": "s1", "run_id": "run-1"},
+        )
+
+        self.assertTrue(_warnings(self.bridge), "the warning must still post")
+
+    async def test_seam_calls_f2s_api_when_present(self):
+        calls: list[tuple] = []
+
+        def set_session_state(session_id, kind, *, on, note, source):
+            calls.append((session_id, kind, on, note, source))
+
+        self.bridge.set_session_state = set_session_state  # type: ignore[attr-defined]
+        self.bridge.mapping.link(Anchor("c1"), "s1")
+        self.bridge.mm.channels["c1"] = {"id": "c1", "purpose": ""}
+        self.bridge.harness.sessions_meta = [
+            {"id": "s1", "backend": "pi", "project": {"path": "/tmp/proj"}},
+        ]
+
+        await self.bridge._on_harness_event(
+            "run.started",
+            {"event": "run.started", "data": {}, "session_id": "s1", "run_id": "r1"},
+        )
+        await self.bridge._on_harness_event(
+            "process.stderr",
+            {"event": "process.stderr", "data": {"text": INCIDENT_OPENROUTER_403},
+             "session_id": "s1", "run_id": "r1"},
+        )
+        await self.bridge._on_harness_event(
+            "run.failed",
+            {"event": "run.failed", "data": {"returncode": 1},
+             "session_id": "s1", "run_id": "r1"},
+        )
+
+        self.assertEqual(len(calls), 1)
+        session_id, kind, on, note, source = calls[0]
+        self.assertEqual(session_id, "s1")
+        self.assertEqual(kind, "blocked")
+        self.assertTrue(on)
+        self.assertIn("quota", note)
+
+    async def test_a_raising_f2_api_never_swallows_the_warning(self):
+        def boom(*_a, **_kw):
+            raise RuntimeError("F2 is having a day")
+
+        self.bridge.set_session_state = boom  # type: ignore[attr-defined]
+        self.bridge.mapping.link(Anchor("c1"), "s1")
+        self.bridge.purpose_by_channel["c1"] = PurposeConfig(
+            backend="pi", model=None, mention_only=False,
+        )
+
+        await self.bridge._on_harness_event(
+            "run.failed",
+            {"event": "run.failed", "data": {"returncode": 1},
+             "session_id": "s1", "run_id": "run-1"},
+        )
+
+        self.assertTrue(_warnings(self.bridge))
+
+
 if __name__ == "__main__":
     unittest.main()

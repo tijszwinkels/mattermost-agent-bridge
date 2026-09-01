@@ -21,6 +21,7 @@ from . import (
 )
 from .backend_errors import (
     PATH_NOT_ACCEPTED,
+    ProviderFailure,
     classify_failure,
     exception_detail,
     format_backend_error,
@@ -4648,6 +4649,7 @@ class Bridge:
             "Harness run failed: session=%s kind=%s provider=%s status=%s detail=%s",
             session_id[:8], failure.kind, failure.provider, failure.status, detail,
         )
+        self._note_run_failure(session_id, failure)
         try:
             self.mm.post(
                 anchor.channel_id,
@@ -4664,6 +4666,39 @@ class Bridge:
         except Exception:
             logger.warning(
                 "Failed to post run-failure notice for session %s",
+                session_id[:8], exc_info=True,
+            )
+
+    def _note_run_failure(self, session_id: str, failure: ProviderFailure) -> None:
+        """Publish a classified failure to round F2's per-session state API.
+
+        WHY guarded rather than imported: F2 (`feat/turn-state-fleet`) owns
+        `set_session_state`, and this branch has to stand alone on `main`,
+        where that API does not exist yet. When F2 lands the guard simply
+        falls through and `.fleet` can show `blocked (quota)` — no further
+        change here. This is the ONLY call site by design.
+
+        Never allowed to break the warning: the channel message is the whole
+        point of this round, and a state-tracking side effect must not be able
+        to swallow it.
+        """
+        setter = getattr(self, "set_session_state", None)
+        if setter is None:
+            return
+        note = failure.kind
+        if failure.provider:
+            note = f"{note} ({failure.provider})"
+        try:
+            setter(
+                session_id,
+                "blocked",
+                on=True,
+                note=note,
+                source="provider-failure",
+            )
+        except Exception:
+            logger.warning(
+                "Failed to record failure state for session %s",
                 session_id[:8], exc_info=True,
             )
 
