@@ -323,6 +323,17 @@ catch-up block on the next successful forward) and the existing "can't resume
 this external session" warning is posted once. That is exactly what the
 single-post path does today (bridge.py:2022), applied to N posts.
 
+**The carve-out trades durability for termination, knowingly.** `_silent_drops`
+is an in-memory deque, so between the carve-out firing and the next successful
+forward a daemon restart loses those posts — they are no longer in
+`held_posts.json`. Accepted because it matches today's contract for this exact
+failure (the single-post path has always used the non-persistent queue here),
+and because the alternatives are worse: keep-held either nags every sweep
+interval forever, or needs a new frozen-hold lifecycle for a rare terminal
+condition. Requirements §3.10 records the full reasoning. If it ever needs
+closing, persist `_silent_drops` — which would improve the mention-only drop
+path too, and is a strictly larger change than F1.
+
 ### 2.9 `.queue`
 
 `commands.py` gains one spec, appended to `_SPECS` (insertion order drives

@@ -2391,6 +2391,12 @@ class Bridge:
             # Hand them to the silent-drop queue, where the next successful
             # forward replays them verbatim as catch-up — exactly what the
             # single-post path does today, applied to the whole batch.
+            #
+            # KNOWN DURABILITY DOWNGRADE: `_silent_drops` is in-memory, so a
+            # restart between here and that next forward loses them. Accepted
+            # because it matches today's contract for this exact failure, and
+            # because keep-held would either nag every sweep interval forever
+            # or need a new frozen-hold lifecycle. See spec requirements §3.10.
             self._held.discard(anchor, delivered_ids)
             if self.config.initial_catch_up_n > 0:
                 logger.warning(

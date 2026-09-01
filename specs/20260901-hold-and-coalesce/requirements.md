@@ -117,6 +117,28 @@ the single-post path does today (bridge.py:2022), applied to N posts.
 **[decision]** — a deliberate carve-out from §3.8's "posts remain held",
 honoring its intent (no strand, no loss) rather than its letter.
 
+3.10 **The carve-out's durability downgrade** (lead condition **C3**). At the
+moment §3.9 fires, the posts leave `held_posts.json` for the in-memory
+`_silent_drops` deque. **A daemon restart in that window loses them.** This is
+a real, accepted downgrade, recorded here as a judgment rather than left
+implicit:
+
+* It matches today's contract *for this exact failure*. The single-post path
+  already calls `_enqueue_silent_drop` on `HarnessResumeUnsupported`
+  (bridge.py:2014), and that queue has never been persistent. F1 is not making
+  this case worse than it was — it is declining to make it better.
+* The alternative costs more than it buys. Keeping them held would either
+  re-post the "can't resume" warning every sweep interval forever (a nag storm
+  of our own making) or require a new frozen-hold state — a whole extra
+  lifecycle for a rare terminal condition.
+* The window is narrow and self-closing. Silent drops replay on the next
+  successful forward, which for a resume-unsupported session is exactly when
+  the anchor gets a replacement session (`_replace_external_session`).
+
+If this ever needs closing, the cheap version is to persist `_silent_drops`
+alongside the holds file — a strictly larger change than F1, and one that
+would improve the mention-only drop path too.
+
 ## 4. The enqueue/terminal race (R3)
 
 4.1 **The race.** A post is held on the strength of a liveness check; the run
