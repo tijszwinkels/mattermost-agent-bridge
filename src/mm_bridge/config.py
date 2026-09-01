@@ -101,10 +101,28 @@ class Config:
     auto_join_public_channels: bool = False
     auto_join_reconcile_seconds: float = 5.0
 
+    # Hold posts that arrive while the anchor's session already has a run in
+    # flight, and deliver them as ONE annotated run when it finishes. OFF is
+    # exactly the pre-coalescing behavior: every post becomes its own eager
+    # run and the harness FIFO decides the order — including the order of
+    # posts that went stale while they waited.
+    coalesce_posts: bool = True
+    # Per-anchor cap on held posts. On overflow the overflowing post falls
+    # back to an eager `create_run` and the bridge logs loudly; a held post is
+    # never silently dropped. `<= 0` disables holding without touching the
+    # kill switch above.
+    coalesce_max_held: int = 50
+
     # State + config file paths
     state_file: str = str(Path.home() / ".config/mm-bridge/state.json")
     config_file: str = str(_config_file_path())
     sidecar_dir: str = str(Path.home() / ".mm-bridge/sessions")
+    # Where held posts are persisted across daemon restarts. Empty = derived
+    # from `state_file`'s directory in `load()`, so a relocated state file
+    # carries its holds file with it. Deliberately NOT a section of the state
+    # file: that one is rewritten on a 2-second throttle for the SSE cursor,
+    # and the holds buffer has no business riding along on that cadence.
+    held_posts_file: str = ""
 
     # Attachment safety
     allowed_attachment_roots: list[str] = field(default_factory=list)
@@ -166,6 +184,12 @@ class Config:
         cfg.default_cwd = _expand(cfg.default_cwd)
         cfg.state_file = _expand(cfg.state_file)
         cfg.sidecar_dir = _expand(cfg.sidecar_dir)
+        # Derived AFTER state_file is expanded so the holds file lands beside
+        # whichever state file the operator actually configured.
+        cfg.held_posts_file = (
+            _expand(cfg.held_posts_file) if cfg.held_posts_file
+            else str(Path(cfg.state_file).parent / "held_posts.json")
+        )
         cfg.allowed_attachment_roots = [_expand(p) for p in cfg.allowed_attachment_roots]
         return cfg
 
@@ -235,6 +259,9 @@ class Config:
             "pending_session_merge_window_seconds",
             "name_sync_window_seconds",
             "dangerous_permissions",
+            "coalesce_posts",
+            "coalesce_max_held",
+            "held_posts_file",
         ):
             if key in data:
                 setattr(self, key, data[key])
@@ -367,6 +394,23 @@ class Config:
             self.state_file = env["MM_BRIDGE_STATE"]
         if "MM_BRIDGE_SIDECAR_DIR" in env:
             self.sidecar_dir = env["MM_BRIDGE_SIDECAR_DIR"]
+        if "MM_BRIDGE_HELD_POSTS" in env:
+            self.held_posts_file = env["MM_BRIDGE_HELD_POSTS"]
+        if "MM_COALESCE_POSTS" in env:
+            self.coalesce_posts = env["MM_COALESCE_POSTS"].strip().lower() in (
+                "1", "true", "yes", "on",
+            )
+        if "MM_COALESCE_MAX_HELD" in env:
+            # A typo'd cap keeps the built-in default rather than taking the
+            # daemon down on boot — the buffer is a safety feature, so its
+            # misconfiguration must not be fatal.
+            try:
+                self.coalesce_max_held = int(env["MM_COALESCE_MAX_HELD"])
+            except ValueError:
+                logger.warning(
+                    "MM_COALESCE_MAX_HELD=%r is not an integer — keeping %d",
+                    env["MM_COALESCE_MAX_HELD"], self.coalesce_max_held,
+                )
         if "MM_BRIDGE_DANGEROUS_PERMISSIONS" in env:
             self.dangerous_permissions = (
                 env["MM_BRIDGE_DANGEROUS_PERMISSIONS"].strip().lower()

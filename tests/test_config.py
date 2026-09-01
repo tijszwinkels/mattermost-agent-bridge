@@ -364,3 +364,75 @@ class MirrorExternalSessionsTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CoalesceConfigTests(unittest.TestCase):
+    """Hold-and-coalesce knobs: kill switch, cap, holds-file path.
+
+    Spec: specs/20260901-hold-and-coalesce/design.md §6.
+    """
+
+    def _apply_env(self, env: dict[str, str]) -> Config:
+        cfg = Config()
+        with patch.dict("os.environ", env, clear=True):
+            cfg._apply_env()
+        return cfg
+
+    def test_defaults(self) -> None:
+        cfg = Config()
+        self.assertTrue(cfg.coalesce_posts)   # R7 — default ON
+        self.assertEqual(cfg.coalesce_max_held, 50)  # R6
+        self.assertEqual(cfg.held_posts_file, "")    # derived in load()
+
+    def test_toml_top_level_keys(self) -> None:
+        cfg = Config()
+        cfg._apply_toml({
+            "coalesce_posts": False,
+            "coalesce_max_held": 7,
+            "held_posts_file": "/tmp/holds.json",
+        })
+        self.assertFalse(cfg.coalesce_posts)
+        self.assertEqual(cfg.coalesce_max_held, 7)
+        self.assertEqual(cfg.held_posts_file, "/tmp/holds.json")
+
+    def test_env_kill_switch_off(self) -> None:
+        for raw in ("0", "false", "no", "off", ""):
+            with self.subTest(raw=raw):
+                self.assertFalse(
+                    self._apply_env({"MM_COALESCE_POSTS": raw}).coalesce_posts,
+                )
+
+    def test_env_kill_switch_on(self) -> None:
+        for raw in ("1", "true", "yes", "on", "ON"):
+            with self.subTest(raw=raw):
+                self.assertTrue(
+                    self._apply_env({"MM_COALESCE_POSTS": raw}).coalesce_posts,
+                )
+
+    def test_env_cap_and_holds_path(self) -> None:
+        cfg = self._apply_env({
+            "MM_COALESCE_MAX_HELD": "5",
+            "MM_BRIDGE_HELD_POSTS": "/tmp/x/holds.json",
+        })
+        self.assertEqual(cfg.coalesce_max_held, 5)
+        self.assertEqual(cfg.held_posts_file, "/tmp/x/holds.json")
+
+    def test_bad_cap_env_falls_back_to_the_default(self) -> None:
+        # A typo'd cap must not take the daemon down on boot.
+        cfg = self._apply_env({"MM_COALESCE_MAX_HELD": "lots"})
+        self.assertEqual(cfg.coalesce_max_held, 50)
+
+    def test_holds_file_defaults_next_to_the_state_file(self) -> None:
+        with patch.dict("os.environ",
+                        {"MM_BRIDGE_STATE": "/tmp/mmb/state.json"}, clear=True):
+            cfg = Config.load()
+        self.assertEqual(cfg.held_posts_file, "/tmp/mmb/held_posts.json")
+
+    def test_explicit_holds_file_is_expanded_and_kept(self) -> None:
+        with patch.dict("os.environ", {
+            "MM_BRIDGE_STATE": "/tmp/mmb/state.json",
+            "MM_BRIDGE_HELD_POSTS": "~/holds.json",
+        }, clear=True):
+            cfg = Config.load()
+        self.assertTrue(cfg.held_posts_file.endswith("/holds.json"))
+        self.assertNotIn("~", cfg.held_posts_file)
