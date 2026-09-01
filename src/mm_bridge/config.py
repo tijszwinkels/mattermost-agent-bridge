@@ -137,6 +137,16 @@ class Config:
 
     # Typing indicator
     typing_refresh_seconds: float = 3.0
+    # ----- awaiting-nag (F2) -----
+    # The bridge is the only always-awake party, and a post into a channel IS
+    # a turn — so an `awaiting` state that goes stale can be rung. OFF leaves
+    # the state directive and the fleet view fully working; only the doorbell
+    # stops (spec §5.8).
+    nag_enabled: bool = True
+    awaiting_nag_after_seconds: float = 1800.0
+    # Who to @-mention when a wait escalates. Empty = fall back to the most
+    # recent non-bot poster in the awaiting session's channel.
+    operator_username: str = ""
     typing_stop_after_silence_seconds: float = 15.0
 
     # Claim window for matching session_added → pending MM invite
@@ -273,6 +283,9 @@ class Config:
             "coalesce_posts",
             "coalesce_max_held",
             "held_posts_file",
+            "nag_enabled",
+            "awaiting_nag_after_seconds",
+            "operator_username",
         ):
             if key in data:
                 setattr(self, key, data[key])
@@ -422,6 +435,26 @@ class Config:
                     "MM_COALESCE_MAX_HELD=%r is not an integer — keeping %d",
                     env["MM_COALESCE_MAX_HELD"], self.coalesce_max_held,
                 )
+        if "MM_NAG_ENABLED" in env:
+            self.nag_enabled = env["MM_NAG_ENABLED"].strip().lower() in (
+                "1", "true", "yes", "on",
+            )
+        if "MM_AWAITING_NAG_AFTER_SECONDS" in env:
+            # A typo'd threshold keeps the built-in default rather than taking
+            # the daemon down on boot — same discipline as MM_COALESCE_MAX_HELD.
+            try:
+                self.awaiting_nag_after_seconds = float(
+                    env["MM_AWAITING_NAG_AFTER_SECONDS"]
+                )
+            except ValueError:
+                logger.warning(
+                    "MM_AWAITING_NAG_AFTER_SECONDS=%r is not a number — "
+                    "keeping %s", env["MM_AWAITING_NAG_AFTER_SECONDS"],
+                    self.awaiting_nag_after_seconds,
+                )
+        if "MM_OPERATOR_USERNAME" in env:
+            self.operator_username = env["MM_OPERATOR_USERNAME"].strip().lstrip("@")
+
         if "MM_BRIDGE_DANGEROUS_PERMISSIONS" in env:
             self.dangerous_permissions = (
                 env["MM_BRIDGE_DANGEROUS_PERMISSIONS"].strip().lower()

@@ -44,6 +44,7 @@ from .agent_harness_client import (
 from .config import Anchor, ChannelMapping, Config
 from .session_state import (
     DEFAULT_KIND,
+    humanise_age,
     KINDS,
     FleetRow,
     SessionState,
@@ -99,6 +100,16 @@ HARNESS_ACTIVITY_EVENTS = {
     "permission.denied",
 }
 HARNESS_RUN_TERMINAL_EVENTS = {"run.completed", "run.failed", "run.interrupted"}
+
+# Self-identifying prefix on every awaiting-nag. Required, not decorative:
+# a nag held by F1 is flushed later as `HH:MM <bot-username>: <body>`, and
+# without the marker the woken agent would read a bridge doorbell as a peer
+# agent's post.
+NAG_PREFIX = "⏰ bridge nag:"
+
+# `Parent: ~slug~` — the header `spawn.format_parent_header` writes. Matched
+# as a prefix because a spawn from a thread appends `([thread](permalink))`.
+_PARENT_HEADER_RE = re.compile(r"Parent:\s*~([\w\-]+)~")
 
 # Run statuses (agent-harness ``RunStatus``) that mean the run is still in
 # flight. The Run row is the authoritative "is the coding agent running?"
@@ -970,6 +981,14 @@ class Bridge:
                 await self._sweep_held_anchors()
             except Exception:
                 logger.exception("Held-anchor sweep iteration failed")
+            # Third phase, same task (R7): ring anyone who has been awaited
+            # too long. No new timer — the tick that already exists is the
+            # only always-awake thing in the system, and the sweep costs
+            # nothing when nobody is awaiting.
+            try:
+                await self._sweep_awaiting_nags()
+            except Exception:
+                logger.exception("Awaiting-nag sweep iteration failed")
 
     async def _typing_watchdog_tick(self) -> None:
         """One watchdog pass over the typing sessions silent for longer than
@@ -3767,6 +3786,270 @@ class Bridge:
         return any(
             (run or {}).get("status") in HARNESS_LIVE_RUN_STATUSES
             for run in runs
+        )
+
+    # ───────────────────────── Awaiting-nag (F2) ─────────────────────────
+
+    async def _sweep_awaiting_nags(self) -> None:
+        """Ring at most ONE doorbell for the longest-overdue wait.
+
+        The whole feature rests on one asymmetry: an agent cannot wake itself
+        after 30 minutes of silence, but the bridge is always awake and *a
+        post into a channel is a turn*. So a stale `awaiting` becomes a post
+        that wakes the party that forgot.
+
+        Three independent bounds keep that from becoming a ghost-turn
+        generator (R6), any one of which would be sufficient:
+
+        * one nag per level per episode — the level is marked fired BEFORE
+          the attempt, so a transient Mattermost error costs a missed
+          doorbell rather than a repeated one;
+        * **one nag post per sweep across the entire fleet** — a fleet of 40
+          overdue sessions drains at one per tick, never as a burst. Oldest
+          wait first, so the longest wait is never starved by a newer one;
+        * the hold path (`_deliver_nag`): a busy target gets no extra run at
+          all, because F1 folds the nag into the flush it was already going
+          to receive.
+
+        Deliberately tracker-based, unlike `.fleet`: it runs every
+        `typing_refresh_seconds`, and a rare nag sent to a session whose
+        `run.started` was lost is harmless — it is one post.
+        """
+        if not self.config.nag_enabled:
+            return
+        threshold = self.config.awaiting_nag_after_seconds
+        if threshold <= 0:
+            return
+
+        now = time.time()
+        due: list[tuple[float, str, SessionState, int, float]] = []
+        for session_id, state in list(self.mapping.session_states.items()):
+            if state.kind != "awaiting" or not state.set_at:
+                continue
+            if self._session_has_active_run(session_id):
+                continue
+            age = now - state.set_at
+            level = 2 if age >= 2 * threshold else 1 if age >= threshold else 0
+            if not level:
+                continue
+            already = self._nagged_levels.get(session_id, set())
+            if level in already:
+                continue
+            due.append((state.set_at, session_id, state, level, age))
+
+        if not due:
+            return
+        due.sort(key=lambda d: d[0])
+        _set_at, session_id, state, level, age = due[0]
+
+        # Mark every level up to the one we are firing. A daemon that was
+        # down through level 1 must escalate straight to level 2, not ring a
+        # downgrade on its next tick.
+        self._nagged_levels.setdefault(session_id, set()).update(
+            lv for lv in (1, 2) if lv <= level
+        )
+        try:
+            await self._fire_nag(session_id, state, level, age)
+        except Exception:
+            logger.exception(
+                "Failed to ring the awaiting-nag for %s", session_id[:8],
+            )
+
+    async def _fire_nag(
+        self, session_id: str, state: SessionState, level: int, age: float,
+    ) -> None:
+        """Compose and place ONE nag for `session_id`."""
+        anchor = self.mapping.get_anchor(session_id)
+        if anchor is None:
+            return
+        try:
+            child = await asyncio.to_thread(
+                self.mm.get_channel, anchor.channel_id,
+            )
+        except Exception:
+            logger.warning(
+                "Nag: channel %s unreadable — skipping", anchor.channel_id,
+            )
+            return
+        slug = child.get("name") or anchor.channel_id
+
+        named = await self._known_username(state.on)
+        parent = await self._nag_parent_anchor(anchor, child)
+
+        # Placement (lead ruling on Q2):
+        #   named human, level 1 → the child's OWN channel, mention, and NO
+        #     delivery: `is_own_post` means such a post cannot wake the child
+        #     anyway, and the human being summoned is where the context is.
+        #   named human, level 2 → the parent, so the lead learns its builder
+        #     is stuck on a human.
+        #   lead (or an unknown `on`) → the parent, delivered as a turn.
+        if named and level == 1:
+            target, deliver = anchor, False
+        elif parent is not None:
+            target, deliver = parent, True
+        else:
+            # No parent channel at all: ring the session's own channel with a
+            # mention, since nothing there can be woken by the post itself.
+            target, deliver = anchor, False
+
+        mention = ""
+        if named:
+            mention = f"@{named}"
+        elif level >= 2 or not deliver:
+            mention = self._nag_fallback_mention(anchor.channel_id)
+
+        target_session = self.mapping.get_session(target) if deliver else None
+        body = self._nag_body(slug, state, age, named, mention)
+        await self._deliver_nag(target, target_session, body)
+
+    def _nag_body(
+        self,
+        slug: str,
+        state: SessionState,
+        age: float,
+        named: str | None,
+        mention: str,
+    ) -> str:
+        """`⏰ bridge nag: ~kestrel~ has been awaiting you for 30 min ("M0 gate")`
+
+        The `bridge nag:` marker is required: when a busy target holds this
+        post, F1 flushes it later rendered as ``HH:MM <bot-username>: …``,
+        and without the marker the woken agent would read a bridge doorbell
+        as a peer agent's post.
+        """
+        if named:
+            who = "you"
+        elif state.on and state.on != "lead":
+            # An unknown username routes to the lead, and says so — silently
+            # re-addressing someone else's obligation would be a lie.
+            who = f"`{state.on}` (unknown user — routed to the lead)"
+        else:
+            who = "you"
+        note = f' ("{state.note}")' if state.note else ""
+        body = (
+            f"{NAG_PREFIX} ~{slug}~ has been awaiting {who} for "
+            f"{humanise_age(age)}{note}"
+        )
+        return f"{mention} {body}" if mention else body
+
+    async def _known_username(self, on: str | None) -> str | None:
+        """Return `on` if it names a real Mattermost user, else None.
+
+        The distinction decides placement, so it has to be a real lookup —
+        one MM call, paid only when a nag is actually firing.
+        """
+        name = (on or "").strip().lstrip("@")
+        if not name or name == "lead":
+            return None
+        try:
+            user = await asyncio.to_thread(self.mm.get_user_by_username, name)
+        except Exception:
+            logger.info("Nag: `on=%s` is not a known MM user — treating as lead",
+                        name)
+            return None
+        return user.get("username") or name
+
+    async def _nag_parent_anchor(
+        self, anchor: Anchor, child: dict,
+    ) -> Anchor | None:
+        """Where a nag for `anchor` should ring.
+
+        A thread-fork session's overseer is the channel session it lives in
+        (R9), so its nag goes to the channel root — not into the thread,
+        where only the forked session is looking. Otherwise the parent comes
+        from the `Parent: ~slug~` header `mm-bridge spawn` writes.
+        """
+        if anchor.is_thread:
+            return Anchor(anchor.channel_id)
+        m = _PARENT_HEADER_RE.match(child.get("header") or "")
+        if not m:
+            return None
+        try:
+            parent = await asyncio.to_thread(
+                self.mm.get_channel_by_name, self.config.mm_team, m.group(1),
+            )
+        except Exception:
+            logger.warning(
+                "Nag: parent channel ~%s~ unresolvable", m.group(1),
+            )
+            return None
+        return Anchor(parent["id"]) if parent.get("id") else None
+
+    def _nag_fallback_mention(self, channel_id: str) -> str:
+        """`@operator`, else the most recent non-bot poster in `channel_id`.
+
+        An escalation that mentions nobody is a post no human is notified
+        about — the exact failure the escalation exists to fix. Returns ""
+        only when neither can be determined, and logs that.
+        """
+        if self.config.operator_username:
+            return "@" + self.config.operator_username.lstrip("@")
+        try:
+            posts = self.mm.get_posts(channel_id, 50)
+        except Exception:
+            posts = []
+        for post in reversed(posts):   # get_posts is oldest-first
+            uid = post.get("user_id") or ""
+            if uid and uid != self.mm.bot_user_id:
+                return "@" + self._resolve_username(uid)
+        logger.warning(
+            "Nag escalation in %s has nobody to mention — set "
+            "`operator_username`", channel_id,
+        )
+        return ""
+
+    async def _deliver_nag(
+        self, target: Anchor, target_session: str | None, body: str,
+    ) -> None:
+        """Post the nag, then make it a TURN for `target_session`.
+
+        A post the daemon authors is dropped from the forwarding path
+        upstream, by post id (`mm_client.is_own_post`), before
+        `_on_mm_posted` ever sees it — so the turn has to be submitted
+        explicitly or the nag wakes nobody. Rather than punching a hole in
+        that invariant (it has a cross-layer contract test), the nag is
+        routed exactly as a user post is: held while the target is busy,
+        delivered otherwise. It therefore inherits F1's coalescing, the
+        silent-drop peek and the first-message preamble for free.
+
+        `requeue_on_failure=[]` on purpose: a failed doorbell must not be
+        replayed later as a silent drop, when it would ring about a wait
+        that has long since ended.
+        """
+        try:
+            posted = await asyncio.to_thread(
+                self.mm.post, target.channel_id, _truncate_for_mm(body),
+                root_id=target.root_id,
+            )
+        except Exception:
+            logger.exception(
+                "Nag: failed to post into %s", target.channel_id,
+            )
+            return
+        logger.info("Rang an awaiting-nag into %s", target.channel_id)
+        if not target_session:
+            return
+
+        # Give the hold buffer a complete post envelope: `self.mm.post`
+        # returns only what the server echoed, and a held post renders from
+        # these fields.
+        stored = dict(posted)
+        stored.setdefault("channel_id", target.channel_id)
+        stored.setdefault("user_id", self.mm.bot_user_id)
+        stored["message"] = body
+        stored.setdefault("create_at", int(time.time() * 1000))
+
+        if self._should_hold(target, target_session):
+            if await self._hold_post(target, target_session, stored, body):
+                return
+            # Overflow — fall through to the eager submit, exactly as
+            # `_forward_user_post` does.
+        await self._deliver_to_session(
+            target.channel_id, target_session, body,
+            thread_root=target.root_id,
+            first_message=target.channel_id in self._awaiting_first_forward,
+            exclude_post_id=stored.get("id"),
+            requeue_on_failure=[],
         )
 
     # ─────────────────── Turn-end session state (F2) ─────────────────────
