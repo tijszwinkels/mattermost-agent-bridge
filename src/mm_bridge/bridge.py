@@ -19,6 +19,7 @@ from . import (
     name_sync,
     purpose,
     resume_header,
+    spawn,
     watchdog_notices,
 )
 from .backend_errors import (
@@ -3448,6 +3449,8 @@ class Bridge:
             await self._cmd_cwd(channel_id, session_id, parsed.arg, thread_root)
         elif spec.name == "models":
             await self._cmd_models(channel_id, session_id, thread_root)
+        elif spec.name == "fleet":
+            await self._cmd_fleet(channel_id, parsed.arg, thread_root)
         elif spec.name == "running":
             await self._cmd_running(channel_id, thread_root)
         elif spec.name == "sessions":
@@ -3584,6 +3587,171 @@ class Bridge:
             f"• autorespond: `{autorespond}`",
         ]
         self._post_cmd_reply(channel_id, "\n".join(lines), thread_root)
+
+    # ────────────────────────── Fleet view (F2) ──────────────────────────
+
+    # Per-probe bound for `.fleet`. The probes fan out with `asyncio.gather`,
+    # so this is also the TOTAL bound of the pass, not a per-row cost.
+    FLEET_PROBE_TIMEOUT_S = 2.0
+
+    async def _cmd_fleet(
+        self, channel_id: str, arg: str | None, thread_root: str | None,
+    ) -> None:
+        """`.fleet [all]` — one row per child channel of this one."""
+        all_sessions = (arg or "").strip().lower() in {"all", "--all"}
+        try:
+            rows = await self._fleet_rows(channel_id, all_sessions=all_sessions)
+        except Exception:
+            logger.exception("Failed to build the fleet view for %s", channel_id)
+            self._post_cmd_reply(
+                channel_id, ":warning: Could not read the fleet.", thread_root,
+            )
+            return
+        self._post_cmd_reply(channel_id, render_fleet(rows), thread_root)
+
+    def _fleet_targets(
+        self, channel_id: str, by_id: dict[str, dict], *, all_sessions: bool,
+    ) -> list[tuple[Anchor, str | None, str]]:
+        """Resolve the (anchor, session, title) triples a fleet view covers.
+
+        Children are the channels whose header starts with
+        ``Parent: ~<this channel's slug>~`` — the header `mm-bridge spawn`
+        writes (`spawn.format_parent_header`). A PREFIX match, not equality:
+        a spawn from a thread appends ``([thread](permalink))``.
+
+        A child with no mapped session is included with ``session=None``.
+        "The channel exists and nothing is running there" is exactly the fact
+        a lead needs; hiding it would make a dead lane look like no lane.
+        """
+        if all_sessions:
+            chosen = sorted(
+                by_id,
+                key=lambda cid: (by_id[cid].get("display_name")
+                                 or by_id[cid].get("name") or cid),
+            )
+            chosen = [cid for cid in chosen
+                      if any(a.channel_id == cid
+                             for a in self.mapping.session_to_anchor.values())]
+        else:
+            me = by_id.get(channel_id) or {}
+            slug = me.get("name") or ""
+            if not slug:
+                logger.warning(
+                    "Fleet view: no channel slug for %s — cannot find children",
+                    channel_id,
+                )
+                return []
+            prefix = spawn.format_parent_header(slug)
+            chosen = sorted(
+                (cid for cid, c in by_id.items()
+                 if (c.get("header") or "").startswith(prefix)),
+                key=lambda cid: (by_id[cid].get("display_name")
+                                 or by_id[cid].get("name") or cid),
+            )
+
+        targets: list[tuple[Anchor, str | None, str]] = []
+        for cid in chosen:
+            title = (by_id[cid].get("display_name")
+                     or by_id[cid].get("name") or cid)
+            channel_anchor = Anchor(cid)
+            targets.append(
+                (channel_anchor, self.mapping.get_session(channel_anchor), title)
+            )
+            # Thread forks are sessions in their own right (R9), so they get
+            # their own row under the channel they live in.
+            for sid, anchor in sorted(self.mapping.session_to_anchor.items()):
+                if anchor.channel_id == cid and anchor.is_thread:
+                    targets.append((anchor, sid, f"{title} (thread)"))
+        return targets
+
+    async def _fleet_rows(
+        self, channel_id: str, *, all_sessions: bool = False,
+    ) -> list[FleetRow]:
+        """Assemble the fleet's rows: claims next to observations.
+
+        ONE Mattermost listing (`list_bot_channels` carries `header` and
+        `display_name`), off the event loop, plus ONE parallel probe pass
+        over the sessions that will be displayed.
+
+        The probe is not optional (lead condition C1). `active_run_by_session`
+        is reconciled only by `_typing_watchdog_tick`, which early-returns
+        when `self.typing` is unset and otherwise iterates only
+        `self.typing.running_sessions()` — so a session whose `run.started`
+        was lost is never reconciled, and with no typing indicator nothing
+        is. The tracker is stale in BOTH directions, and rendering a working
+        builder as `idle` is the exact lie this view exists to remove.
+        """
+        channels = await asyncio.to_thread(self.mm.list_bot_channels)
+        by_id = {c.get("id"): c for c in channels if c.get("id")}
+        if channel_id not in by_id:
+            # The bot is normally a member of the channel it was asked in;
+            # fall back to a direct fetch rather than returning "no children".
+            try:
+                me = await asyncio.to_thread(self.mm.get_channel, channel_id)
+                by_id[channel_id] = me
+            except Exception:
+                logger.warning("Fleet view: channel %s unreadable", channel_id)
+
+        targets = self._fleet_targets(
+            channel_id, by_id, all_sessions=all_sessions,
+        )
+        session_ids = [sid for _a, sid, _t in targets if sid]
+        probed = dict(zip(
+            session_ids,
+            await asyncio.gather(
+                *(self._probe_run_live(sid) for sid in session_ids)
+            ),
+        ))
+
+        now = time.time()
+        rows: list[FleetRow] = []
+        for anchor, sid, title in targets:
+            state = self.mapping.get_state(sid) if sid else None
+            live = probed.get(sid) if sid else False
+            uncertain = sid is not None and live is None
+            if uncertain:
+                live = self._session_has_active_run(sid or "")
+            rows.append(FleetRow(
+                title=title,
+                state=state,
+                age_s=(now - state.set_at) if state and state.set_at else None,
+                run_live=bool(live),
+                held=len(self._held.peek(anchor)),
+                uncertain=uncertain,
+            ))
+        return rows
+
+    async def _probe_run_live(self, session_id: str) -> bool | None:
+        """Ask the harness whether `session_id` has a live run.
+
+        Returns None when the answer is UNKNOWN (timeout, HTTP error, harness
+        down) — deliberately distinct from False. `_active_run_is_alive` maps
+        every failure to False, which is right for its callers (a dead harness
+        must not leave typing stuck on) and wrong here: an unknown row must
+        fall back to the tracker and be marked `?`, not be asserted idle.
+        """
+        try:
+            return await asyncio.wait_for(
+                self._harness_run_live(session_id), self.FLEET_PROBE_TIMEOUT_S,
+            )
+        except Exception as exc:
+            logger.info(
+                "Fleet probe for %s inconclusive: %s", session_id[:8], exc,
+            )
+            return None
+
+    async def _harness_run_live(self, session_id: str) -> bool:
+        """Raising counterpart of `_active_run_is_alive` (see `_probe_run_live`)."""
+        run_id = self.active_run_by_session.get(session_id)
+        if run_id:
+            run = await self.harness.get_run(session_id, run_id)
+            runs = [run] if run else []
+        else:
+            runs = await self.harness.list_session_runs(session_id)
+        return any(
+            (run or {}).get("status") in HARNESS_LIVE_RUN_STATUSES
+            for run in runs
+        )
 
     # ─────────────────── Turn-end session state (F2) ─────────────────────
 

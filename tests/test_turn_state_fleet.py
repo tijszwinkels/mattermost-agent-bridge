@@ -207,3 +207,146 @@ class RunLifecycleStateTests(_F2TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ────────────────────────── B. the fleet view (R8, C1) ──────────────────────
+
+
+class _FleetTestCase(_F2TestCase):
+    """A lead channel `c1` with two spawned children and one stranger."""
+
+    async def asyncSetUp(self):  # type: ignore[override]
+        await super().asyncSetUp()
+        mm = self.bridge.mm
+        mm.channels.update({
+            "c1": {"id": "c1", "name": "lead", "display_name": "lead"},
+            "c-kestrel": {"id": "c-kestrel", "name": "kestrel",
+                          "display_name": "kestrel",
+                          "header": "Parent: ~lead~"},
+            "c-grebe": {"id": "c-grebe", "name": "grebe",
+                        "display_name": "grebe",
+                        "header": "Parent: ~lead~ ([thread](http://x/pl/p1))"},
+            "c-stranger": {"id": "c-stranger", "name": "stranger",
+                           "display_name": "stranger",
+                           "header": "Parent: ~someone-else~"},
+        })
+        self.bridge.mapping.link(Anchor("c-kestrel"), "s-kestrel")
+        self.bridge.mapping.link(Anchor("c-grebe"), "s-grebe")
+        self.bridge.mapping.link(Anchor("c-stranger"), "s-stranger")
+
+    async def fleet(self, channel_id="c1", arg=None) -> str:
+        await self.bridge._cmd_fleet(channel_id, arg, None)
+        return self.bridge.mm.posted[-1].message
+
+
+class FleetViewTests(_FleetTestCase):
+    async def test_renders_children_only(self):
+        out = await self.fleet()
+        self.assertIn("kestrel", out)
+        self.assertIn("grebe", out)
+        self.assertNotIn("stranger", out)
+
+    async def test_a_child_row_carries_state_target_and_note(self):
+        self.bridge.set_session_state(
+            "s-kestrel", "awaiting", on="lead", note="C5 gate",
+        )
+        out = await self.fleet()
+        line = next(ln for ln in out.splitlines() if "kestrel" in ln)
+        self.assertIn("awaiting → lead", line)
+        self.assertIn("note: C5 gate", line)
+
+    async def test_held_count_comes_from_the_f1_buffer(self):
+        from mm_bridge import held_posts
+        self.bridge._held.add(
+            Anchor("c-grebe"),
+            held_posts.HeldPost(post={"id": "p9"}, username="tijs",
+                                held_at_ms=0),
+            session_id="s-grebe",
+        )
+        line = next(ln for ln in (await self.fleet()).splitlines()
+                    if "grebe" in ln)
+        self.assertIn("held: 1", line)
+
+    async def test_a_dormant_child_is_shown_not_hidden(self):
+        self.bridge.mapping.unlink(Anchor("c-kestrel"))
+        line = next(ln for ln in (await self.fleet()).splitlines()
+                    if "kestrel" in ln)
+        self.assertIn("-", line)
+
+    async def test_thread_forks_get_their_own_row(self):
+        """R9: state is per session, so a thread fork is its own row."""
+        self.bridge.mapping.link(Anchor("c-kestrel", "root-1"), "s-thread")
+        self.bridge.set_session_state("s-thread", "blocked", note="quota")
+        out = await self.fleet()
+        thread_lines = [ln for ln in out.splitlines() if "thread" in ln]
+        self.assertEqual(len(thread_lines), 1, out)
+        self.assertIn("blocked", thread_lines[0])
+
+    async def test_all_widens_to_every_mapped_session(self):
+        out = await self.fleet(arg="all")
+        self.assertIn("stranger", out)
+
+    async def test_a_channel_with_no_children_says_so(self):
+        out = await self.fleet(channel_id="c-stranger")
+        self.assertIn("no child channels", out.lower())
+
+    async def test_the_listing_is_fetched_once_not_once_per_row(self):
+        await self.fleet()
+        self.assertEqual(self.bridge.mm.list_bot_channels_calls, 1)
+
+
+class FleetProbeTests(_FleetTestCase):
+    """C1: the run tracker is stale in both directions, so the fleet probes.
+
+    `_typing_watchdog_tick` early-returns with no typing indicator and
+    otherwise only sweeps `typing.running_sessions()`, so a session whose
+    `run.started` was lost is never reconciled. A fleet that renders a
+    working builder as `idle` is the lie this feature exists to remove.
+    """
+
+    async def test_probe_beats_a_stale_tracker(self):
+        self.bridge.harness.session_runs_meta["s-kestrel"] = [
+            {"id": "r1", "status": "running", "origin": "harness"},
+        ]
+        self.assertNotIn("s-kestrel", self.bridge.active_run_by_session)
+        line = next(ln for ln in (await self.fleet()).splitlines()
+                    if "kestrel" in ln)
+        self.assertIn("working", line)
+
+    async def test_a_failed_probe_falls_back_to_the_tracker_and_is_marked(self):
+        self.run_live(session_id="s-kestrel", run_id="r1")
+
+        async def boom(session_id):
+            raise RuntimeError("harness down")
+
+        self.bridge.harness.list_session_runs = boom
+        self.bridge.harness.get_run = boom
+        line = next(ln for ln in (await self.fleet()).splitlines()
+                    if "kestrel" in ln)
+        self.assertIn("working", line)
+        self.assertIn("?", line)
+
+    async def test_a_slow_probe_does_not_hang_the_view(self):
+        import asyncio as _asyncio
+
+        async def never(session_id):
+            await _asyncio.sleep(30)
+
+        self.bridge.harness.list_session_runs = never
+        self.bridge.harness.get_run = never
+        self.bridge.FLEET_PROBE_TIMEOUT_S = 0.05
+        out = await _asyncio.wait_for(self.fleet(), timeout=5)
+        self.assertIn("?", out)
+
+    async def test_probes_run_in_parallel_not_serially(self):
+        import asyncio as _asyncio
+
+        async def slow(session_id):
+            await _asyncio.sleep(0.1)
+            return []
+
+        self.bridge.harness.list_session_runs = slow
+        started = time.monotonic()
+        await self.fleet()   # two child sessions: 0.1s parallel, 0.2s serial
+        self.assertLess(time.monotonic() - started, 0.15,
+                        "probes must fan out, not run one after another")

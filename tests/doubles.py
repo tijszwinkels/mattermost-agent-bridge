@@ -67,6 +67,9 @@ class FakeMattermostClient:
     # post_id → set of emoji names, mirroring the MM reactions API. Held
     # posts get an hourglass, delivered ones a check mark.
     reactions: dict = field(default_factory=dict)
+    # Times `list_bot_channels` was called — `.fleet` must fan out over ONE
+    # listing, never one call per row.
+    list_bot_channels_calls: int = 0
     _post_counter: int = 0
     # Mirror of MattermostClient's own-post tracking — populated
     # whenever the fake creates or edits a post.
@@ -177,6 +180,16 @@ class FakeMattermostClient:
 
     def get_bot_channel_ids(self) -> set:
         return set(self.bot_channel_ids)
+
+    def list_bot_channels(self) -> list:
+        """Full channel records for the bot's memberships.
+
+        The fleet view reads `header` + `display_name` from exactly this
+        call, so the fake serves whole records out of `channels` (which
+        `create_channel` / `set_channel_header` already populate).
+        """
+        self.list_bot_channels_calls += 1
+        return [dict(c) for c in self.channels.values()]
 
     def list_public_team_channels(self) -> list:
         return list(self.public_channels)

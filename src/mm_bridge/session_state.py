@@ -172,10 +172,14 @@ def render_fleet(rows: list[FleetRow]) -> str:
 
     cells: list[tuple[str, ...]] = []
     for r in rows:
-        if r.state is None:
-            state = "-"
+        # A live run outranks the claim: `working` is what is TRUE right
+        # now, and it is renderable even for a session that never declared
+        # anything (an agent that has not learned the tag, or an external
+        # session the bridge merely observes).
+        if r.run_live:
+            state = "working"
         else:
-            state = "working" if r.run_live else r.state.describe()
+            state = r.state.describe() if r.state else "-"
         if r.uncertain:
             state += " ?"
         when = humanise_run(r.age_s) if r.run_live else humanise_age(r.age_s)

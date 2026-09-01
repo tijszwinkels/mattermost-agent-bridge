@@ -122,6 +122,11 @@ _SPECS: tuple[CommandSpec, ...] = (
         session_scoped=True,
     ),
     CommandSpec(
+        "fleet", ".fleet [all]",
+        "Show this channel's spawned children: state, run, held posts.",
+        global_scope=True,
+    ),
+    CommandSpec(
         "invite", ".invite <session-id>",
         "Get invited to a session's Mattermost channel (creating it if needed).",
         global_scope=True,
