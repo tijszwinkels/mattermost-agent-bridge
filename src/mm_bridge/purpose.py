@@ -25,20 +25,6 @@ _BACKEND_ALIASES: dict[str, str] = {
     "claude code": "claude",
 }
 
-def canonical_backend(token: str | None) -> str | None:
-    """Canonicalise a backend name to the vocabulary the channel speaks.
-
-    agent-harness reports its own wire names (``claude-code``); Channel
-    Purpose, `.backend` and every operator-facing message use the short form
-    (``claude``). Unknown names pass through unchanged — naming a backend we
-    don't recognise is still more truthful than dropping it.
-    """
-    if not token:
-        return None
-    lc = token.strip().lower()
-    return _BACKEND_ALIASES.get(lc, lc) or None
-
-
 # A standalone line equal to this string splits the Channel Purpose into a
 # config section (parsed by `parse()`) and a trailing section reserved for
 # informational content such as the resume-command block written by
@@ -78,6 +64,13 @@ def canonical_backend(name: str | None) -> str | None:
     ``"claude-code"`` / ``"claudecode"`` → ``"claude"``. Returns the input
     unchanged when it's falsy (None / empty). Unknown names pass through
     lowercased so callers can still use them (free-text tolerance).
+
+    WHY callers need this: agent-harness reports its own wire names
+    (``claude-code``), while Channel Purpose, `.backend` and every
+    operator-facing message speak the short form (``claude``). Anything
+    reading a backend off a harness record — `_backend_for_error`,
+    `_resume_meta_for` — must come through here so the channel never sees a
+    name the user can't type back.
     """
     if not name:
         return name
