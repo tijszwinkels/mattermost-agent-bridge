@@ -3,6 +3,7 @@
 Supported directives:
     <openFile path="..." [line="..."] [follow="..."] />
     <leaveChannel [reason="..."] />
+    <state kind="..." [on="..."] [note="..."] />
 
 The parser is markdown-fence-aware: directives appearing inside
 triple-backtick fenced blocks or inline backtick code spans are treated
@@ -18,7 +19,7 @@ from typing import Literal
 
 @dataclass
 class Directive:
-    kind: Literal["open_file", "leave_channel"]
+    kind: Literal["open_file", "leave_channel", "state"]
     attrs: dict[str, str]
 
 
@@ -26,6 +27,11 @@ _OPEN_FILE_RE = re.compile(r"<openFile\s+([^>]*)/>", re.IGNORECASE)
 _LEAVE_CHANNEL_RE = re.compile(
     r"<leaveChannel(?:\s+([^>]*?))?\s*/>", re.IGNORECASE
 )
+# Turn-end state. Attributes are validated by the caller, not here: an
+# unknown `kind` must still be STRIPPED from the visible post (and answered
+# with a notice), which means the parser has to match it first.
+_STATE_RE = re.compile(r"<state(?:\s+([^>]*?))?\s*/>", re.IGNORECASE)
+
 _ATTR_RE = re.compile(r'(\w+)="([^"]*)"')
 
 # Collapse 3+ consecutive newlines (possibly with blank whitespace) to two.
@@ -83,6 +89,11 @@ def extract(text: str) -> tuple[str, list[Directive]]:
     for m in _LEAVE_CHANNEL_RE.finditer(masked):
         matches.append(
             (m.start(), m.end(), Directive("leave_channel", _parse_attrs(m.group(1))))
+        )
+
+    for m in _STATE_RE.finditer(masked):
+        matches.append(
+            (m.start(), m.end(), Directive("state", _parse_attrs(m.group(1))))
         )
 
     if not matches:

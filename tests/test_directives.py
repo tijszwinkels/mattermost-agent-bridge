@@ -169,3 +169,60 @@ def test_text_between_directives_preserved_verbatim() -> None:
     cleaned, directives = extract(text)
     assert cleaned == "middle"
     assert [d.attrs["path"] for d in directives] == ["a", "b"]
+
+
+# ── <state kind="..." on="..." note="..."/> — the turn-end state directive ──
+# Same fence-aware machinery as the other two: the tag is documented in
+# `CLAUDE-include.md` inside fences, and agents quote it when explaining
+# themselves, so a fenced tag must stay visible text and set nothing.
+
+
+def test_state_directive_minimal() -> None:
+    cleaned, directives = extract('<state kind="idle" />')
+    assert cleaned == ""
+    assert directives == [Directive("state", {"kind": "idle"})]
+
+
+def test_state_directive_full_attrs() -> None:
+    cleaned, directives = extract(
+        'M0 done.\n<state kind="awaiting" on="lead" note="M0 gate" />'
+    )
+    assert cleaned == "M0 done.\n"
+    assert directives == [
+        Directive("state", {"kind": "awaiting", "on": "lead", "note": "M0 gate"}),
+    ]
+
+
+def test_state_directive_case_insensitive() -> None:
+    _, directives = extract('<STATE KIND="parked" />')
+    assert directives[0].kind == "state"
+
+
+def test_state_directive_inside_plain_fence_not_extracted() -> None:
+    text = 'Use it like:\n```\n<state kind="awaiting" on="lead" />\n```\n'
+    cleaned, directives = extract(text)
+    assert cleaned == text
+    assert directives == []
+
+
+def test_state_directive_inside_inline_code_span_not_extracted() -> None:
+    text = 'End your reply with `<state kind="parked" />` to park.'
+    cleaned, directives = extract(text)
+    assert cleaned == text
+    assert directives == []
+
+
+def test_two_state_directives_keep_textual_order() -> None:
+    """Last-tag-wins is decided by the bridge; the parser preserves order."""
+    _, directives = extract(
+        'was <state kind="idle"/> now <state kind="blocked" note="quota"/>'
+    )
+    assert [d.attrs.get("kind") for d in directives] == ["idle", "blocked"]
+
+
+def test_state_mixed_with_other_directives_keeps_order() -> None:
+    cleaned, directives = extract(
+        '<openFile path="a.py"/> done <state kind="awaiting" on="tijs"/>'
+    )
+    assert cleaned == " done "
+    assert [d.kind for d in directives] == ["open_file", "state"]
