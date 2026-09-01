@@ -196,8 +196,14 @@ cover it: `_restart_session_with_config` sets that only *after* the
 `typing.stop` await, and `_replace_external_session` never sets it in its own
 body at all.
 
+The guard must hold **inside the flush loop, not merely on entry** (lead
+condition **C5**): a swap can open while an earlier iteration is suspended in
+`_deliver_held` — a `create_run` plus 2N reaction round trips is seconds for a
+deep batch — and by the next iteration the entry check is long past. A `None`
+session while the anchor is protected means **defer**, never abandon.
+
 Requirement: **no path that unlinks an anchor and relinks it after an await
-may let the sweep abandon its held posts, and the marker that protects them
+may let a flush abandon its held posts, and the marker that protects them
 must be in place before the first await after the unlink.** Once the anchor is
 relinked, the backlog is delivered to its *new* owner — that is design §1's
 promise, and waiting for the next sweep would only make it late.
@@ -353,6 +359,7 @@ before the code that makes it pass:
 | 22 | A failed restart ⇒ backlog stays with the restored old session | C4 |
 | 23 | Sweep during an external-session replacement ⇒ backlog intact | C4 |
 | 24 | `.leave` with a backlog names what it dropped | nit |
+| 25 | A swap opening MID-FLUSH defers instead of abandoning; delivered after the relink | C5 |
 
 12.2 Full suite green at FINAL (`uv run -m pytest`), with before/after counts
 reported. Baseline at branch point (`3e28e53`): **1022 passed, 1 skipped, 42

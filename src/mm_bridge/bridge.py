@@ -2344,22 +2344,32 @@ class Bridge:
         """
         if anchor in self._flushing:
             return
-        if self._held_is_protected(anchor):
-            # A session swap is in progress for this anchor. `get_session` is
-            # transiently None, which the no-session branch below would read
-            # as "abandon the backlog". Guarding HERE rather than in the sweep
-            # covers every caller — the sweep, the terminal event and the
-            # post-enqueue probe alike. The restart flushes once it relinks.
-            logger.debug(
-                "Deferring flush for %s — session swap in progress",
-                anchor.channel_id,
-            )
-            return
         self._flushing.add(anchor)
         try:
             while True:
                 held = self._held.peek(anchor)
                 if not held:
+                    return
+                if self._held_is_protected(anchor):
+                    # A session swap is in progress for this anchor, so
+                    # `get_session` is transiently None and the branch below
+                    # would read that as "session gone" and abandon the
+                    # backlog. Defer instead — the restart flushes to the
+                    # replacement once it relinks.
+                    #
+                    # Checked INSIDE the loop, not just on entry: a swap can
+                    # open while an earlier iteration is suspended in
+                    # `_deliver_held` (a `create_run` plus 2N reaction round
+                    # trips is seconds for a deep batch), and by then the
+                    # entry check is long past. Checking here covers entry
+                    # too — the first iteration runs immediately — so this is
+                    # the only guard needed, and every caller inherits it:
+                    # the terminal event, the watchdog, the post-enqueue
+                    # probe and the sweep alike.
+                    logger.debug(
+                        "Deferring flush for %s — session swap in progress",
+                        anchor.channel_id,
+                    )
                     return
                 session_id = self.mapping.get_session(anchor)
                 if not session_id:

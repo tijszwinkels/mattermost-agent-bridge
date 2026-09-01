@@ -464,7 +464,24 @@ if self.mapping.get_session(Anchor(channel_id)):
     await self._flush_held(Anchor(channel_id))
 ```
 
-Two choices worth naming:
+The guard sits at the **top of the flush loop**, not before it. An entry-only
+check covers the caller that starts a flush during a swap, but not the swap
+that opens *while a flush is already looping* — `_deliver_held` awaits a
+`create_run` plus 2N reaction round trips, seconds for a deep batch, and the
+operator's `.model` lands in exactly that window. The next iteration then sees
+a non-empty buffer and a `None` session and abandons it (lead condition
+**C5**). Checking at the loop top covers entry too, since the first iteration
+runs immediately — so it is the only guard needed.
+
+The interleavings all terminate:
+
+| Order | Outcome |
+| --- | --- |
+| Loop wakes while the swap is still open | Defers, `_flushing` clears; the restart's post-relink flush delivers |
+| Restart relinks first, its flush finds `_flushing` held | Returns early; the loop's next iteration sees the NEW session and delivers |
+| Restart fails | Old mapping restored; the same post-relink flush hands the backlog back to the still-live old session |
+
+Two further choices worth naming:
 
 * **The guard lives in `_flush_held`, not in the sweep.** One choke point, so
   the terminal event (T1), the watchdog (T2), the post-enqueue probe (T3) and
@@ -481,7 +498,21 @@ rather than up to one sweep interval late, and it runs **before**
 during the restart. On a failed restart the old mapping is restored, so the
 same call delivers the backlog back to the still-live old session.
 
-### 4.6 Accepted, documented non-closures
+### 4.6 One residual, accepted
+
+A swap that opens *during* `_deliver_held` — after `create_run` has already
+been issued — sends that batch to the outgoing session, whose output is
+dropped once the anchor is relinked. The batch's turn is effectively lost.
+
+Not closed, deliberately. The only fix is to withhold the `discard` when the
+anchor was swapped mid-delivery and re-send to the replacement — which trades
+a rare lost turn for a rare *duplicated* one, since the outgoing session runs
+it either way. A duplicate turn is the worse failure: it re-executes side
+effects. The window is also the narrowest in this feature (it needs `.model`
+to land inside a single `create_run` round trip), and it is not a regression:
+today a `.model` during a live run already abandons that run's output.
+
+### 4.7 Accepted, documented non-closures
 
 | Case | Behaviour | Why acceptable |
 | --- | --- | --- |

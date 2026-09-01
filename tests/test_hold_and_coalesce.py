@@ -1042,6 +1042,75 @@ class RestartWindowTests(_HoldTestCase):
         self.assertEqual(self.bridge.mapping.get_session(Anchor("c1")), "s3")
 
 
+    async def test_a_swap_opening_mid_flush_does_not_abandon_the_buffer(self):
+        """C5 — the guard covered the entry, not the loop.
+
+        A flush is looping; its `_deliver_held` is awaiting `create_run` plus
+        2N reaction round trips — seconds for a deep batch. The operator types
+        `.model` in that window. The restart unlinks the anchor; posts still
+        arriving are held (`anchor in self._flushing`). The loop's next
+        iteration then sees a non-empty buffer and a `None` session, and
+        abandons it — the same transient-None-read-as-loss as C4, one seam
+        deeper. Nothing else would have caught it either: the restart's own
+        post-relink flush returns early while `_flushing` is held, and the
+        sweep would only ever see an already-emptied anchor.
+        """
+        from mm_bridge.held_posts import HeldPost
+
+        self.run_live()
+        self.bridge.mm.users["u1"] = {"id": "u1", "username": "tijs"}
+        await self.bridge._on_mm_posted(self.post("p1", "first batch"))
+
+        in_delivery, release_run = asyncio.Event(), asyncio.Event()
+        real_create_run = self.bridge.harness.create_run
+
+        async def gated_create_run(session_id, message):
+            in_delivery.set()
+            await release_run.wait()
+            return await real_create_run(session_id, message)
+
+        self.bridge.harness.create_run = gated_create_run
+
+        # A flush is now mid-loop, suspended inside `_deliver_held`.
+        flush = asyncio.create_task(self.terminal())
+        await self._await_gate(in_delivery, flush)
+
+        # The operator restarts the session while that delivery is in flight.
+        entered, release_session = asyncio.Event(), asyncio.Event()
+        self.bridge.harness.create_session = self._gated_create_session(
+            entered, release_session,
+        )
+        restart = asyncio.create_task(
+            self.bridge._restart_session_with_config("c1", "s1", self._config()),
+        )
+        await self._await_gate(entered, restart)
+        self.assertIsNone(self.bridge.mapping.get_session(Anchor("c1")))
+
+        # A post arriving now is held because a flush is in progress.
+        self.bridge._held.add(Anchor("c1"), HeldPost(
+            post=self.post("p2", "arrived mid-swap"), username="tijs",
+            held_at_ms=1_788_000_000_000,
+        ), session_id="s1")
+
+        # The suspended loop wakes up and takes its next iteration.
+        release_run.set()
+        await flush
+
+        self.assertEqual(
+            self.held_ids(), ["p2"], "buffer abandoned mid-swap",
+        )
+
+        release_session.set()
+        await restart
+
+        self.assertEqual(self.bridge.mapping.get_session(Anchor("c1")), "s2")
+        self.assertIn(
+            "arrived mid-swap",
+            "\n".join(m for sid, m in self.bridge.harness.sent if sid == "s2"),
+        )
+        self.assertEqual(self.held_ids(), [])
+
+
 # ───────────────────────── Teardown hygiene ───────────────────────────────
 
 
