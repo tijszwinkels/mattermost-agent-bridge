@@ -23,6 +23,7 @@ from .backend_errors import (
     PATH_NOT_ACCEPTED,
     ProviderFailure,
     classify_failure,
+    failure_state_note,
     exception_detail,
     format_backend_error,
     format_provider_failure,
@@ -4649,7 +4650,7 @@ class Bridge:
             "Harness run failed: session=%s kind=%s provider=%s status=%s detail=%s",
             session_id[:8], failure.kind, failure.provider, failure.status, detail,
         )
-        self._note_run_failure(session_id, failure)
+        self._note_run_failure(session_id, failure, run_failure_path(data))
         try:
             self.mm.post(
                 anchor.channel_id,
@@ -4669,7 +4670,9 @@ class Bridge:
                 session_id[:8], exc_info=True,
             )
 
-    def _note_run_failure(self, session_id: str, failure: ProviderFailure) -> None:
+    def _note_run_failure(
+        self, session_id: str, failure: ProviderFailure, path: str,
+    ) -> None:
         """Publish a classified failure to round F2's per-session state API.
 
         WHY guarded rather than imported: F2 (`feat/turn-state-fleet`) owns
@@ -4685,16 +4688,17 @@ class Bridge:
         setter = getattr(self, "set_session_state", None)
         if setter is None:
             return
-        note = failure.kind
-        if failure.provider:
-            note = f"{note} ({failure.provider})"
         try:
+            # Call shape pinned with F2 (Nuthatch) at M1: `on=None` — F2 owns
+            # the on/off lifecycle and creates the row if missing — and a note
+            # whose first token is the class, which is what F2 renders as
+            # `blocked (<class>)`.
             setter(
                 session_id,
                 "blocked",
-                on=True,
-                note=note,
-                source="provider-failure",
+                on=None,
+                note=failure_state_note(failure, path),
+                source="bridge",
             )
         except Exception:
             logger.warning(

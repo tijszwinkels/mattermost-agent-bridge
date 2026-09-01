@@ -21,6 +21,7 @@ from mm_bridge.backend_errors import (
     PATH_HARNESS_PROCESS,
     PATH_NOT_ACCEPTED,
     classify_failure,
+    failure_state_note,
     format_provider_failure,
 )
 from mm_bridge.config import Anchor
@@ -373,6 +374,45 @@ class DeliveryFailureTests(_BridgeTestCase):
 # ───────────────────────── 5. The F2 state seam ────────────────────────────
 
 
+class StateNoteTests(unittest.TestCase):
+    """`note` is F2's rendering input: "<class> (<provider>, HTTP <status>)",
+    with provider and status omitted when unknown."""
+
+    def test_provider_and_status_both_known(self):
+        self.assertEqual(
+            failure_state_note(classify_failure(INCIDENT_OPENROUTER_403), PATH_CLI_EXIT),
+            "quota_exhausted (openrouter, HTTP 403)")
+
+    def test_provider_only(self):
+        self.assertEqual(
+            failure_state_note(classify_failure("ollama is unhappy about rate limit"),
+                               PATH_CLI_EXIT),
+            "rate_limited (ollama)")
+
+    def test_status_only(self):
+        self.assertEqual(
+            failure_state_note(classify_failure("401 Unauthorized"), PATH_CLI_EXIT),
+            "auth (HTTP 401)")
+
+    def test_neither_known(self):
+        self.assertEqual(
+            failure_state_note(classify_failure("mystery"), PATH_CLI_EXIT), "unknown")
+
+    def test_harness_process_is_its_own_class_token(self):
+        """F2's vocabulary includes `harness_process`; an unclassifiable
+        harness-process death is more useful as that than as `unknown`."""
+        self.assertEqual(
+            failure_state_note(classify_failure("No such file: pi"),
+                               PATH_HARNESS_PROCESS),
+            "harness_process")
+
+    def test_a_classified_harness_process_failure_keeps_the_real_class(self):
+        self.assertEqual(
+            failure_state_note(classify_failure(INCIDENT_OPENROUTER_403),
+                               PATH_HARNESS_PROCESS),
+            "quota_exhausted (openrouter, HTTP 403)")
+
+
 class StateSeamTests(_BridgeTestCase):
     """F2 (`feat/turn-state-fleet`) owns `set_session_state`. This branch must
     stand alone on `main`, where that API does not exist yet."""
@@ -393,6 +433,9 @@ class StateSeamTests(_BridgeTestCase):
         self.assertTrue(_warnings(self.bridge), "the warning must still post")
 
     async def test_seam_calls_f2s_api_when_present(self):
+        """The contract F2 (Nuthatch) pinned at M1: `on=None`, `source="bridge"`,
+        and a note whose FIRST TOKEN is the class, because F2 renders
+        `blocked (<first token>)`."""
         calls: list[tuple] = []
 
         def set_session_state(session_id, kind, *, on, note, source):
@@ -424,8 +467,10 @@ class StateSeamTests(_BridgeTestCase):
         session_id, kind, on, note, source = calls[0]
         self.assertEqual(session_id, "s1")
         self.assertEqual(kind, "blocked")
-        self.assertTrue(on)
-        self.assertIn("quota", note)
+        self.assertIsNone(on)
+        self.assertEqual(source, "bridge")
+        self.assertEqual(note, "quota_exhausted (openrouter, HTTP 403)")
+        self.assertTrue(note.startswith("quota_exhausted"), "F2 renders the first token")
 
     async def test_a_raising_f2_api_never_swallows_the_warning(self):
         def boom(*_a, **_kw):
