@@ -3896,7 +3896,7 @@ class Bridge:
         if named:
             mention = f"@{named}"
         elif level >= 2 or not deliver:
-            mention = self._nag_fallback_mention(anchor.channel_id)
+            mention = await self._nag_fallback_mention(anchor.channel_id)
 
         target_session = self.mapping.get_session(target) if deliver else None
         body = self._nag_body(slug, state, age, named, mention)
@@ -3975,23 +3975,27 @@ class Bridge:
             return None
         return Anchor(parent["id"]) if parent.get("id") else None
 
-    def _nag_fallback_mention(self, channel_id: str) -> str:
+    async def _nag_fallback_mention(self, channel_id: str) -> str:
         """`@operator`, else the most recent non-bot poster in `channel_id`.
 
         An escalation that mentions nobody is a post no human is notified
         about — the exact failure the escalation exists to fix. Returns ""
         only when neither can be determined, and logs that.
+
+        Both lookups go through `to_thread` like the rest of the nag path:
+        the Mattermost client is synchronous, and nothing on the watchdog
+        tick may block the event loop, however briefly.
         """
         if self.config.operator_username:
             return "@" + self.config.operator_username.lstrip("@")
         try:
-            posts = self.mm.get_posts(channel_id, 50)
+            posts = await asyncio.to_thread(self.mm.get_posts, channel_id, 50)
         except Exception:
             posts = []
         for post in reversed(posts):   # get_posts is oldest-first
             uid = post.get("user_id") or ""
             if uid and uid != self.mm.bot_user_id:
-                return "@" + self._resolve_username(uid)
+                return "@" + await asyncio.to_thread(self._resolve_username, uid)
         logger.warning(
             "Nag escalation in %s has nobody to mention — set "
             "`operator_username`", channel_id,
@@ -4062,6 +4066,7 @@ class Bridge:
         on: str | None = None,
         note: str | None = None,
         source: str = "agent",
+        restamp: bool = True,
     ) -> SessionState | None:
         """Record `session_id`'s state and return the PREVIOUS one.
 
@@ -4075,6 +4080,17 @@ class Bridge:
         bookkeeping is dropped, so a session that re-declares `awaiting` is
         rung again from zero rather than inheriting the old episode's
         already-fired levels.
+
+        `restamp=False` means "only write if the CLAIM changed" — same
+        `kind`/`on`/`note` is a no-op that keeps the stored `set_at` and the
+        current episode. It exists for the tagless-block path (C2): a chatty
+        run emits an assistant text block per tool narration, and each one
+        implies `idle`. Stamping `set_at=now` every time would make every
+        block a full atomic rewrite of the state file — several a second
+        across a handful of busy sessions, on a path with no throttle (the
+        SSE cursor throttles its own writes at 2s for exactly this reason).
+        Leaving `set_at` where `run.started` put it is also the documented
+        age semantics: time since the state was set or the last run started.
 
         An unknown `kind` is refused (state unchanged) rather than stored:
         every reader — the fleet renderer, the nag sweep, the CLI — assumes
@@ -4092,6 +4108,12 @@ class Bridge:
                 "Refusing unknown session state %r for %s (valid: %s)",
                 kind, session_id[:8], ", ".join(KINDS),
             )
+            return prev
+        if (
+            not restamp
+            and prev is not None
+            and (prev.kind, prev.on, prev.note) == (kind, on or None, note or None)
+        ):
             return prev
         try:
             self.mapping.set_state(session_id, SessionState(
@@ -4121,7 +4143,8 @@ class Bridge:
 
         * **No tag means `idle`.** That is the zero-migration property — an
           agent that never learns the tag ends every turn idle, which is
-          exactly today's unmodelled behaviour.
+          exactly today's unmodelled behaviour. An untagged block that
+          changes nothing does not touch the state file (see `restamp`).
         * **The LAST tag wins.** Quoting an earlier state mid-reply is
           legitimate prose, so only the final declaration counts.
 
@@ -4133,7 +4156,10 @@ class Bridge:
         """
         states = [d for d in dirs if d.kind == "state"]
         if not states:
-            self.set_session_state(session_id, DEFAULT_KIND)
+            # `restamp=False`: an untagged block only WRITES when it actually
+            # changes the claim (C2). Ten busy sessions narrating tools would
+            # otherwise rewrite the state file several times a second.
+            self.set_session_state(session_id, DEFAULT_KIND, restamp=False)
             return
 
         attrs = states[-1].attrs

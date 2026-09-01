@@ -134,6 +134,70 @@ class StateDirectiveTests(_F2TestCase):
         self.assertEqual(self.state("s2").kind, "blocked")
 
 
+class TaglessBlockWriteTests(_F2TestCase):
+    """C2: a tagless text block must not rewrite the state file.
+
+    `_apply_state_directive` runs per assistant text block, and a chatty run
+    emits one per tool narration. Stamping `set_at=now` every time would make
+    every block a full atomic rewrite of the state file, on a path with no
+    throttle — the SSE cursor throttles its own writes at 2s for exactly this
+    reason.
+    """
+
+    def count_saves(self, bridge=None):
+        b = bridge or self.bridge
+        saves = []
+        real = b.mapping.save
+
+        def counting_save():
+            saves.append(1)
+            real()
+
+        b.mapping.save = counting_save
+        return saves
+
+    async def test_five_tagless_blocks_write_at_most_once(self):
+        saves = self.count_saves()
+        for i in range(5):
+            await self.reply(f"narrating step {i}")
+        self.assertLessEqual(len(saves), 1, "one write per text block")
+        self.assertEqual(self.state().kind, "idle")
+
+    async def test_a_tagless_block_after_awaiting_still_transitions_once(self):
+        await self.reply('<state kind="awaiting" on="lead" note="M0"/>')
+        saves = self.count_saves()
+        await self.reply("here is the answer")
+        self.assertEqual(len(saves), 1)
+        self.assertEqual(self.state().kind, "idle")
+        self.assertIsNone(self.state().on)
+
+    async def test_a_no_op_tagless_block_leaves_the_age_alone(self):
+        """`set_at` stays where `run.started` re-stamped it — the documented
+        age semantics."""
+        await self.reply("first")
+        stamped = self.state().set_at
+        await self.reply("second")
+        self.assertEqual(self.state().set_at, stamped)
+
+    async def test_an_explicit_tag_always_writes_even_when_identical(self):
+        """A re-declared `awaiting` must start a NEW episode."""
+        await self.reply('<state kind="awaiting" on="lead"/>')
+        first = self.state().set_at
+        self.bridge._nagged_levels["s1"] = {1}
+        saves = self.count_saves()
+        await self.reply('<state kind="awaiting" on="lead"/>')
+        self.assertEqual(len(saves), 1)
+        self.assertGreaterEqual(self.state().set_at, first)
+        self.assertNotIn("s1", self.bridge._nagged_levels)
+
+    async def test_a_tagless_block_for_a_stateless_session_writes_once(self):
+        self.bridge.mapping.set_state("s1", None)
+        saves = self.count_saves()
+        await self.reply("hello")
+        self.assertEqual(len(saves), 1)
+        self.assertEqual(self.state().kind, "idle")
+
+
 class StateApiTests(_F2TestCase):
     async def test_set_session_state_returns_the_previous_state(self):
         """R3: one entry point, and F3 needs exactly one call."""

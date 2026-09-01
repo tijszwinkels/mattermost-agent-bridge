@@ -80,6 +80,15 @@ state yet (it creates one). F3 asserts that a raising API must not swallow
 the warning post it still owes the channel; a non-raising API makes that
 trivially true.
 
+3.2.2 **A tagless block only writes when the claim changes** (lead condition
+C2). `set_session_state(..., restamp=False)` is a no-op when the stored
+`kind`/`on`/`note` already match, keeping `set_at` where `run.started` put it.
+`_apply_state_directive` runs per assistant text block and a chatty run emits
+one per tool narration; stamping `set_at=now` each time would make every block
+a full atomic rewrite of the state file, on a path with no throttle (the SSE
+cursor throttles its own writes at 2 s for exactly this reason). An EXPLICIT
+tag always writes — a re-declared `awaiting` must start a new episode.
+
 3.3 **A reply with no `<state/>` tag sets `idle`.** That is the zero-migration
 rule: today's agents emit no tag, so every turn ends idle, which is exactly
 today's (unmodelled) behaviour made explicit.
@@ -315,6 +324,10 @@ implementation. Every gate wait is bounded (F1's `_await_gate` pattern).
 | T26 | nag body carries the `bridge nag:` self-identifying prefix |
 | T27 | `on="<user>"` level 1 → own channel, mention, NO delivery call |
 | T28 | unknown `on` username → treated as `lead`, and the nag says so |
+| T29 | five tagless blocks in one run → at most one state-file write (C2) |
+| T30 | `awaiting` → tagless block still transitions to `idle`, writing once |
+| T31 | a no-op tagless block leaves `set_at` (and so the age) alone |
+| T32 | an explicit tag always writes, even when identical (new episode) |
 
 9.2 Full suite green at FINAL. Base at `24281c5`: **1135 passed, 1 skipped,
 52 subtests passed**.
