@@ -42,25 +42,6 @@ The bridge CLI resolves the current session id via four sources, in order: `CLAU
   The last tag in a reply wins; an unknown `kind` leaves your state alone and gets you a
   one-line reply naming the valid ones.
 
-- **Messages that arrived while you were working.** A post to your channel while your
-  turn is running is not delivered on arrival — the bridge holds it and hands you the whole
-  backlog as ONE turn when your run ends:
-
-  ```
-  [3 posts arrived while you were working — the newest governs]
-  14:02 tijs: can you also check the deploy logs?
-  14:07 bittern: R6 changed — cap is 50, not 20.
-  14:09 tijs: ignore the logs, the deploy was fine. Do R6.
-  [End of held posts]
-  ```
-
-  One `HH:MM username: body` line per post, oldest first. **Where they conflict the newest
-  wins** — that is what the header means, and the older lines are usually context rather
-  than instructions. A single held post arrives as one stamped line with no header and no
-  `[End of held posts]`. ⏳ on someone's post means the bridge is still holding it; ✅ means
-  it has reached you. `.stop` interrupts your run but KEEPS the backlog — you get it as one
-  cheap turn immediately after — while `.queue clear` is the way to actually drop it.
-
 - **Checking what is waiting before you commit to something.** `mm-bridge inbox
   [--channel <ref>] [--json]` prints the posts held for you but not yet delivered, or
   `(empty)`. Run it before freezing a FINAL, opening a PR, or any other step you can't take
