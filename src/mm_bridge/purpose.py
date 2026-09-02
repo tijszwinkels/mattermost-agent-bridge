@@ -64,6 +64,13 @@ def canonical_backend(name: str | None) -> str | None:
     ``"claude-code"`` / ``"claudecode"`` → ``"claude"``. Returns the input
     unchanged when it's falsy (None / empty). Unknown names pass through
     lowercased so callers can still use them (free-text tolerance).
+
+    WHY callers need this: agent-harness reports its own wire names
+    (``claude-code``), while Channel Purpose, `.backend` and every
+    operator-facing message speak the short form (``claude``). Anything
+    reading a backend off a harness record — `_backend_for_error`,
+    `_resume_meta_for` — must come through here so the channel never sees a
+    name the user can't type back.
     """
     if not name:
         return name
