@@ -716,12 +716,15 @@ contains the `@…/CLAUDE-include.md` import; and in a Claude Code session bound
    sidecar-dir writable). Sourcing `.env` gives your shell the same `MM_BOT_TOKEN` the
    daemon uses; this subsumes the old `curl localhost:8877/v1/health` check.
 2. In Mattermost, create a channel and `/invite @<bot>` (skip the invite if auto-join is on).
-3. Before posting a conversational message, use `.backend <name>`, `.model <name>` and/or
-   `.cwd <path>`; confirm no agent session starts yet.
+3. Before posting a conversational message, use `.backend <name>`, `.model <name>`,
+   `.effort <level>` and/or `.cwd <path>`; confirm no agent session starts yet.
 4. Post `@<bot> hello`. Within a few seconds you get a reply from a session using that configuration.
-5. Type `.status` → shows session id, backend, model, cwd, autorespond flag, harness status
-   (the cwd is whatever `.cwd` set, else `default_cwd`).
-6. Type `.help` → lists dot-commands (`.stop`, `.model`, `.cwd`, `.sessions`, `.autorespond`, …).
+5. Type `.status` → shows session id, backend, model, effort, cwd, autorespond flag, harness
+   status (the cwd is whatever `.cwd` set, else `default_cwd`; effort reads `default` when
+   unset).
+6. Type `.effort xhigh` → confirms without restarting the session (`.status` still shows the
+   same session id).
+7. Type `.help` → lists dot-commands (`.stop`, `.model`, `.cwd`, `.effort`, `.sessions`, `.autorespond`, …).
 
 **✅ Done** when a message to the bot produces a model reply and `.status` reports the
 harness as reachable.

@@ -91,6 +91,31 @@ of those roots: `.cwd` rejects an out-of-root path inline and names the roots, a
 out-of-root `cwd=` in the Purpose is dropped with a warning. `.status` shows what's in
 effect.
 
+### How hard the model thinks
+
+Three levers, all one setting:
+
+| Lever | Applies to | Where you set it |
+|---|---|---|
+| `mm-bridge spawn --effort <level>` | the one session being spawned | at spawn time |
+| `effort=<level>` in the **Channel Purpose** | that channel's sessions | Channel Menu → Edit Channel Purpose |
+| `.effort <level>` | that channel's sessions | typed in the channel |
+
+Levels are `low`, `medium`, `high`, `xhigh`, `max` — valid on all three backends (claude
+`--effort`, codex `-c model_reasoning_effort=`, pi `--thinking`). Unset means the flag is
+omitted entirely and the backend CLI applies its own default; `.status` shows `default`.
+
+The Purpose token is **keyed** (`effort=xhigh`, not a bare `xhigh`): the Purpose parser
+treats an unrecognised bare token as a model name, so a bare level would be sent to the
+harness as the model. An unknown level is rejected by the bridge rather than passed
+through — codex doesn't validate it locally, it forwards the value and the API fails
+mid-run.
+
+Unlike model, backend and directory, effort applies to a **live** session: the harness
+rebuilds the backend's argv on every run, so `.effort` patches the session in place and
+the level takes effect on your next message, conversation intact. No restart, no `.stop`
+first — even mid-run.
+
 ### In-channel dot-commands
 
 The **bridge** handles these itself — they bypass the mention gate and are never
@@ -101,10 +126,11 @@ forwarded to the agent. An unknown `.word` gets a "try `.help`" reply.
 | `.help` | List these commands. |
 | `.stop` | Interrupt the running turn in this channel. |
 | `.autorespond [on\|off]` | Reply to every message, or only when mentioned (bare = toggle). |
-| `.status` | Session id, backend, model, cwd, autorespond flag, run state, harness health. |
+| `.status` | Session id, backend, model, effort, cwd, autorespond flag, run state, harness health. |
 | `.model [<name>]` | Show or switch the model. Names are free text; a bad one fails loudly when the backend starts. |
 | `.backend [<name>]` | Show or switch the backend (`claude`, `codex`, `pi`, …). Switching **resets the model** to that backend's default. |
 | `.cwd [<path>]` | Show or set the working directory — see [above](#which-directory-a-session-starts-in). The path must be absolute (`~` is expanded), exist, and contain no comma; it's persisted as `cwd=<path>` in the Channel Purpose. |
+| `.effort [<level>]` | Show or set the reasoning level (`low`, `medium`, `high`, `xhigh`, `max`) — see [above](#how-hard-the-model-thinks). Applies from your next message; does **not** restart the session. |
 | `.models` | Models available for this channel's backend, current one marked. |
 | `.running` | Sessions with a run in flight right now. |
 | `.sessions [N]` | The N most recent sessions across all agents, including terminal ones. Each shows its channel or an `.invite` hint. |
@@ -113,7 +139,8 @@ forwarded to the agent. An unknown `.word` gets a "try `.help`" reply.
 | `.invite <session-id>` | Get added to a session's channel, creating it for unmapped/terminal sessions. |
 
 Switching model, backend or directory in an **active** channel recreates the session, so
-`.stop` a running turn first. Inside a **thread fork**, reading works but switching is
+`.stop` a running turn first. (`.effort` is the exception — it patches the live session,
+so it needs neither.) Inside a **thread fork**, reading works but switching is
 refused — a restart would replace the *channel's* session, not the thread's; switch from
 the channel. A switch is also refused when the bridge can't read the Channel Purpose
 (Mattermost unreachable) — the settings it *isn't* changing are stored there, so it would
@@ -251,6 +278,7 @@ mm-bridge spawn --title "Refactor the parser" --cwd ~/projects/foo --invite alic
 - `--title` — channel display name (default: derived from the prompt).
 - `--cwd` — working directory for the new session.
 - `--backend claude|codex|pi` and `--model <model>` — override the config defaults.
+- `--effort low|medium|high|xhigh|max` — reasoning level (default: the backend CLI's own).
 - `--invite <user>` — pull someone into the new channel.
 - `--no-forward-prompt` — don't echo the kickoff message into the parent channel.
 
