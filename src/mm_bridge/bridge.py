@@ -7,6 +7,7 @@ import logging
 import re
 import time
 from collections import deque
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 
@@ -14,6 +15,7 @@ from . import (
     attribution,
     commands,
     directives,
+    held_posts,
     name_sync,
     purpose,
     resume_header,
@@ -44,6 +46,30 @@ INVITE_PLACEHOLDER = (
 )
 
 MM_POST_MAX_LEN = 16000
+
+# Markers wrapping a coalesced flush of posts that arrived while the session
+# was working. Bracketed like ``_format_catch_up_block`` so the agent reads
+# one consistent "this is bridge-injected context, not a live user turn"
+# convention. A SINGLE held post is rendered bare (no markers): the header
+# would be noise when there is nothing to disambiguate, but the per-post
+# ``HH:MM username:`` stamp is always kept — staleness is the payload.
+HELD_BLOCK_HEADER = (
+    "[{n} posts arrived while you were working — the newest governs]"
+)
+HELD_BLOCK_FOOTER = "[End of held posts]"
+
+# Reaction placed on a post the bridge is holding, and the one that replaces
+# it on delivery. Mattermost emoji names: ⏳ and ✅.
+HELD_REACTION = "hourglass_flowing_sand"
+DELIVERED_REACTION = "white_check_mark"
+
+# Outcome of `Bridge._deliver_to_session`. The flush path needs more than a
+# bool: a TRANSIENT failure means "keep the posts held and retry on the next
+# trigger", while UNSUPPORTED is permanent — that session can never accept a
+# run, so retrying would strand them forever.
+DELIVERY_OK = "ok"
+DELIVERY_FAILED = "failed"
+DELIVERY_UNSUPPORTED = "unsupported"
 MM_DISPLAY_NAME_MAX = 64
 # Event types that unconditionally mean "the session is actively working" and
 # should (re)start the typing indicator. ``session.updated`` is NOT here: it is
@@ -504,6 +530,31 @@ class Bridge:
         # the run ends. Cleared on use, so a single completion event only
         # pings once, and on session teardown (see `*_forget_session`).
         self._session_triggerer: dict[str, str] = {}
+        # Posts held because the anchor's session already had a run in
+        # flight. Sibling of `_silent_drops` — same (channel_id, thread_root)
+        # key — but these WOULD have been forwarded: they are deferred, not
+        # dropped, and are delivered as ONE coalesced run when the live run
+        # reaches a terminal state. Persisted, because today an un-coalesced
+        # post lands in the harness FIFO and survives a bridge restart;
+        # holding it purely in memory would be a durability regression.
+        self._held = held_posts.HeldPostStore(
+            config.resolved_held_posts_file(), cap=config.coalesce_max_held,
+        )
+        # Anchors with a flush in progress. Posts arriving during a flush's
+        # awaits must be held rather than eagerly submitted, or their run
+        # would overtake the flush's own `create_run` and reorder the
+        # conversation.
+        self._flushing: set[Anchor] = set()
+        # Anchors whose session is being swapped — unlinked, and not yet
+        # relinked to the replacement. `mapping.get_session` reads None across
+        # that window, which the sweep would take as "session gone" and use to
+        # abandon the backlog. See `_anchor_relink_window`.
+        self._relinking: set[Anchor] = set()
+        # Monotonic timestamp of the last harness liveness probe per session,
+        # for the held-anchor sweep. Same rate-limit discipline as the typing
+        # watchdog (one probe per silence window), so a long-held anchor can't
+        # turn into a per-tick GET storm. Popped on flush and on teardown.
+        self._held_probe_ts: dict[str, float] = {}
         # Recently-sent backend message bodies, keyed by session_id. Used to
         # de-duplicate the role=user echo the harness broadcasts when the bridge
         # itself shipped the message (MM forwards, catch-up blocks,
@@ -541,6 +592,16 @@ class Bridge:
             logger.warning(
                 "resume-purpose: startup reconcile failed", exc_info=True,
             )
+
+        # Reload posts that were held when the daemon last stopped, and
+        # deliver the ones whose run has since finished. Runs after the
+        # bootstrap so the anchor→session mapping is populated, and before
+        # the listeners so a restart can't interleave a new post with the
+        # backlog it belongs behind.
+        try:
+            await self._rehydrate_held()
+        except Exception:
+            logger.exception("Failed to rehydrate held posts at startup")
 
         await asyncio.gather(
             self._run_mm_listener(),
@@ -809,6 +870,12 @@ class Bridge:
         while True:
             await asyncio.sleep(self.config.typing_refresh_seconds)
             await self._typing_watchdog_tick()
+            # Second phase, same task: reconcile anchors holding posts. The
+            # typing tick can't cover them — see `_sweep_held_anchors`.
+            try:
+                await self._sweep_held_anchors()
+            except Exception:
+                logger.exception("Held-anchor sweep iteration failed")
 
     async def _typing_watchdog_tick(self) -> None:
         """One watchdog pass over the typing sessions silent for longer than
@@ -855,6 +922,9 @@ class Bridge:
             await self.typing.stop(session_id)
             self.last_activity_ts.pop(session_id, None)
             self.active_run_by_session.pop(session_id, None)
+            # The run died without a terminal event reaching us, so nothing
+            # else will flush this session's held posts.
+            await self._maybe_flush_held_for_session(session_id)
 
     async def _active_run_is_alive(self, session_id: str) -> bool:
         """Ask the harness whether the session's tracked run is still in
@@ -1207,7 +1277,9 @@ class Bridge:
         self._awaiting_first_forward.discard(channel_id)
         self._pending_initial_catch_up.pop(channel_id, None)
         self._forget_channel_silent_drops(channel_id)
+        self._held.forget_channel(channel_id)
         if session_id:
+            self._held_probe_ts.pop(session_id, None)
             self._end_tool_use_run(session_id)
             self.posters.forget(session_id)
             self._session_triggerer.pop(session_id, None)
@@ -1522,56 +1594,66 @@ class Bridge:
         # against the same dead session. Per-session bookkeeping for the
         # old id is safe to drop now: even if replacement fails, the old
         # session is by definition unreachable from MM.
-        self.mapping.unlink(Anchor(channel_id))
-        self._end_tool_use_run(old_session_id)
-        self.posters.forget(old_session_id)
-        self._forget_channel_silent_drops(channel_id)
-        self._session_triggerer.pop(old_session_id, None)
-        self._recent_harness_sends.pop(old_session_id, None)
-        self._external_sessions.discard(old_session_id)
-        if self.typing:
-            await self.typing.stop(old_session_id)
-        try:
-            self.mm.post_message(
+        # Everything from here to the relink runs with the anchor
+        # session-less. Protect its held posts across that window BEFORE
+        # the first await, or the sweep abandons the backlog mid-adoption.
+        async with self._anchor_relink_window(Anchor(channel_id)):
+            self.mapping.unlink(Anchor(channel_id))
+            self._end_tool_use_run(old_session_id)
+            self.posters.forget(old_session_id)
+            self._forget_channel_silent_drops(channel_id)
+            self._session_triggerer.pop(old_session_id, None)
+            self._recent_harness_sends.pop(old_session_id, None)
+            self._external_sessions.discard(old_session_id)
+            if self.typing:
+                await self.typing.stop(old_session_id)
+            try:
+                self.mm.post_message(
+                    channel_id,
+                    ":arrows_counterclockwise: Previous session is no longer reachable from "
+                    "Mattermost. Starting a fresh session for this channel.",
+                )
+            except Exception:
+                logger.debug("Failed to post adoption notice", exc_info=True)
+            await self._start_invited_session(
                 channel_id,
-                ":arrows_counterclockwise: Previous session is no longer reachable from "
-                "Mattermost. Starting a fresh session for this channel.",
+                initial_message=message,
+                awaits_first_message=False,
+                post_welcome=False,
+                exclude_post_id=post.get("id"),
+                post=post,
             )
-        except Exception:
-            logger.debug("Failed to post adoption notice", exc_info=True)
-        await self._start_invited_session(
-            channel_id,
-            initial_message=message,
-            awaits_first_message=False,
-            post_welcome=False,
-            exclude_post_id=post.get("id"),
-            post=post,
-        )
 
-        # Commit the "old session is gone" state ONLY if the replacement
-        # actually produced a fresh mapping. ``_start_invited_session``
-        # logs+returns on harness/MM failure without raising and without
-        # linking; if we'd ``mark_adopted``'d the old id eagerly, the
-        # next bootstrap would skip auto-recovery for the still-mapped
-        # channel and the operator would have to surgically edit
-        # ``state.json`` to recover.
-        new_session_id = self.mapping.get_session(Anchor(channel_id))
-        if new_session_id and new_session_id != old_session_id:
-            self.mapping.mark_adopted(old_session_id)
-            # Stop the bootstrap recovery path from re-spawning a fresh
-            # channel for this session id on the next restart.
-            self._known_sessions.add(old_session_id)
-        else:
-            # Replacement failed — restore the old mapping so the next MM
-            # post re-enters this path and retries. ``_start_invited_session``
-            # has already posted a user-visible warning on its own error path.
-            self.mapping.link(Anchor(channel_id), old_session_id)
-            self._external_sessions.add(old_session_id)
-            logger.warning(
-                "Replacement of external session %s failed — restored old "
-                "mapping for retry on next MM post",
-                old_session_id[:12],
-            )
+            # Commit the "old session is gone" state ONLY if the replacement
+            # actually produced a fresh mapping. ``_start_invited_session``
+            # logs+returns on harness/MM failure without raising and without
+            # linking; if we'd ``mark_adopted``'d the old id eagerly, the
+            # next bootstrap would skip auto-recovery for the still-mapped
+            # channel and the operator would have to surgically edit
+            # ``state.json`` to recover.
+            new_session_id = self.mapping.get_session(Anchor(channel_id))
+            if new_session_id and new_session_id != old_session_id:
+                self.mapping.mark_adopted(old_session_id)
+                # Stop the bootstrap recovery path from re-spawning a fresh
+                # channel for this session id on the next restart.
+                self._known_sessions.add(old_session_id)
+            else:
+                # Replacement failed — restore the old mapping so the next MM
+                # post re-enters this path and retries. ``_start_invited_session``
+                # has already posted a user-visible warning on its own error path.
+                self.mapping.link(Anchor(channel_id), old_session_id)
+                self._external_sessions.add(old_session_id)
+                logger.warning(
+                    "Replacement of external session %s failed — restored old "
+                    "mapping for retry on next MM post",
+                    old_session_id[:12],
+                )
+
+        # The anchor is linked again — to the replacement, or restored to the
+        # old session. Either way it has an owner now, so deliver anything
+        # that was held across the swap.
+        if self.mapping.get_session(Anchor(channel_id)):
+            await self._flush_held(Anchor(channel_id))
 
     async def _restart_session_with_config(
         self,
@@ -1593,61 +1675,73 @@ class Bridge:
         ``:warning:`` is posted. Callers must not claim success on ``None``.
         """
         previous_cfg = self.purpose_by_channel.get(channel_id)
-        self.mapping.unlink(Anchor(channel_id))
-        self._end_tool_use_run(old_session_id)
-        self.posters.forget(old_session_id)
-        self._forget_channel_silent_drops(channel_id)
-        self._session_triggerer.pop(old_session_id, None)
-        self._recent_harness_sends.pop(old_session_id, None)
-        if self.typing:
-            await self.typing.stop(old_session_id)
-        effective_cwd = self._resolve_purpose_cwd(cfg)
+        # Same unlink -> await -> relink window as the adoption path: the
+        # anchor has no session across `typing.stop` and `create_session`,
+        # and `create_session` routinely outlives one sweep interval.
+        async with self._anchor_relink_window(Anchor(channel_id)):
+            self.mapping.unlink(Anchor(channel_id))
+            self._end_tool_use_run(old_session_id)
+            self.posters.forget(old_session_id)
+            self._forget_channel_silent_drops(channel_id)
+            self._session_triggerer.pop(old_session_id, None)
+            self._recent_harness_sends.pop(old_session_id, None)
+            if self.typing:
+                await self.typing.stop(old_session_id)
+            effective_cwd = self._resolve_purpose_cwd(cfg)
 
-        self.warming_up_sessions[channel_id] = WarmingUpChannel(channel_id)
-        self.purpose_by_channel[channel_id] = cfg
-        session_id: str | None = None
+            self.warming_up_sessions[channel_id] = WarmingUpChannel(channel_id)
+            self.purpose_by_channel[channel_id] = cfg
+            session_id: str | None = None
 
-        try:
-            session = await self.harness.create_session(
-                backend=cfg.backend,
-                model=self._resolve_session_model(cfg),
-                cwd=effective_cwd,
-            )
-            session_id = session.get("id")
-            if not session_id:
-                raise RuntimeError("agent-harness create_session response missing id")
-            self.mapping.link(Anchor(channel_id), session_id)
-            self._known_sessions.add(session_id)
-            # No greeting/warming run: a restart is triggered by `.model` /
-            # `.backend`, which post their own confirmation. Firing the
-            # INVITE_PLACEHOLDER prompt here would burn a run and post a
-            # spurious "Hi! I'm set up…" greeting. The next real user message
-            # becomes the new session's first run.
-            await self._update_resume_purpose(
-                channel_id, session_id, cfg.backend, effective_cwd,
-            )
-        except Exception as exc:
-            logger.exception("Failed to restart agent-harness session for %s", channel_id)
-            # Restore the prior mapping/config so the channel keeps talking to
-            # its old (still-live) session instead of being orphaned — a lost
-            # session would silently drop every subsequent message.
-            self.mapping.link(Anchor(channel_id), old_session_id)
-            if previous_cfg is not None:
-                self.purpose_by_channel[channel_id] = previous_cfg
-            else:
-                self.purpose_by_channel.pop(channel_id, None)
             try:
-                self.mm.post_message(
-                    channel_id,
-                    format_backend_error(
-                        "restart the session", cfg.backend, exception_detail(exc),
-                    ),
+                session = await self.harness.create_session(
+                    backend=cfg.backend,
+                    model=self._resolve_session_model(cfg),
+                    cwd=effective_cwd,
                 )
-            except Exception:
-                logger.debug("Failed to post session-restart error", exc_info=True)
-            session_id = None
-        finally:
-            queued = self.warming_up_sessions.pop(channel_id, None)
+                session_id = session.get("id")
+                if not session_id:
+                    raise RuntimeError("agent-harness create_session response missing id")
+                self.mapping.link(Anchor(channel_id), session_id)
+                self._known_sessions.add(session_id)
+                # No greeting/warming run: a restart is triggered by `.model` /
+                # `.backend`, which post their own confirmation. Firing the
+                # INVITE_PLACEHOLDER prompt here would burn a run and post a
+                # spurious "Hi! I'm set up…" greeting. The next real user message
+                # becomes the new session's first run.
+                await self._update_resume_purpose(
+                    channel_id, session_id, cfg.backend, effective_cwd,
+                )
+            except Exception as exc:
+                logger.exception("Failed to restart agent-harness session for %s", channel_id)
+                # Restore the prior mapping/config so the channel keeps talking to
+                # its old (still-live) session instead of being orphaned — a lost
+                # session would silently drop every subsequent message.
+                self.mapping.link(Anchor(channel_id), old_session_id)
+                if previous_cfg is not None:
+                    self.purpose_by_channel[channel_id] = previous_cfg
+                else:
+                    self.purpose_by_channel.pop(channel_id, None)
+                try:
+                    self.mm.post_message(
+                        channel_id,
+                        format_backend_error(
+                            "restart the session", cfg.backend, exception_detail(exc),
+                        ),
+                    )
+                except Exception:
+                    logger.debug("Failed to post session-restart error", exc_info=True)
+                session_id = None
+            finally:
+                queued = self.warming_up_sessions.pop(channel_id, None)
+        # Held posts predate the restart and are still buffered under this
+        # anchor. Now that it points at the replacement (or, on failure, back
+        # at the old session), deliver them there rather than waiting up to a
+        # sweep interval. Flushed BEFORE the warming queue because they are
+        # OLDER than anything that arrived during the restart — arrival order
+        # is what the coalesced turn promises.
+        if self.mapping.get_session(Anchor(channel_id)):
+            await self._flush_held(Anchor(channel_id))
         # On success, posts target the replacement. On failure, the old
         # mapping above was restored, so re-dispatch there instead of dropping
         # anything that arrived during the failed restart.
@@ -1953,6 +2047,21 @@ class Bridge:
             self._enqueue_silent_drop(channel_id, thread_root, post)
             return
 
+        # Hold rather than submit while this anchor's session is busy.
+        #
+        # Placed exactly here on purpose: AFTER the mention gate, because a
+        # mention-only drop is a *drop* and must still reach `_silent_drops`
+        # for the catch-up replay; and BEFORE the attachment download and the
+        # mention strip, because R3 puts the download at flush time — no point
+        # transferring a file for a post a later one supersedes.
+        anchor = Anchor(channel_id, thread_root)
+        if self._should_hold(anchor, session_id):
+            if await self._hold_post(anchor, session_id, post, message):
+                return
+            # Overflow (R6): the buffer is full, so fall through to the
+            # pre-coalescing path — an eager submit into the harness FIFO.
+            # Loud, never silent; `_hold_post` has already logged it.
+
         # Strip the @-mention so the agent doesn't see a stray handle.
         cleaned = self._strip_bot_mention(message)
 
@@ -1985,8 +2094,46 @@ class Bridge:
             notes_block = "\n".join(attachment_notes)
             body = f"{notes_block}\n\n{body}" if body else notes_block
 
+        await self._deliver_to_session(
+            channel_id, session_id, body,
+            thread_root=thread_root,
+            first_message=first_message,
+            exclude_post_id=post.get("id"),
+            requeue_on_failure=[post],
+        )
+
+    async def _deliver_to_session(
+        self,
+        channel_id: str,
+        session_id: str,
+        body: str,
+        *,
+        thread_root: str | None,
+        first_message: bool,
+        exclude_post_id: str | None,
+        requeue_on_failure: list[dict],
+    ) -> str:
+        """Prepend the pending context blocks to `body` and create the run.
+
+        Shared tail of the two ways a message reaches the agent: a live
+        forward (`_forward_user_post`) and a coalesced flush of held posts
+        (`_deliver_held`). Everything the agent expects around a turn —
+        the silent-drop catch-up block, the first-message preamble and its
+        rollback on failure — lives here so both paths behave identically.
+
+        Returns one of ``DELIVERY_OK`` / ``DELIVERY_FAILED`` /
+        ``DELIVERY_UNSUPPORTED``. The distinction matters to the flush path:
+        a transient failure means "keep the posts held and retry", while
+        ``DELIVERY_UNSUPPORTED`` is permanent (that session can never accept
+        a run) and retrying it forever would strand them.
+
+        `requeue_on_failure` is the list of posts to preserve as silent drops
+        if delivery fails — the live path passes the post it was forwarding,
+        the flush path passes nothing because its posts are already durably
+        buffered and requeueing would duplicate them.
+        """
         silent_block, silent_key = await self._peek_silent_drops_as_block(
-            channel_id, thread_root, session_id, exclude_post_id=post.get("id"),
+            channel_id, thread_root, session_id, exclude_post_id=exclude_post_id,
         )
         if silent_block:
             body = f"{silent_block}\n\n{body}" if body else silent_block
@@ -2010,10 +2157,9 @@ class Bridge:
             run = await self.harness.create_run(session_id, body)
             self._track_run_response(session_id, run)
         except HarnessResumeUnsupported:
-            if first_message:
-                self._awaiting_first_forward.add(channel_id)
-                if first_catch_up:
-                    self._pending_initial_catch_up[channel_id] = first_catch_up
+            self._restore_first_message_state(
+                channel_id, first_message, first_catch_up,
+            )
             logger.warning("agent-harness resume unsupported for %s", session_id[:8])
             try:
                 self.mm.post(
@@ -2023,12 +2169,13 @@ class Bridge:
                 )
             except Exception:
                 pass
-            self._enqueue_silent_drop(channel_id, thread_root, post)
+            for pending in requeue_on_failure:
+                self._enqueue_silent_drop(channel_id, thread_root, pending)
+            return DELIVERY_UNSUPPORTED
         except Exception as exc:
-            if first_message:
-                self._awaiting_first_forward.add(channel_id)
-                if first_catch_up:
-                    self._pending_initial_catch_up[channel_id] = first_catch_up
+            self._restore_first_message_state(
+                channel_id, first_message, first_catch_up,
+            )
             logger.exception("Failed to create run for harness session %s", session_id[:8])
             try:
                 self.mm.post(
@@ -2046,9 +2193,463 @@ class Bridge:
             # current post too: the user's actual request would
             # otherwise vanish with the failed send. The next mention
             # replays everything that wasn't delivered.
-            self._enqueue_silent_drop(channel_id, thread_root, post)
+            for pending in requeue_on_failure:
+                self._enqueue_silent_drop(channel_id, thread_root, pending)
+            return DELIVERY_FAILED
         else:
             self._clear_silent_drops(silent_key)
+            return DELIVERY_OK
+
+    def _restore_first_message_state(
+        self,
+        channel_id: str,
+        first_message: bool,
+        first_catch_up: str | None,
+    ) -> None:
+        """Put the first-forward slot back after a failed delivery, so the
+        next attempt still carries the MM-context preamble and catch-up."""
+        if not first_message:
+            return
+        self._awaiting_first_forward.add(channel_id)
+        if first_catch_up:
+            self._pending_initial_catch_up[channel_id] = first_catch_up
+
+    # ─────────────────────── Hold & coalesce ──────────────────────────────
+
+    def _should_hold(self, anchor: Anchor, session_id: str) -> bool:
+        """True when this post must wait rather than start its own run.
+
+        Every condition is synchronous so the caller can decide and enqueue
+        with no `await` in between. That atomicity is half of the race
+        closure: the terminal-event handler pops `active_run_by_session`
+        before *its* first await, so "checked live, but the flush had already
+        run" cannot interleave. The other half is the post-enqueue re-check in
+        `_hold_post` — atomicity says nothing about a tracker that is simply
+        stale because a lifecycle event never arrived.
+        """
+        if not self.config.coalesce_posts:
+            return False
+        if anchor in self._flushing:
+            # A flush is mid-loop for this anchor. Submitting now would race
+            # a run ahead of the flush's own `create_run` and reorder the
+            # conversation; the flush picks this post up on its next pass.
+            return True
+        return self._session_has_active_run(session_id)
+
+    async def _hold_post(
+        self,
+        anchor: Anchor,
+        session_id: str,
+        post: dict,
+        message: str,
+    ) -> bool:
+        """Buffer `post` for a later coalesced flush.
+
+        Returns True when held, False on overflow — the caller then falls
+        back to an eager submit (R6). The mention is stripped here rather
+        than at flush time so `.queue` and `mm-bridge inbox` show exactly the
+        text the agent will eventually receive.
+        """
+        stored = dict(post)
+        stored["message"] = self._strip_bot_mention(message)
+        held = held_posts.HeldPost(
+            post=stored,
+            username=self._resolve_username(post.get("user_id", "")),
+            held_at_ms=int(post.get("create_at") or 0),
+        )
+        # --- atomic span: no await between `_should_hold` and this append ---
+        accepted = self._held.add(anchor, held, session_id=session_id)
+        # --- end atomic span ---
+        if not accepted:
+            logger.warning(
+                "Hold buffer for %s is full (%d) — submitting post %s eagerly "
+                "instead; it will run behind the live turn in the harness "
+                "queue", anchor.channel_id, self.config.coalesce_max_held,
+                held.post_id[:8],
+            )
+            return False
+
+        logger.info(
+            "Holding post %s for %s — %d post(s) now waiting on the live run",
+            held.post_id[:8], session_id[:8], len(self._held.peek(anchor)),
+        )
+        await self._react_best_effort(held.post_id, HELD_REACTION, add=True)
+
+        if anchor in self._flushing:
+            # Held only because a flush is already looping; it will collect
+            # this post itself. Probing the harness here would be wasted.
+            return True
+
+        # The tracker said "live". Ask the harness whether that is still
+        # true: a lost terminal event, a harness restart or an SSE gap all
+        # leave the tracker asserting a run that is already gone, and then
+        # nothing would ever trigger a flush. One GET, paid only on the
+        # (rare) hold path. `_active_run_is_alive` returns False on every
+        # failure mode, so an unreachable harness flushes rather than
+        # strands — and a flush that then fails keeps the posts held.
+        self._held_probe_ts[session_id] = time.monotonic()
+        if not await self._active_run_is_alive(session_id):
+            logger.info(
+                "Held a post for %s but its run is no longer alive — "
+                "flushing immediately", session_id[:8],
+            )
+            await self._flush_held(anchor)
+        return True
+
+    @asynccontextmanager
+    async def _anchor_relink_window(self, anchor: Anchor):
+        """Protect `anchor`'s held posts while its session is being swapped.
+
+        `_restart_session_with_config` (`.model` / `.backend` / `.cwd`) and
+        `_replace_external_session` both unlink the anchor, then await —
+        `typing.stop`, then `create_session` — before linking the
+        replacement. Across that window `mapping.get_session(anchor)` is
+        None, and `_sweep_held_anchors` runs every `typing_refresh_seconds`
+        (3s by default). Without this marker the sweep reads the transient
+        None as "the session went away" and abandons the whole backlog —
+        loudly, so not a silent drop, but a drop. Session creation routinely
+        takes longer than one sweep interval, and `.model` while a run is in
+        flight is an ordinary operator move.
+
+        Entered BEFORE the unlink so no await after it can be unprotected.
+        Protecting slightly early is harmless: the anchor still points at its
+        old session, and the only effect is that a flush waits for the swap
+        to finish — which is what we want anyway, since the replacement is
+        the conversation's new owner.
+        """
+        self._relinking.add(anchor)
+        try:
+            yield
+        finally:
+            self._relinking.discard(anchor)
+
+    def _held_is_protected(self, anchor: Anchor) -> bool:
+        """True while `anchor`'s held posts must not be flushed or abandoned."""
+        return anchor in self._relinking
+
+    async def _maybe_flush_held_for_session(self, session_id: str) -> None:
+        """Flush the anchor bound to `session_id`, if it holds anything."""
+        anchor = self.mapping.get_anchor(session_id)
+        if anchor is None or not self._held.peek(anchor):
+            return
+        await self._flush_held(anchor)
+
+    async def _flush_held(self, anchor: Anchor) -> None:
+        """Deliver everything held for `anchor` as ONE coalesced run.
+
+        Loops rather than delivering once: posts that arrive during the
+        awaits of a delivery are held (see `_should_hold`) and must not be
+        left behind, since the terminal event that would have flushed them
+        has already been consumed.
+        """
+        if anchor in self._flushing:
+            return
+        self._flushing.add(anchor)
+        try:
+            while True:
+                held = self._held.peek(anchor)
+                if not held:
+                    return
+                if self._held_is_protected(anchor):
+                    # A session swap is in progress for this anchor, so
+                    # `get_session` is transiently None and the branch below
+                    # would read that as "session gone" and abandon the
+                    # backlog. Defer instead — the restart flushes to the
+                    # replacement once it relinks.
+                    #
+                    # Checked INSIDE the loop, not just on entry: a swap can
+                    # open while an earlier iteration is suspended in
+                    # `_deliver_held` (a `create_run` plus 2N reaction round
+                    # trips is seconds for a deep batch), and by then the
+                    # entry check is long past. Checking here covers entry
+                    # too — the first iteration runs immediately — so this is
+                    # the only guard needed, and every caller inherits it:
+                    # the terminal event, the watchdog, the post-enqueue
+                    # probe and the sweep alike.
+                    logger.debug(
+                        "Deferring flush for %s — session swap in progress",
+                        anchor.channel_id,
+                    )
+                    return
+                session_id = self.mapping.get_session(anchor)
+                if not session_id:
+                    await self._abandon_held(anchor, held)
+                    return
+                if not await self._deliver_held(anchor, session_id, held):
+                    return
+        finally:
+            self._flushing.discard(anchor)
+
+    async def _deliver_held(
+        self, anchor: Anchor, session_id: str, held: list[held_posts.HeldPost],
+    ) -> bool:
+        """Render and deliver one batch. True = keep looping.
+
+        The batch is only discarded once `create_run` has actually
+        succeeded, and then BY POST ID — not by dropping the anchor — so
+        that (a) a failed delivery leaves the buffer intact for the next
+        trigger to retry, and (b) posts that arrived during this delivery's
+        awaits survive to be sent by the next iteration.
+        """
+        channel_id = anchor.channel_id
+        cwd: str | None = None
+        if any(h.post.get("file_ids") for h in held):
+            try:
+                cwd = await self._project_path_for(session_id)
+            except Exception:
+                logger.exception(
+                    "project-path lookup failed while flushing held posts "
+                    "for %s", session_id[:8],
+                )
+                cwd = None
+
+        lines: list[str] = []
+        delivered_ids: set[str] = set()
+        last_user_id = ""
+        for h in held:
+            delivered_ids.add(h.post_id)
+            notes: list[str] = []
+            if h.post.get("file_ids"):
+                # Downloaded HERE, not at hold time: a post that a later one
+                # supersedes should never have cost a file transfer.
+                notes = (
+                    await self._save_mm_attachments(h.post, cwd) if cwd
+                    else ["[MM attachment skipped: no project path for session]"]
+                )
+            # Keep the poster tracker accurate even though held posts are
+            # attributed unconditionally — the next LIVE forward still asks
+            # it whether to prefix a username.
+            self.posters.note_post(session_id, h.user_id)
+            line = h.render(notes)
+            if not line:
+                continue
+            lines.append(line)
+            if h.user_id:
+                last_user_id = h.user_id
+
+        if not lines:
+            # Nothing renderable (e.g. a bare "@claude"). Drop them rather
+            # than sending an empty turn, and loop in case more arrived.
+            self._held.discard(anchor, delivered_ids)
+            return True
+
+        # The newest post governs, so its author is who's waiting on the
+        # answer and who `_mention_triggerer_on_done` should ping.
+        if last_user_id:
+            self._session_triggerer[session_id] = last_user_id
+
+        if len(lines) == 1:
+            body = lines[0]
+        else:
+            body = "\n".join([
+                HELD_BLOCK_HEADER.format(n=len(lines)),
+                *lines,
+                HELD_BLOCK_FOOTER,
+            ])
+
+        status = await self._deliver_to_session(
+            channel_id, session_id, body,
+            thread_root=anchor.root_id,
+            first_message=channel_id in self._awaiting_first_forward,
+            exclude_post_id=None,
+            requeue_on_failure=[],
+        )
+
+        if status == DELIVERY_OK:
+            self._held.discard(anchor, delivered_ids)
+            self._held_probe_ts.pop(session_id, None)
+            for h in held:
+                await self._react_best_effort(h.post_id, HELD_REACTION, add=False)
+                await self._react_best_effort(
+                    h.post_id, DELIVERED_REACTION, add=True,
+                )
+            return True
+
+        if status == DELIVERY_UNSUPPORTED:
+            # Permanent: this session can never accept a run, so retrying
+            # would strand the posts and re-post the warning on every sweep.
+            # Hand them to the silent-drop queue, where the next successful
+            # forward replays them verbatim as catch-up — exactly what the
+            # single-post path does today, applied to the whole batch.
+            #
+            # KNOWN DURABILITY DOWNGRADE: `_silent_drops` is in-memory, so a
+            # restart between here and that next forward loses them. Accepted
+            # because it matches today's contract for this exact failure, and
+            # because keep-held would either nag every sweep interval forever
+            # or need a new frozen-hold lifecycle. See spec requirements §3.10.
+            self._held.discard(anchor, delivered_ids)
+            if self.config.initial_catch_up_n > 0:
+                logger.warning(
+                    "Session %s can't accept runs — moving %d held post(s) to "
+                    "the catch-up queue", session_id[:8], len(held),
+                )
+                for h in held:
+                    self._enqueue_silent_drop(channel_id, anchor.root_id, h.post)
+                    await self._react_best_effort(
+                        h.post_id, HELD_REACTION, add=False,
+                    )
+            else:
+                # `initial_catch_up_n <= 0` disables the silent-drop queue,
+                # so there is nowhere to park them. Name them instead — a
+                # disabled catch-up must not turn a permanent delivery
+                # failure into a silent loss.
+                await self._announce_dropped_held(
+                    anchor, held,
+                    f"the session ({session_id[:8]}) can no longer accept "
+                    "messages",
+                )
+            return False
+
+        # Transient failure: keep them held. The next terminal event, probe
+        # or sweep retries, and the sweep is guaranteed to come around.
+        logger.warning(
+            "Flush of %d held post(s) for %s failed — keeping them buffered "
+            "for the next retry", len(held), session_id[:8],
+        )
+        return False
+
+    async def _abandon_held(
+        self, anchor: Anchor, held: list[held_posts.HeldPost],
+    ) -> None:
+        """Give up on an anchor whose session is gone — loudly, by name.
+
+        There is nobody left to deliver to and retrying forever would be a
+        silent strand, so the posts are dropped and the buffer cleared.
+        """
+        self._held.clear(anchor)
+        await self._announce_dropped_held(
+            anchor, held, "this channel's session went away",
+        )
+
+    async def _announce_dropped_held(
+        self, anchor: Anchor, held: list[held_posts.HeldPost], reason: str,
+    ) -> None:
+        """Report held posts that will never be delivered — by author and
+        timestamp, in the log AND in the channel.
+
+        The one rule the hold buffer must never break is "no silent drop", so
+        every path that gives up on a batch comes through here. Callers own
+        clearing the buffer; this only reports.
+        """
+        summary = ", ".join(
+            f"{h.timestamp()} {h.username}" for h in held
+        ) or "(none)"
+        logger.warning(
+            "Dropping %d held post(s) for %s%s — %s: %s",
+            len(held), anchor.channel_id,
+            f":{anchor.root_id[:8]}" if anchor.root_id else "",
+            reason, summary,
+        )
+        try:
+            self.mm.post(
+                anchor.channel_id,
+                f":warning: {len(held)} held message(s) could not be "
+                f"delivered because {reason}: {summary}.",
+                root_id=anchor.root_id,
+            )
+        except Exception:
+            logger.debug("Failed to post dropped-holds notice", exc_info=True)
+        # Through `_react_best_effort` like every other reaction: these are
+        # blocking HTTP calls, and clearing a 50-deep anchor inline would
+        # stall the event loop for the whole batch.
+        for h in held:
+            await self._react_best_effort(h.post_id, HELD_REACTION, add=False)
+
+    async def _announce_held_before_leaving(
+        self, anchor: Anchor, reason: str,
+    ) -> None:
+        """Name an anchor's held posts on the way out, if it has any.
+
+        Teardown forgets held posts silently, which is right for
+        `_on_mm_user_removed` (nobody left to tell) but wrong for a
+        deliberate `.leave`: the operator chose to drop a backlog and should
+        see whose messages went with it. No-op on an empty buffer, so an
+        ordinary leave stays quiet.
+        """
+        held = self._held.peek(anchor)
+        if held:
+            await self._announce_dropped_held(anchor, held, reason)
+
+    async def _sweep_held_anchors(self) -> None:
+        """Reconcile held anchors whose run lifecycle events went missing,
+        and retry flushes that failed.
+
+        Deliberately independent of the typing watchdog's sweep list. A
+        session whose `run.started` was lost never enters
+        `active_run_by_session`, so `_typing_watchdog_tick` takes its
+        silence-stop branch, cancels the typing loop, and the session leaves
+        `running_sessions()` *while its run is still alive* — after which a
+        typing-scoped sweep would never look at it again. For the same reason
+        there is no `if not self.typing` guard here: held posts must
+        reconcile even with no typing indicator at all.
+
+        Probe discipline mirrors the typing watchdog: at most one harness GET
+        per session per `typing_stop_after_silence_seconds`, and only while a
+        buffer is non-empty, so an idle daemon costs nothing.
+        """
+        if not len(self._held):
+            return
+        timeout = self.config.typing_stop_after_silence_seconds
+        now = time.monotonic()
+        for anchor in self._held.anchors():
+            if anchor in self._flushing:
+                continue  # a flush is already looping over this anchor
+            session_id = self.mapping.get_session(anchor)
+            if not session_id:
+                await self._flush_held(anchor)  # → `_abandon_held`
+                continue
+            last = self._held_probe_ts.get(session_id)
+            if last is not None and now - last <= timeout:
+                continue
+            self._held_probe_ts[session_id] = now
+            if not await self._active_run_is_alive(session_id):
+                logger.info(
+                    "Sweep found no live run for %s with held posts — "
+                    "flushing", session_id[:8],
+                )
+                await self._flush_held(anchor)
+
+    async def _rehydrate_held(self) -> None:
+        """Reload held posts from disk at startup and act on each anchor.
+
+        Today an un-coalesced post to a busy session sits in the harness
+        FIFO and survives a bridge restart, so holding it purely in memory
+        would be a durability regression. Reloading restores parity; probing
+        each anchor turns the restart into a *delivery* rather than a wait.
+        """
+        self._held.load()
+        for anchor in self._held.anchors():
+            session_id = self.mapping.get_session(anchor)
+            if not session_id:
+                await self._abandon_held(anchor, self._held.peek(anchor))
+                continue
+            if await self._active_run_is_alive(session_id):
+                logger.info(
+                    "Session %s still running after restart — keeping %d "
+                    "held post(s) buffered", session_id[:8],
+                    len(self._held.peek(anchor)),
+                )
+                continue
+            await self._flush_held(anchor)
+
+    async def _react_best_effort(
+        self, post_id: str, emoji_name: str, *, add: bool,
+    ) -> None:
+        """Add/remove a reaction, swallowing every failure.
+
+        Held-post visibility is a convenience; a Mattermost hiccup here must
+        never affect whether a message reaches the agent.
+        """
+        if not post_id:
+            return
+        call = self.mm.add_reaction if add else self.mm.remove_reaction
+        try:
+            await asyncio.to_thread(call, post_id, emoji_name)
+        except Exception:
+            logger.debug(
+                "Reaction %s %s on %s failed",
+                "add" if add else "remove", emoji_name, post_id, exc_info=True,
+            )
 
     def _resolve_username(self, user_id: str) -> str:
         try:
@@ -2540,6 +3141,10 @@ class Bridge:
             removed = self.mapping.unlink(Anchor(channel_id, thread_root))
             self.dead_threads.add((channel_id, thread_root))
             self._forget_thread_silent_drops(channel_id, thread_root)
+            await self._announce_held_before_leaving(
+                Anchor(channel_id, thread_root), "the bot left this thread",
+            )
+            self._held.forget_anchor(Anchor(channel_id, thread_root))
             if removed:
                 self._end_tool_use_run(removed)
                 self.posters.forget(removed)
@@ -2756,6 +3361,10 @@ class Bridge:
             await self._cmd_running(channel_id, thread_root)
         elif spec.name == "sessions":
             await self._cmd_sessions(channel_id, parsed.arg, thread_root)
+        elif spec.name == "queue":
+            await self._cmd_queue(
+                channel_id, session_id, parsed.arg, thread_root,
+            )
         elif spec.name == "invite":
             await self._cmd_invite(channel_id, post, parsed.arg, thread_root)
         else:  # registered but not wired — defensive, shouldn't happen
@@ -3184,6 +3793,64 @@ class Bridge:
             f":gear: Backend set to `{requested}` — session restarted "
             f"(model reset to the `{requested}` default). "
             "If the backend rejects it, the error will appear above.",
+            thread_root,
+        )
+
+    async def _cmd_queue(
+        self,
+        channel_id: str,
+        session_id: str | None,
+        arg: str | None,
+        thread_root: str | None,
+    ) -> None:
+        """`.queue [clear]` — inspect or drop the posts held for this anchor.
+
+        `.stop` deliberately leaves the buffer alone (interrupting a run and
+        discarding the backlog are different intents), so this is the
+        explicit escape hatch. A clear names what it dropped: an explicit
+        drop is still never a silent one.
+        """
+        anchor = Anchor(channel_id, thread_root)
+        held = self._held.peek(anchor)
+        wants_clear = (arg or "").strip().lower()
+        if wants_clear and wants_clear != "clear":
+            self._post_cmd_reply(
+                channel_id,
+                ":grey_question: Usage: `.queue` or `.queue clear`.",
+                thread_root,
+            )
+            return
+
+        if not held:
+            self._post_cmd_reply(
+                channel_id,
+                ":inbox_tray: Nothing held — the queue is empty.",
+                thread_root,
+            )
+            return
+
+        listing = "\n".join(f"• `{h.summary()}`" for h in held)
+        if not wants_clear:
+            self._post_cmd_reply(
+                channel_id,
+                f":hourglass_flowing_sand: **{len(held)} post(s) held** — "
+                f"they'll be delivered as one turn when the run "
+                f"finishes:\n{listing}",
+                thread_root,
+            )
+            return
+
+        dropped = self._held.clear(anchor)
+        for h in dropped:
+            await self._react_best_effort(h.post_id, HELD_REACTION, add=False)
+        logger.info(
+            "`.queue clear` dropped %d held post(s) in %s",
+            len(dropped), channel_id,
+        )
+        self._post_cmd_reply(
+            channel_id,
+            f":wastebasket: Dropped {len(dropped)} held post(s); they will "
+            f"NOT be delivered:\n{listing}",
             thread_root,
         )
 
@@ -3768,6 +4435,12 @@ class Bridge:
                 self.mm.post_message(channel_id, farewell)
             except Exception:
                 pass
+        # Leaving discards this channel's held posts. Name them first —
+        # "an explicit drop is still never a silent one" — and first is
+        # literal: after `remove_self_from_channel` we can't post here.
+        await self._announce_held_before_leaving(
+            Anchor(channel_id), "the bot left this channel",
+        )
         try:
             self.mm.remove_self_from_channel(channel_id)
         except Exception:
@@ -3784,6 +4457,8 @@ class Bridge:
         self._awaiting_first_forward.discard(channel_id)
         self._pending_initial_catch_up.pop(channel_id, None)
         self._forget_channel_silent_drops(channel_id)
+        self._held.forget_channel(channel_id)
+        self._held_probe_ts.pop(session_id, None)
         self._end_tool_use_run(session_id)
         self.posters.forget(session_id)
         self._session_triggerer.pop(session_id, None)
@@ -4308,6 +4983,7 @@ class Bridge:
                     pass
                 self.mapping.unlink(Anchor(channel_id, thread_root))
                 self._forget_thread_silent_drops(channel_id, thread_root)
+                self._held.forget_anchor(Anchor(channel_id, thread_root))
                 self.posters.forget(session_id)
                 self._session_triggerer.pop(session_id, None)
                 self._recent_harness_sends.pop(session_id, None)
@@ -4532,6 +5208,10 @@ class Bridge:
         if event_type == "run.failed":
             await self._surface_run_failure(session_id, data)
         self._mention_triggerer_on_done(session_id)
+        # The session is free again — deliver anything that arrived while it
+        # was working, as ONE coalesced turn. Placed AFTER the completion
+        # ping so that ping still belongs to the run that just ended.
+        await self._maybe_flush_held_for_session(session_id)
 
     async def _surface_run_failure(self, session_id: str, data: dict) -> None:
         """Post a channel-facing warning for a ``run.failed`` SSE event.

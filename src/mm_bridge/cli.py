@@ -5,6 +5,7 @@ Subcommands:
   - `invite <username>`     → invite a MM user to this session's channel
   - `channel`               → print this session's MM channel_id (debug)
   - `spawn <prompt>`        → start a sub-session in a new sibling channel
+  - `inbox`                 → print posts held for this session, not yet delivered
 
 A bare `mm-bridge` prints help and exits with status 1 — this is intentional
 so that a typo like `mm-bridge` (meaning to ask a question inside a channel)
@@ -33,6 +34,7 @@ from .agent_harness_client import AgentHarnessClient
 from .bridge import Bridge, resolve_attachment_path
 from .codex_session import find_active_codex_rollout_uuid, iter_session_ids_by_cwd
 from .config import Anchor, ChannelMapping, Config
+from .held_posts import HeldPostStore
 from .channel_ref import ChannelRef, ChannelRefError, parse_channel_ref
 from .mm_client import MattermostClient
 
@@ -1154,6 +1156,73 @@ def cmd_read(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_inbox(args: argparse.Namespace) -> int:
+    """Print the posts held for this session but not yet delivered to it.
+
+    The agent-facing half of hold-and-coalesce: a session that is about to
+    freeze a conclusion can ask whether anything arrived while it was
+    working, instead of finding out after the fact.
+
+    Read-only and best-effort **by contract**. The daemon owns the holds
+    file and may append between our read and our print, so the output is a
+    snapshot rather than a lock. Its writes are atomic (temp file +
+    ``os.replace``), so we can never read a half-written file — the worst
+    case is a snapshot that is one post stale. Every failure mode (missing
+    file, corrupt JSON, unknown schema) renders as ``(empty)``: an agent
+    checking its inbox must never be the thing that breaks.
+
+    With no ``--channel`` this touches Mattermost not at all — the username
+    is stored in each envelope at hold time precisely so this path needs no
+    bot token.
+    """
+    cfg = Config.load()
+
+    if args.channel:
+        try:
+            ref = _validate_channel_ref(cfg, args.channel)
+        except ChannelResolutionError as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            return 2
+        if ref is not None and ref.kind != "id":
+            # A slug or URL has to be resolved server-side, which is the one
+            # case where this command needs credentials.
+            _require_bot_token(cfg)
+            mm = _make_mm_client(cfg)
+            mm.login()
+            try:
+                anchor = _resolve_explicit_anchor(ref, cfg, mm)
+            except ChannelResolutionError as exc:
+                print(f"Error: {exc}", file=sys.stderr)
+                return 2
+        else:
+            anchor = Anchor(args.channel)
+    else:
+        try:
+            session_id = _current_session_id(cfg.sidecar_dir)
+            anchor = _resolve_anchor_from_session(cfg.sidecar_dir, session_id)
+        except NotInMattermostChannel as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            return 2
+
+    store = HeldPostStore(cfg.resolved_held_posts_file(), cap=1)
+    store.load()
+    held = store.peek(anchor)
+
+    if args.json:
+        print(json.dumps([h.to_json() for h in held], indent=2))
+        return 0
+
+    if not held:
+        print("(empty)")
+        return 0
+
+    where = anchor.channel_id + (f" (thread {anchor.root_id})" if anchor.root_id else "")
+    print(f"{len(held)} post(s) held for {where}, not yet delivered:")
+    for h in held:
+        print(f"  {h.summary()}")
+    return 0
+
+
 def cmd_spawn(args: argparse.Namespace) -> int:
     cfg = Config.load()
     _require_bot_token(cfg)
@@ -1622,6 +1691,31 @@ def _build_parser() -> argparse.ArgumentParser:
         "--no-bot", action="store_true", help="Exclude bot posts.",
     )
     p_read.set_defaults(func=cmd_read)
+
+    p_inbox = sub.add_parser(
+        "inbox",
+        help="Print posts held for this session but not yet delivered.",
+        description=(
+            "Posts that arrived while this session's agent was working are "
+            "held by the bridge and delivered as one turn when the run ends. "
+            "This prints what is currently waiting. Best-effort: the daemon "
+            "may append between the read and the print, so treat the output "
+            "as a snapshot."
+        ),
+    )
+    p_inbox.add_argument(
+        "--channel",
+        help=(
+            "Channel id, bare slug, channel URL or permalink URL. Defaults "
+            "to the current session's own anchor (channel or thread fork), "
+            "which needs no bot token."
+        ),
+    )
+    p_inbox.add_argument(
+        "--json", action="store_true",
+        help="Emit the raw held-post envelopes as JSON.",
+    )
+    p_inbox.set_defaults(func=cmd_inbox)
 
     p_spawn = sub.add_parser(
         "spawn",

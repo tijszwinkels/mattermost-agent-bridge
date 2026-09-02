@@ -60,6 +60,13 @@ class FakeMattermostClient:
     permanent_delete_disabled: bool = False
     # Channel-create failure simulation (used by retry-semantics tests):
     fail_create_channel: bool = False
+    # File ids passed to `download_file`, in call order. Lets a test assert
+    # WHEN a download happened — held posts must download at FLUSH time, not
+    # at hold time, so a superseded post never costs a transfer.
+    downloaded: list = field(default_factory=list)
+    # post_id → set of emoji names, mirroring the MM reactions API. Held
+    # posts get an hourglass, delivered ones a check mark.
+    reactions: dict = field(default_factory=dict)
     _post_counter: int = 0
     # Mirror of MattermostClient's own-post tracking — populated
     # whenever the fake creates or edits a post.
@@ -145,9 +152,19 @@ class FakeMattermostClient:
         return fid
 
     def download_file(self, file_id: str) -> bytes:
+        self.downloaded.append(file_id)
         if file_id in self.download_failures:
             raise RuntimeError(f"simulated download failure for {file_id}")
         return self.files_by_id.get(file_id, b"")
+
+    def get_file_info(self, file_id: str) -> dict:
+        return self.files_by_id.get(file_id) or {"id": file_id, "name": file_id}
+
+    def add_reaction(self, post_id: str, emoji_name: str) -> None:
+        self.reactions.setdefault(post_id, set()).add(emoji_name)
+
+    def remove_reaction(self, post_id: str, emoji_name: str) -> None:
+        self.reactions.setdefault(post_id, set()).discard(emoji_name)
 
     def get_max_file_size(self) -> int:
         return 50 * 1024 * 1024

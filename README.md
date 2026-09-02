@@ -89,6 +89,7 @@ forwarded to the agent. An unknown `.word` gets a "try `.help`" reply.
 | `.models` | Models available for this channel's backend, current one marked. |
 | `.running` | Sessions with a run in flight right now. |
 | `.sessions [N]` | The N most recent sessions across all agents, including terminal ones. Each shows its channel or an `.invite` hint. |
+| `.queue [clear]` | Show the posts held while the agent is working; `clear` drops them, naming who wrote them. |
 | `.invite <session-id>` | Get added to a session's channel, creating it for unmapped/terminal sessions. |
 
 Switching model, backend or directory in an **active** channel recreates the session, so
@@ -98,6 +99,41 @@ the channel. A switch is also refused when the bridge can't read the Channel Pur
 (Mattermost unreachable) — the settings it *isn't* changing are stored there, so it would
 have to guess them, and it couldn't write the result back either. `.autorespond` refuses
 for the same reason: it persists its flag into the same Purpose.
+
+### Messages that arrive while the agent is working
+
+A post to a busy session used to become its own harness run immediately. The harness
+queued it and later fired it as a full turn — however stale it had become, and with no way
+for the agent to know anything was waiting. Three follow-ups meant three full turns, the
+last one usually contradicting the first.
+
+The bridge now **holds** those posts and delivers them as **one** annotated turn when the
+run finishes:
+
+```
+[3 posts arrived while you were working — the newest governs]
+14:02 tijs: can you also check the deploy logs?
+14:07 bittern: R6 changed — cap is 50, not 20.
+14:09 tijs: ignore the logs, the deploy was fine. Do R6.
+[End of held posts]
+```
+
+Everything that short-circuits before a forward still does: dot-commands are answered
+immediately, an unmentioned post in a mention-only channel is still a silent drop, and a
+thread fork holds independently of its parent channel.
+
+- **Nothing is dropped silently.** Overflow past `coalesce_max_held` (default 50) falls
+  back to submitting eagerly and logs loudly; a batch that can never be delivered is named
+  — author and timestamp — in the channel.
+- **A failed delivery keeps the posts held** and is retried by the watchdog sweep, so a
+  harness that was down when the run ended doesn't cost you the backlog.
+- **Held posts survive a daemon restart** (`held_posts.json`), matching what the harness
+  queue used to give you.
+- **`.stop` does not drop the buffer.** Interrupting a run and discarding a backlog are
+  different intents; the interrupt just makes the backlog arrive as one cheap turn. Use
+  `.queue clear` to actually drop it.
+- **Held posts are marked ⏳ in the channel**, and ✅ once delivered.
+- Set `coalesce_posts = false` (or `MM_COALESCE_POSTS=0`) for exactly the old behaviour.
 The global listings (`.sessions`, `.running`, `.invite`) reveal operator-wide state, so in
 a dormant channel they need an explicit mention.
 
@@ -115,6 +151,7 @@ as the daemon. All of them accept `--channel <channel>` to target another channe
 | `mm-bridge channels [--title <kw>]` | List channels the bot can see, most recently active first. |
 | `mm-bridge post [--file <path>] "<msg>"` | Post a message (`-` reads the body from stdin). |
 | `mm-bridge read [-n N] [--since 1h]` | Print recent posts — how one agent reads another's channel. |
+| `mm-bridge inbox [--channel <ref>]` | Print posts held for this session but not yet delivered. Needs no bot token. |
 | `mm-bridge spawn "<prompt>"` | Start a sub-session in a new sibling channel. |
 
 ### `mm-bridge spawn`
@@ -266,12 +303,23 @@ url = "http://localhost:8877"
 | `MM_AUTO_JOIN` | Toggle `auto_join_public_channels` without editing TOML. |
 | `MM_BRIDGE_STATE` | Path to the state JSON. |
 | `MM_BRIDGE_SIDECAR_DIR` | Sidecar directory. |
+| `MM_BRIDGE_HELD_POSTS` | Path to the held-posts JSON (default: beside the state file). |
+| `MM_COALESCE_POSTS` | `0/false/no/off` to disable hold-and-coalesce (default on). |
+| `MM_COALESCE_MAX_HELD` | Per-anchor cap on held posts (default 50). |
 | `MM_BRIDGE_CONFIG` | Path to the TOML file. |
 
 ## Under the hood
 
-**State file** — the canonical `session ↔ Anchor(channel_id, root_id?)` map. JSON, v3
-schema; v2 is read transparently and re-emitted as v3 on the next save.
+**State file** — the canonical `session ↔ Anchor(channel_id, root_id?)` map. JSON, v5
+schema (v3 collapsed the mapping into `entries`, v4 added the SSE cursor, v5 the adopted
+session ids); v2 is read transparently and re-emitted as the current version on the next
+save.
+
+**Held-posts file** — `held_posts.json`, beside the state file. Posts that arrived while a
+session's run was in flight, waiting to be delivered as one coalesced turn. Written
+atomically (temp + rename) and only when the buffer changes, so `mm-bridge inbox` can read
+it concurrently without ever seeing a torn file. Deliberately *not* part of the state file:
+that one is rewritten on a 2-second throttle for the SSE cursor.
 
 **Sidecar dir** — one file per session (`~/.mm-bridge/sessions/<session_id>`) holding the
 channel id: one line for a channel session, two for a thread fork. `0700` directory,
