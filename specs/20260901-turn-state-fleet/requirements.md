@@ -103,7 +103,9 @@ re-stamp from §5.6 — the session reverts to what it last declared, aged from
 the run rather than from before it.
 
 3.5 Every state carries `set_at` (epoch seconds, wall clock — it must survive
-a restart) and `source`.
+a restart), `source`, and an optional `nag_after` (seconds, clamped; absent =
+a passive wait). `nag_after` is tolerated-when-absent on load, so a v6 row
+written before C3 reads as passive.
 
 3.6 State is **per session**, so a thread-fork session has its own state,
 its own fleet row and its own nag (R9).
@@ -138,8 +140,40 @@ against a state that changed while the daemon was down.
 
 ## 5. The nag (C, R5/R6)
 
-5.1 **Trigger.** A session whose state is `awaiting`, with **no active run**,
-whose `set_at` is older than `awaiting_nag_after_seconds` (default 1800).
+5.1 **Trigger (C3 — opt-in per wait, Tijs's ruling).** A session whose state
+is `awaiting`, **with a `nag_after` it explicitly asked for**, with no active
+run, whose `set_at` is older than that delay.
+
+5.1.1 `awaiting` alone is **passive**: a fleet row and nothing else, at any
+age. Waking an agent is the most intrusive act available to the bridge, so
+nothing implies it — `nag="<duration>"` on the `<state/>` tag is the only
+thing that schedules one.
+
+5.1.2 Duration grammar: `<int>[s|m|h]`, a bare integer meaning seconds.
+Unparseable, negative or zero → the state still applies, the nag is ignored,
+and a one-line channel notice says so (the unknown-kind pattern). A `nag` on
+any kind other than `awaiting` is dropped with a debug log and no notice —
+it is meaningless rather than wrong.
+
+5.1.3 The requested delay is clamped into `nag_min_seconds` (default 900) /
+`nag_max_seconds` (default 14400), **at declaration time**, so the stored
+value is the one that will actually be used: a row that says 1200 rings at
+1200. Clamping is logged at info.
+
+5.1.4 **`awaiting_nag_after_seconds` is RETIRED** [decision]. With no default
+nag there is no global threshold to configure, and keeping the name as a
+ceiling would duplicate `nag_max_seconds` under a name that promises
+something else. No deprecation shim: the key never shipped — F2 is unmerged,
+so no operator config can contain it.
+
+5.1.5 **Target opt-out.** A `no-nag` token in a channel's Purpose means no
+nag is ever placed in that channel — neither the post nor the turn — logged
+at info. It protects the channel it is written in, not the wait: opting a
+child channel out does not silence nags its wait sends to the parent. The
+level is still marked fired, so an opted-out target neither re-attempts every
+tick nor breaks the escalation schedule. Unreadable Purpose → fail open
+(ring) with a warning: the wait was explicitly opted into, so a transient MM
+error must not silently disable it.
 
 5.2 **Target.** The *parent* channel — the channel whose slug appears in this
 session's channel header as `Parent: ~<slug>~` (the header
@@ -162,7 +196,7 @@ route it through the same busy/idle decision a user post takes —
 coalescing folds it into the next flush), else `_deliver_to_session()`. The
 self-post suppression is **not weakened**; see `design.md` §3.
 
-5.5 **Escalation and placement.** At `2 ×` the threshold, ONE further post.
+5.5 **Escalation and placement.** At `2 ×` the requested delay, ONE further post.
 Placement depends on **who** is waited on (lead ruling on Q2):
 
 | `on` | Level 1 | Level 2 |
@@ -201,8 +235,8 @@ channel root — not into the thread, where only the forked session is looking.
 * at most **one nag post per watchdog tick** (`typing_refresh_seconds`, 3s
   default) across the entire fleet — a fleet of 40 overdue sessions drains at
   one doorbell per tick, never a burst;
-* `nag_enabled = false` (or `MM_NAG_ENABLED=0`) → no nag ever; A and B
-  unaffected;
+* `nag_enabled = false` (or `MM_NAG_ENABLED=0`) → nag requests are ignored
+  wholesale; A and B unaffected;
 * a nag is never sent to a session that has an active run *at delivery time*
   without going through the hold path (5.4), so it can never jump a queue.
 
@@ -325,6 +359,17 @@ implementation. Every gate wait is bounded (F1's `_await_gate` pattern).
 | T27 | `on="<user>"` level 1 → own channel, mention, NO delivery call |
 | T28 | unknown `on` username → treated as `lead`, and the nag says so |
 | T29 | five tagless blocks in one run → at most one state-file write (C2) |
+| T33 | an `awaiting` with no `nag` attribute never rings, at any age (C3) |
+| T34 | a passive wait still renders in `.fleet` |
+| T35 | duration grammar: bare int, `s`, `m`, `h`, surrounding space |
+| T36 | the delay is clamped at both bounds |
+| T37 | unusable duration → state applies, notice posted, no nag |
+| T38 | `nag` on a non-`awaiting` kind → ignored, no notice |
+| T39 | escalation at 2× the REQUESTED delay |
+| T40 | `nag_after` survives a restart and a `run.started` re-stamp |
+| T41 | `no-nag` on the target → neither post nor turn; level still marked |
+| T42 | `no-nag` on the child does not silence the parent |
+| T43 | `no-nag` parses, round-trips through `to_purpose_string`, and is scannable without a model catalog |
 | T30 | `awaiting` → tagless block still transitions to `idle`, writing once |
 | T31 | a no-op tagless block leaves `set_at` (and so the age) alone |
 | T32 | an explicit tag always writes, even when identical (new episode) |

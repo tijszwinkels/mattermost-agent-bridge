@@ -30,6 +30,7 @@ Spec: specs/20260901-turn-state-fleet/design.md §1 and §5.3.
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass
 from typing import Any
 
@@ -59,6 +60,12 @@ class SessionState:
     note: str | None = None
     set_at: float = 0.0
     source: str = "agent"  # "agent" | "bridge" (F3 sets `blocked`)
+    # Seconds this wait asked to be rung after, or None for a PASSIVE wait.
+    # None is the default and the overwhelmingly common case: `awaiting`
+    # produces a fleet row and nothing else unless the agent explicitly
+    # asked for a doorbell with `nag="45m"`. Waking an agent is the most
+    # intrusive thing the bridge can do, so it is never implied.
+    nag_after: float | None = None
 
     def describe(self) -> str:
         """The state column: ``awaiting → lead``, ``idle``, ``blocked``.
@@ -89,6 +96,8 @@ class SessionState:
             out["on"] = self.on
         if self.note:
             out["note"] = self.note
+        if self.nag_after:
+            out["nag_after"] = self.nag_after
         return out
 
     @classmethod
@@ -111,13 +120,47 @@ class SessionState:
         on = raw.get("on")
         note = raw.get("note")
         source = raw.get("source")
+        nag_after = raw.get("nag_after")
+        if not isinstance(nag_after, (int, float)) or isinstance(nag_after, bool):
+            # Absent (a v6 row written before C3, or a passive wait) or junk.
+            # Never fatal: a bad duration costs the doorbell, not the state.
+            nag_after = None
+        elif nag_after <= 0:
+            nag_after = None
         return cls(
             kind=kind,
             on=on if isinstance(on, str) and on else None,
             note=note if isinstance(note, str) and note else None,
             set_at=float(set_at),
             source=source if isinstance(source, str) and source else "agent",
+            nag_after=float(nag_after) if nag_after else None,
         )
+
+
+# `<int>[s|m|h]`, bare integer = seconds. Deliberately strict: a typo must
+# be REFUSED and reported, never silently reinterpreted, because the value
+# decides when a human or an agent gets woken.
+_DURATION_RE = re.compile(r"^(\d+)\s*([smh]?)$", re.IGNORECASE)
+_DURATION_UNITS = {"": 1, "s": 1, "m": 60, "h": 3600}
+
+
+def parse_nag_duration(text: str | None) -> float | None:
+    """Parse a `nag="45m"` attribute into seconds, or None if unusable.
+
+    None covers every rejection — unparseable, negative (the regex refuses
+    the sign), and zero — because they all mean the same thing to the
+    caller: apply the state, ignore the nag, tell the agent.
+    """
+    m = _DURATION_RE.match((text or "").strip())
+    if not m:
+        return None
+    seconds = int(m.group(1)) * _DURATION_UNITS[m.group(2).lower()]
+    return float(seconds) if seconds > 0 else None
+
+
+def clamp_nag_duration(seconds: float, lo: float, hi: float) -> float:
+    """Hold a requested delay inside the operator's bounds."""
+    return max(lo, min(hi, seconds))
 
 
 def humanise_age(seconds: float | None) -> str:

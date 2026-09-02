@@ -477,7 +477,7 @@ class FleetProbeTests(_FleetTestCase):
 class _NagTestCase(_F2TestCase):
     """A lead channel `c1` (session `s-lead`) with one spawned child."""
 
-    THRESHOLD = 1800.0
+    THRESHOLD = 1800.0   # the delay these waits REQUEST via `nag="30m"`
 
     async def asyncSetUp(self):  # type: ignore[override]
         await super().asyncSetUp()
@@ -497,9 +497,14 @@ class _NagTestCase(_F2TestCase):
         self.bridge.mm.usernames = {"tijs"}
 
     def awaiting(self, session_id="s-kestrel", *, ago: float, on="lead",
-                 note="M0 gate") -> None:
+                 note="M0 gate", nag_after: float | None = -1) -> None:
+        """An `awaiting` state. `nag_after=None` is a PASSIVE wait (C3): a
+        fleet row and nothing else."""
+        if nag_after == -1:
+            nag_after = self.THRESHOLD
         self.bridge.mapping.set_state(session_id, SessionState(
             "awaiting", on=on, note=note, set_at=time.time() - ago,
+            nag_after=nag_after,
         ))
 
     async def sweep(self) -> None:
@@ -558,6 +563,7 @@ class NagThresholdTests(_NagTestCase):
             with self.subTest(kind=kind):
                 self.bridge.mapping.set_state("s-kestrel", SessionState(
                     kind, set_at=time.time() - self.THRESHOLD * 3,
+                    nag_after=self.THRESHOLD,
                 ))
                 self.bridge._nagged_levels.clear()
                 await self.sweep()
@@ -706,6 +712,7 @@ class NagBoundingTests(_NagTestCase):
         bridge.mapping.link(Anchor("c-kestrel"), "s-kestrel")
         bridge.mapping.set_state("s-kestrel", SessionState(
             "awaiting", on="lead", set_at=time.time() - self.THRESHOLD * 5,
+            nag_after=self.THRESHOLD,   # asked to ring; the kill switch wins
         ))
         await bridge._sweep_awaiting_nags()
         self.assertEqual(
@@ -717,18 +724,16 @@ class NagBoundingTests(_NagTestCase):
         )
         self.assertEqual(bridge.mapping.get_state("s-kestrel").kind, "parked")
 
-    async def test_a_configured_threshold_is_honoured(self):
-        bridge = self.make_bridge(awaiting_nag_after_seconds=60)
-        bridge.mm.channels.update(self.bridge.mm.channels)
-        bridge.mapping.link(Anchor("c1"), "s-lead")
-        bridge.mapping.link(Anchor("c-kestrel"), "s-kestrel")
-        bridge.mapping.set_state("s-kestrel", SessionState(
-            "awaiting", on="lead", set_at=time.time() - 90,
-        ))
-        await bridge._sweep_awaiting_nags()
-        self.assertEqual(
-            len([p for p in bridge.mm.posted if "bridge nag" in p.message]), 1,
-        )
+    async def test_each_wait_rings_at_its_own_requested_delay(self):
+        """C3: there is no global threshold any more — the wait asks."""
+        self.awaiting("s-kestrel", ago=1000, nag_after=900)
+        await self.sweep()
+        self.assertEqual(len(self.nags()), 1)
+
+    async def test_a_wait_that_asked_for_longer_stays_quiet(self):
+        self.awaiting("s-kestrel", ago=1000, nag_after=3600)
+        await self.sweep()
+        self.assertEqual(self.nags(), [])
 
     async def test_without_an_operator_the_last_human_in_the_channel_is_rung(self):
         """An escalation that mentions nobody notifies nobody."""
@@ -743,6 +748,7 @@ class NagBoundingTests(_NagTestCase):
         bridge.mapping.link(Anchor("c-kestrel"), "s-kestrel")
         bridge.mapping.set_state("s-kestrel", SessionState(
             "awaiting", on="lead", set_at=time.time() - self.THRESHOLD * 2 - 10,
+            nag_after=self.THRESHOLD,
         ))
         await bridge._sweep_awaiting_nags()
         nags = [p.message for p in bridge.mm.posted if "bridge nag" in p.message]
@@ -799,3 +805,156 @@ class NagSweepWiringTests(_NagTestCase):
             self.assertFalse(task.done())
         finally:
             task.cancel()
+
+
+# ─────────────── C3: the nag is opt-in, per wait (Tijs's ruling) ─────────────
+
+
+class OptInNagTests(_NagTestCase):
+    """The conservative default: `awaiting` is PASSIVE.
+
+    A wait rings only if it asked to, with `nag="<duration>"`. Nothing else
+    in the system may cause an agent to be woken.
+    """
+
+    async def test_an_awaiting_with_no_nag_attribute_never_rings(self):
+        for ago in (self.THRESHOLD + 10, self.THRESHOLD * 4, 86_400):
+            with self.subTest(ago=ago):
+                self.awaiting(ago=ago, nag_after=None)
+                self.bridge._nagged_levels.clear()
+                await self.sweep()
+                self.assertEqual(self.nags(), [], "a passive wait must not ring")
+
+    async def test_a_passive_wait_still_shows_in_the_fleet(self):
+        """Passive means "no post", not "invisible"."""
+        self.bridge.mm.channels["c-kestrel"]["header"] = "Parent: ~lead~"
+        self.awaiting(ago=self.THRESHOLD + 10, nag_after=None)
+        await self.bridge._cmd_fleet("c1", None, None)
+        out = self.bridge.mm.posted[-1].message
+        self.assertIn("awaiting → lead", out)
+
+    async def test_the_tag_requests_a_nag(self):
+        await self.reply(
+            '<state kind="awaiting" on="lead" note="M0" nag="45m" />',
+            session_id="s-kestrel", channel_id="c-kestrel",
+        )
+        s = self.bridge.mapping.get_state("s-kestrel")
+        assert s is not None
+        self.assertEqual(s.nag_after, 45 * 60)
+
+    async def test_duration_grammar(self):
+        cases = {"90": 900, "1200": 1200, "45m": 2700, "2h": 7200,
+                 "3600s": 3600, "  30m  ": 1800}
+        for text, expected in cases.items():
+            with self.subTest(text=text):
+                await self.reply(
+                    f'<state kind="awaiting" on="lead" nag="{text}" />',
+                    session_id="s-kestrel", channel_id="c-kestrel",
+                )
+                self.assertEqual(
+                    self.bridge.mapping.get_state("s-kestrel").nag_after, expected,
+                )
+
+    async def test_the_delay_is_clamped_both_ways(self):
+        bridge = self.make_bridge(nag_min_seconds=900, nag_max_seconds=14400)
+        bridge.mapping.link(Anchor("c-kestrel"), "s-kestrel")
+        for text, expected in (("30s", 900), ("99h", 14400)):
+            with self.subTest(text=text):
+                await bridge._handle_assistant_text_block(
+                    "s-kestrel", "c-kestrel", None,
+                    f'<state kind="awaiting" on="lead" nag="{text}" />',
+                )
+                self.assertEqual(
+                    bridge.mapping.get_state("s-kestrel").nag_after, expected,
+                )
+
+    async def test_an_invalid_duration_keeps_the_state_and_says_so(self):
+        await self.reply(
+            'M0 done\n<state kind="awaiting" on="lead" nag="soonish" />',
+            session_id="s-kestrel", channel_id="c-kestrel",
+        )
+        s = self.bridge.mapping.get_state("s-kestrel")
+        assert s is not None
+        self.assertEqual(s.kind, "awaiting", "the state still applies")
+        self.assertIsNone(s.nag_after, "but the nag is ignored")
+        joined = "\n".join(self.messages(channel_id="c-kestrel"))
+        self.assertIn("soonish", joined)
+        self.assertIn("M0 done", joined)
+
+    async def test_a_non_positive_duration_is_refused(self):
+        for text in ("0", "-5m"):
+            with self.subTest(text=text):
+                await self.reply(
+                    f'<state kind="awaiting" on="lead" nag="{text}" />',
+                    session_id="s-kestrel", channel_id="c-kestrel",
+                )
+                self.assertIsNone(
+                    self.bridge.mapping.get_state("s-kestrel").nag_after,
+                )
+
+    async def test_nag_on_a_non_awaiting_kind_is_ignored_quietly(self):
+        await self.reply(
+            '<state kind="parked" nag="30m" />',
+            session_id="s-kestrel", channel_id="c-kestrel",
+        )
+        s = self.bridge.mapping.get_state("s-kestrel")
+        assert s is not None
+        self.assertEqual(s.kind, "parked")
+        self.assertIsNone(s.nag_after)
+        self.assertEqual(self.messages(channel_id="c-kestrel"), [],
+                         "a debug log, not a channel notice")
+
+    async def test_escalation_is_twice_the_REQUESTED_delay(self):
+        self.awaiting(ago=1000, nag_after=900)      # level 1 due, not level 2
+        await self.sweep()
+        self.assertNotIn("@tijs", self.nags()[0])
+        self.awaiting(ago=1900, nag_after=900)      # now past 2x
+        self.bridge._nagged_levels["s-kestrel"] = {1}
+        await self.sweep()
+        self.assertIn("@tijs", self.nags()[1])
+
+    async def test_the_requested_delay_survives_a_restart(self):
+        self.awaiting(ago=10, nag_after=1200)
+        revived = self.make_bridge()
+        s = revived.mapping.get_state("s-kestrel")
+        assert s is not None
+        self.assertEqual(s.nag_after, 1200)
+
+    async def test_a_run_restamp_keeps_the_request(self):
+        self.awaiting(ago=self.THRESHOLD, nag_after=1200)
+        await self.bridge._on_harness_event(
+            "run.started", {"data": {"session_id": "s-kestrel", "run_id": "r1"}},
+        )
+        self.assertEqual(
+            self.bridge.mapping.get_state("s-kestrel").nag_after, 1200,
+        )
+
+
+class NagOptOutTests(_NagTestCase):
+    """`no-nag` in a channel's Purpose: nothing may be placed there."""
+
+    async def test_a_no_nag_parent_receives_neither_post_nor_turn(self):
+        self.bridge.mm.channels["c1"]["purpose"] = "claude, autorespond, no-nag"
+        self.awaiting(ago=self.THRESHOLD + 10)
+        await self.sweep()
+        self.assertEqual(self.nags(), [])
+        self.assertEqual(self.delivered(), [])
+
+    async def test_a_no_nag_child_channel_blocks_a_named_humans_level_1(self):
+        self.bridge.mm.channels["c-kestrel"]["purpose"] = "claude, no-nag"
+        self.awaiting(ago=self.THRESHOLD + 10, on="tijs")
+        await self.sweep()
+        self.assertEqual(self.nags(), [])
+
+    async def test_opting_the_child_out_does_not_silence_its_parent(self):
+        """The token protects the channel it is in, not the wait."""
+        self.bridge.mm.channels["c-kestrel"]["purpose"] = "claude, no-nag"
+        self.awaiting(ago=self.THRESHOLD + 10, on="lead")
+        await self.sweep()
+        self.assertEqual(len(self.nags(channel_id="c1")), 1)
+
+    async def test_the_level_is_still_marked_so_it_escalates_normally(self):
+        self.bridge.mm.channels["c1"]["purpose"] = "no-nag"
+        self.awaiting(ago=self.THRESHOLD + 10)
+        await self.sweep()
+        self.assertEqual(self.bridge._nagged_levels.get("s-kestrel"), {1})

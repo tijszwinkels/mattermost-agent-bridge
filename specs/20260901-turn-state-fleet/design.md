@@ -339,8 +339,14 @@ starved by a newer one.
 | Key | Default | Env |
 | --- | --- | --- |
 | `nag_enabled` | `true` | `MM_NAG_ENABLED` |
-| `awaiting_nag_after_seconds` | `1800` | `MM_AWAITING_NAG_AFTER_SECONDS` |
+| `nag_min_seconds` | `900` | `MM_NAG_MIN_SECONDS` |
+| `nag_max_seconds` | `14400` | `MM_NAG_MAX_SECONDS` |
 | `operator_username` | `""` | `MM_OPERATOR_USERNAME` |
+
+`awaiting_nag_after_seconds` was retired by C3: with no default nag there is
+no global threshold, and reusing the name as a ceiling would duplicate
+`nag_max_seconds` under a name that promises a trigger. It never shipped
+(F2 was unmerged when C3 landed), so no shim is owed.
 
 Added to `_apply_toml`'s key list and to the env overlay, following
 `coalesce_max_held`'s precedent: a non-numeric threshold logs a warning and

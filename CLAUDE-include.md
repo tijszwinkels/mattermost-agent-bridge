@@ -21,12 +21,26 @@ The bridge CLI resolves the current session id via four sources, in order: `CLAU
   quota, a broken dependency, a failing service). `on` names who you are waiting on —
   `lead`, or a Mattermost username. `note` is a few words on what you are waiting for.
 
-  Why it matters: `awaiting` is the only claim the bridge acts on. A session that stays
-  `awaiting` past the nag threshold (30 min by default) causes ONE post into its parent
-  channel — and a post IS a turn, so it wakes the party that forgot. At twice the threshold
-  it escalates with an @-mention. So use `awaiting` when someone genuinely owes you an
-  answer, and `parked` when nobody does. The last tag in a reply wins; an unknown `kind`
-  leaves your state alone and gets you a one-line reply naming the valid ones.
+  **`awaiting` is passive by default** — it shows in `.fleet` and nothing else happens. If
+  you want to be *chased*, ask for it explicitly:
+
+  ```
+  <state kind="awaiting" on="lead" note="M0 gate" nag="45m" />
+  ```
+
+  That schedules ONE post into your parent channel after 45 minutes — and a post IS a turn,
+  so it wakes the party that forgot — plus one escalation with an @-mention at 90. Duration
+  is `<int>[s|m|h]` (a bare integer is seconds), clamped by the operator into
+  `nag_min_seconds`…`nag_max_seconds` (15 min … 4 h by default). An unusable duration
+  applies the state and tells you it ignored the nag. `nag` on any kind other than
+  `awaiting` is ignored.
+
+  Ask for a nag when someone genuinely owes you an answer and the round stalls without it;
+  leave it off for anything you can pick up later yourself. A channel whose Purpose contains
+  `no-nag` never receives one, so don't rely on it as the only way you'll be noticed.
+
+  The last tag in a reply wins; an unknown `kind` leaves your state alone and gets you a
+  one-line reply naming the valid ones.
 
 - **Seeing what your children are doing.** `.fleet` (in-channel) or `mm-bridge fleet`
   (CLI, `--all`, `--json`) prints one row per channel you spawned: its declared state, how

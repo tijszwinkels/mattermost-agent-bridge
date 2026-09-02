@@ -44,7 +44,9 @@ from .agent_harness_client import (
 from .config import Anchor, ChannelMapping, Config
 from .session_state import (
     DEFAULT_KIND,
+    clamp_nag_duration,
     humanise_age,
+    parse_nag_duration,
     KINDS,
     FleetRow,
     SessionState,
@@ -3795,8 +3797,14 @@ class Bridge:
 
         The whole feature rests on one asymmetry: an agent cannot wake itself
         after 30 minutes of silence, but the bridge is always awake and *a
-        post into a channel is a turn*. So a stale `awaiting` becomes a post
-        that wakes the party that forgot.
+        post into a channel is a turn*. So a stale `awaiting` **that asked to
+        be rung** becomes a post that wakes the party that forgot.
+
+        Opt-in per wait (C3, Tijs's ruling): a bare `awaiting` is passive —
+        a fleet row and nothing else. Only `nag="<duration>"` schedules a
+        doorbell, and each wait carries its own delay; there is no global
+        threshold. Waking an agent is the most intrusive thing the bridge
+        can do, so nothing implies it.
 
         Three independent bounds keep that from becoming a ghost-turn
         generator (R6), any one of which would be sufficient:
@@ -3817,18 +3825,19 @@ class Bridge:
         """
         if not self.config.nag_enabled:
             return
-        threshold = self.config.awaiting_nag_after_seconds
-        if threshold <= 0:
-            return
 
         now = time.time()
         due: list[tuple[float, str, SessionState, int, float]] = []
         for session_id, state in list(self.mapping.session_states.items()):
             if state.kind != "awaiting" or not state.set_at:
                 continue
+            # PASSIVE by default (C3): a wait rings only if it asked to.
+            if state.nag_after is None:
+                continue
             if self._session_has_active_run(session_id):
                 continue
             age = now - state.set_at
+            threshold = state.nag_after
             level = 2 if age >= 2 * threshold else 1 if age >= threshold else 0
             if not level:
                 continue
@@ -3892,6 +3901,20 @@ class Bridge:
             # mention, since nothing there can be woken by the post itself.
             target, deliver = anchor, False
 
+        if await self._nag_opted_out(
+            target.channel_id, child if target.channel_id == anchor.channel_id
+            else None,
+        ):
+            # The token protects the CHANNEL it is written in, not the wait:
+            # neither the post nor the turn is placed. The level has already
+            # been marked by the sweep, so an opted-out channel doesn't
+            # re-attempt every tick and still escalates on schedule.
+            logger.info(
+                "Nag for %s suppressed — channel %s carries `no-nag`",
+                session_id[:8], target.channel_id,
+            )
+            return
+
         mention = ""
         if named:
             mention = f"@{named}"
@@ -3931,6 +3954,32 @@ class Bridge:
             f"{humanise_age(age)}{note}"
         )
         return f"{mention} {body}" if mention else body
+
+    async def _nag_opted_out(
+        self, channel_id: str, record: dict | None = None,
+    ) -> bool:
+        """True when `channel_id`'s Purpose carries `no-nag`.
+
+        Fails OPEN (rings) when the Purpose can't be read, and says so in the
+        log. The wait was explicitly opted into by the agent that declared it,
+        so a transient Mattermost error must not silently disable a doorbell
+        the agent is counting on — and if MM is unreachable the post that
+        follows will fail loudly anyway.
+        """
+        cfg = self.purpose_by_channel.get(channel_id)
+        if cfg is not None:
+            return cfg.no_nag
+        try:
+            ch = record if record is not None else await asyncio.to_thread(
+                self.mm.get_channel, channel_id,
+            )
+        except Exception:
+            logger.warning(
+                "Could not read the Purpose of %s for a `no-nag` check — "
+                "ringing anyway", channel_id, exc_info=True,
+            )
+            return False
+        return purpose.has_no_nag(ch.get("purpose") or "")
 
     async def _known_username(self, on: str | None) -> str | None:
         """Return `on` if it names a real Mattermost user, else None.
@@ -4066,6 +4115,7 @@ class Bridge:
         on: str | None = None,
         note: str | None = None,
         source: str = "agent",
+        nag_after: float | None = None,
         restamp: bool = True,
     ) -> SessionState | None:
         """Record `session_id`'s state and return the PREVIOUS one.
@@ -4080,6 +4130,13 @@ class Bridge:
         bookkeeping is dropped, so a session that re-declares `awaiting` is
         rung again from zero rather than inheriting the old episode's
         already-fired levels.
+
+        `nag_after` is the delay this wait asked to be rung after, in
+        seconds. It is clamped into the operator's `nag_min_seconds` /
+        `nag_max_seconds` bounds HERE rather than at sweep time, so the
+        stored value is the one that will actually be used — a row that says
+        1200 rings at 1200. It is dropped for any kind other than `awaiting`,
+        which is the only state a doorbell means anything for.
 
         `restamp=False` means "only write if the CLAIM changed" — same
         `kind`/`on`/`note` is a no-op that keeps the stored `set_at` and the
@@ -4109,10 +4166,30 @@ class Bridge:
                 kind, session_id[:8], ", ".join(KINDS),
             )
             return prev
+        if nag_after is not None:
+            if kind != "awaiting":
+                logger.debug(
+                    "Ignoring nag=%ss on a %r state for %s — only a wait can "
+                    "be rung", nag_after, kind, session_id[:8],
+                )
+                nag_after = None
+            else:
+                clamped = clamp_nag_duration(
+                    nag_after,
+                    self.config.nag_min_seconds,
+                    self.config.nag_max_seconds,
+                )
+                if clamped != nag_after:
+                    logger.info(
+                        "Clamped nag request %ss → %ss for %s",
+                        nag_after, clamped, session_id[:8],
+                    )
+                nag_after = clamped
         if (
             not restamp
             and prev is not None
-            and (prev.kind, prev.on, prev.note) == (kind, on or None, note or None)
+            and (prev.kind, prev.on, prev.note, prev.nag_after)
+            == (kind, on or None, note or None, nag_after)
         ):
             return prev
         try:
@@ -4122,6 +4199,7 @@ class Bridge:
                 note=(note or None),
                 set_at=time.time(),
                 source=source,
+                nag_after=nag_after,
             ))
         except Exception:
             logger.exception(
@@ -4181,10 +4259,31 @@ class Bridge:
             )
             return
 
+        # `nag="45m"` is the ONLY thing that makes a wait ring (C3). An
+        # `awaiting` with no attribute is PASSIVE: a fleet row, never a post.
+        # Waking an agent is the most intrusive act available to the bridge,
+        # so it is opt-in per wait and never implied by the state alone.
+        raw_nag = (attrs.get("nag") or "").strip()
+        nag_after = parse_nag_duration(raw_nag) if raw_nag else None
+        if raw_nag and nag_after is None and kind == "awaiting":
+            # The state still applies — only the doorbell is refused. Silence
+            # would leave the agent believing it had been scheduled.
+            logger.warning(
+                "Unusable nag=%r from %s — state applied without a nag",
+                raw_nag, session_id[:8],
+            )
+            self._post_cmd_reply(
+                channel_id,
+                f":warning: Could not read `nag=\"{raw_nag}\"` — use "
+                "`<int>[s|m|h]` (e.g. `45m`). State applied, no nag scheduled.",
+                thread_root,
+            )
+
         self.set_session_state(
             session_id, kind,
             on=(attrs.get("on") or "").strip() or None,
             note=(attrs.get("note") or "").strip() or None,
+            nag_after=nag_after,
         )
 
     def _restamp_state_for_run(self, session_id: str) -> None:

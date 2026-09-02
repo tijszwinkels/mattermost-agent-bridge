@@ -139,11 +139,17 @@ class Config:
     typing_refresh_seconds: float = 3.0
     # ----- awaiting-nag (F2) -----
     # The bridge is the only always-awake party, and a post into a channel IS
-    # a turn — so an `awaiting` state that goes stale can be rung. OFF leaves
+    # a turn — so an `awaiting` state THAT ASKED TO BE RUNG can be. OFF leaves
     # the state directive and the fleet view fully working; only the doorbell
     # stops (spec §5.8).
+    # Global kill switch. Its meaning is "honour nag requests": individual
+    # waits opt IN with `nag="<duration>"`, so there is no default threshold
+    # to configure here.
     nag_enabled: bool = True
-    awaiting_nag_after_seconds: float = 1800.0
+    # Bounds a requested delay is clamped into, so one agent cannot ask to be
+    # rung every 5 seconds nor effectively never.
+    nag_min_seconds: float = 900.0
+    nag_max_seconds: float = 14400.0
     # Who to @-mention when a wait escalates. Empty = fall back to the most
     # recent non-bot poster in the awaiting session's channel.
     operator_username: str = ""
@@ -284,7 +290,8 @@ class Config:
             "coalesce_max_held",
             "held_posts_file",
             "nag_enabled",
-            "awaiting_nag_after_seconds",
+            "nag_min_seconds",
+            "nag_max_seconds",
             "operator_username",
         ):
             if key in data:
@@ -439,18 +446,20 @@ class Config:
             self.nag_enabled = env["MM_NAG_ENABLED"].strip().lower() in (
                 "1", "true", "yes", "on",
             )
-        if "MM_AWAITING_NAG_AFTER_SECONDS" in env:
-            # A typo'd threshold keeps the built-in default rather than taking
-            # the daemon down on boot — same discipline as MM_COALESCE_MAX_HELD.
+        for var, attr in (
+            ("MM_NAG_MIN_SECONDS", "nag_min_seconds"),
+            ("MM_NAG_MAX_SECONDS", "nag_max_seconds"),
+        ):
+            if var not in env:
+                continue
+            # A typo'd bound keeps the built-in default rather than taking the
+            # daemon down on boot — same discipline as MM_COALESCE_MAX_HELD.
             try:
-                self.awaiting_nag_after_seconds = float(
-                    env["MM_AWAITING_NAG_AFTER_SECONDS"]
-                )
+                setattr(self, attr, float(env[var]))
             except ValueError:
                 logger.warning(
-                    "MM_AWAITING_NAG_AFTER_SECONDS=%r is not a number — "
-                    "keeping %s", env["MM_AWAITING_NAG_AFTER_SECONDS"],
-                    self.awaiting_nag_after_seconds,
+                    "%s=%r is not a number — keeping %s",
+                    var, env[var], getattr(self, attr),
                 )
         if "MM_OPERATOR_USERNAME" in env:
             self.operator_username = env["MM_OPERATOR_USERNAME"].strip().lstrip("@")

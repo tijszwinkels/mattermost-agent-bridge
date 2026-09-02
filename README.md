@@ -188,23 +188,39 @@ session. `err:` is a placeholder for provider-error classification, which lands 
 when it does, a bridge-classified block reads `blocked (quota_exhausted)` while an
 agent-declared one stays bare with its note alongside.
 
-**The nag.** The bridge is the only always-awake party, and a post into a channel *is* a
-turn. So a session that stays `awaiting` longer than `awaiting_nag_after_seconds` (default
-30 min) causes ONE post into its parent channel:
+**The nag — opt-in, per wait.** `awaiting` on its own is *passive*: a fleet row, and
+nothing else. A wait rings only if it asked to, by adding `nag="<duration>"`:
 
-> ⏰ bridge nag: ~kestrel~ has been awaiting you for 30 min ("M0 gate")
+```
+<state kind="awaiting" on="lead" note="M0 gate" nag="45m" />
+```
+
+The bridge is the only always-awake party, and a post into a channel *is* a turn. So a wait
+that asked for 45 minutes and got no answer produces ONE post into its parent channel:
+
+> ⏰ bridge nag: ~kestrel~ has been awaiting you for 45 min ("M0 gate")
 
 That post is also delivered to the parent's session as a turn, so it wakes the party that
 forgot — and if that party is mid-turn, the post is *held* and folded into its next
-coalesced turn rather than queueing a stale one. At 2× the threshold there is one
+coalesced turn rather than queueing a stale one. At 2× the requested delay there is one
 escalation carrying an @-mention (`operator_username`, else the last human who posted in
 the waiting channel). If `on` names a real Mattermost user, the first nag goes to the
 waiting session's own channel and mentions them there instead — a human is only woken by a
 mention, and that channel is where the context is.
 
-Bounded by construction: one nag per level per wait, at most one nag post per watchdog tick
-across the whole fleet, and `nag_enabled = false` (or `MM_NAG_ENABLED=0`) turns the
-doorbell off while leaving the state directive and `.fleet` fully working.
+Durations are `<int>[s|m|h]` (bare integer = seconds), clamped into
+`nag_min_seconds` … `nag_max_seconds` (15 min … 4 h by default) so no agent can ask to be
+rung every five seconds. An unusable duration applies the state and says it ignored the
+nag; `nag` on any kind other than `awaiting` is ignored.
+
+**Opting a channel out.** Put `no-nag` in a channel's Purpose and no nag is ever placed
+there — neither the post nor the turn. It protects the channel it is written in, not the
+wait, so silencing a busy lead channel doesn't change how its builders declare themselves.
+
+Bounded by construction: nothing rings unless it asked to, one nag per level per wait, at
+most one nag post per watchdog tick across the whole fleet, and `nag_enabled = false` (or
+`MM_NAG_ENABLED=0`) as the global off switch, leaving the state directive and `.fleet`
+fully working.
 The global listings (`.sessions`, `.running`, `.invite`) reveal operator-wide state, so in
 a dormant channel they need an explicit mention.
 
@@ -261,9 +277,10 @@ reply and strips them from the visible post:
 
 - `<openFile path="/abs/path" [line="N"] />` — upload that file (must live under an
   allowed root; see `allowed_attachment_roots`).
-- `<state kind="idle|awaiting|parked|blocked" [on="lead|<username>"] [note="..."] />` —
-  declare how the turn ends. Last tag wins; no tag means `idle`; an unknown `kind` leaves
-  the state alone and gets a one-line reply naming the valid ones.
+- `<state kind="idle|awaiting|parked|blocked" [on="lead|<username>"] [note="..."]
+  [nag="45m"] />` — declare how the turn ends. Last tag wins; no tag means `idle`; an
+  unknown `kind` leaves the state alone and gets a one-line reply naming the valid ones.
+  `nag=` is what makes an `awaiting` ring; without it the wait is passive.
 
 [`CLAUDE-include.md`](CLAUDE-include.md) is the prompt snippet that teaches Claude how to
 use all of this — drop it into your `CLAUDE.md`.
@@ -330,12 +347,14 @@ auto_join_reconcile_seconds = 5.0
 # Attachment safety — <openFile path="..."> only resolves files under these.
 allowed_attachment_roots = ["~/projects"]
 
-# Awaiting-nag: how long a session may sit in `<state kind="awaiting"/>`
-# before the bridge rings its parent channel once (and once more, with an
-# @-mention, at twice that). `nag_enabled = false` turns the doorbell off
-# while leaving the state directive and `.fleet` working.
+# Awaiting-nag. A wait rings only if it asked to (`nag="45m"` on the
+# `<state/>` tag); these bounds clamp what it may ask for.
+# `nag_enabled = false` is the global off switch — it means "honour nag
+# requests" — and leaves the state directive and `.fleet` working.
+# Put `no-nag` in a channel's Purpose to stop nags landing in it.
 nag_enabled = true
-awaiting_nag_after_seconds = 1800
+nag_min_seconds = 900
+nag_max_seconds = 14400
 operator_username = "tijs"
 
 # State + sidecar paths.
@@ -389,8 +408,9 @@ url = "http://localhost:8877"
 | `MM_BRIDGE_HELD_POSTS` | Path to the held-posts JSON (default: beside the state file). |
 | `MM_COALESCE_POSTS` | `0/false/no/off` to disable hold-and-coalesce (default on). |
 | `MM_COALESCE_MAX_HELD` | Per-anchor cap on held posts (default 50). |
-| `MM_NAG_ENABLED` | `0/false/no/off` to disable the awaiting-nag (default on). |
-| `MM_AWAITING_NAG_AFTER_SECONDS` | Seconds before a wait is rung (default 1800). |
+| `MM_NAG_ENABLED` | `0/false/no/off` to ignore all nag requests (default on). |
+| `MM_NAG_MIN_SECONDS` | Floor for a requested nag delay (default 900). |
+| `MM_NAG_MAX_SECONDS` | Ceiling for a requested nag delay (default 14400). |
 | `MM_OPERATOR_USERNAME` | Who an escalating nag @-mentions. |
 | `MM_BRIDGE_CONFIG` | Path to the TOML file. |
 
