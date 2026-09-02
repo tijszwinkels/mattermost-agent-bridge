@@ -1653,6 +1653,12 @@ class Bridge:
         """Layer `new` on top of `current`. Any field explicitly set by the
         new parse wins; omitted fields fall back to current.
 
+        Built with ``replace(current, ...)`` — overriding exactly the fields
+        a caller's `new` actually carries — so a field added to
+        ``PurposeConfig`` later falls back correctly without touching this
+        function. Rebuilding field-by-field instead silently reset every
+        field this function hadn't been taught about (`no_nag` was one).
+
         Exception: when the backend changes, the carried model is dropped.
         Models are backend-specific (``sonnet`` is claude-only, ``gpt-5.5``
         is codex-only) — letting one leak across a backend swap crashes
@@ -1669,7 +1675,8 @@ class Bridge:
             model = None
         else:
             model = current.model
-        return purpose.PurposeConfig(
+        return replace(
+            current,
             backend=new.backend,
             model=model,
             mention_only=new.mention_only,
@@ -2056,12 +2063,8 @@ class Bridge:
         but the flag is carried through to the persisted Purpose untouched).
         """
         turn_on_autorespond = token.strip().lower() in purpose.AUTORESPOND_ALIASES
-        updated = purpose.PurposeConfig(
-            backend=current.backend,
-            model=current.model,
-            mention_only=not turn_on_autorespond,
-            cwd=current.cwd,
-            warnings=[],
+        updated = replace(
+            current, mention_only=not turn_on_autorespond, warnings=[],
         )
         self.purpose_by_channel[channel_id] = updated
         self._persist_purpose(channel_id, updated)
@@ -4360,13 +4363,7 @@ class Bridge:
             )
             return
 
-        updated = purpose.PurposeConfig(
-            backend=cfg.backend,
-            model=arg,
-            mention_only=cfg.mention_only,
-            cwd=cfg.cwd,
-            warnings=[],
-        )
+        updated = replace(cfg, model=arg, warnings=[])
         self.purpose_by_channel[channel_id] = updated
         self._persist_purpose(channel_id, updated)
         self._post_cmd_reply(
@@ -4409,13 +4406,7 @@ class Bridge:
             )
             return
 
-        target = purpose.PurposeConfig(
-            backend=requested,
-            model=None,
-            mention_only=cfg.mention_only,
-            cwd=cfg.cwd,
-            warnings=[],
-        )
+        target = replace(cfg, backend=requested, model=None, warnings=[])
         updated = self._merge_configs(cfg, target)
         self.purpose_by_channel[channel_id] = updated
         self._persist_purpose(channel_id, updated)
@@ -4486,13 +4477,7 @@ class Bridge:
         # Only the model moves: the backend (the LIVE one — see
         # ``_live_backend``), the working directory and the autorespond flag
         # carry over untouched.
-        new_cfg = purpose.PurposeConfig(
-            backend=backend,
-            model=arg,
-            mention_only=cfg.mention_only,
-            cwd=cfg.cwd,
-            warnings=[],
-        )
+        new_cfg = replace(cfg, backend=backend, model=arg, warnings=[])
         new_session = await self._restart_session_with_config(
             channel_id, session_id, new_cfg,
         )
@@ -4584,13 +4569,7 @@ class Bridge:
         # Layer the new backend over the current config via ``_merge_configs``
         # so the carried model is dropped (a claude model can't run on codex).
         # The working directory and the autorespond flag survive the swap.
-        target = purpose.PurposeConfig(
-            backend=requested,
-            model=None,
-            mention_only=cfg.mention_only,
-            cwd=cfg.cwd,
-            warnings=[],
-        )
+        target = replace(cfg, backend=requested, model=None, warnings=[])
         # Merge against the LIVE backend, not the Purpose's: in a token-less
         # channel the Purpose parses to the default backend, which would make
         # ``_merge_configs`` see no change and carry the old model (or, with
@@ -4796,12 +4775,8 @@ class Bridge:
         # ``_live_backend``), model and the autorespond flag carry over
         # untouched (unlike `.backend`, where the model can't survive the
         # swap).
-        new_cfg = purpose.PurposeConfig(
-            backend=self._live_backend(meta, cfg),
-            model=cfg.model,
-            mention_only=cfg.mention_only,
-            cwd=target,
-            warnings=[],
+        new_cfg = replace(
+            cfg, backend=self._live_backend(meta, cfg), cwd=target, warnings=[],
         )
         new_session = await self._restart_session_with_config(
             channel_id, session_id, new_cfg,
@@ -4846,13 +4821,7 @@ class Bridge:
             )
             return
 
-        updated = purpose.PurposeConfig(
-            backend=cfg.backend,
-            model=cfg.model,
-            mention_only=cfg.mention_only,
-            cwd=target,
-            warnings=[],
-        )
+        updated = replace(cfg, cwd=target, warnings=[])
         self.purpose_by_channel[channel_id] = updated
         self._persist_purpose(channel_id, updated)
         self._post_cmd_reply(

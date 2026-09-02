@@ -4390,6 +4390,41 @@ class MergeConfigsTests(_BridgeTestCase):
 
         self.assertEqual(merged.model, "opus")
 
+    def test_fields_the_new_parse_never_carries_fall_back_to_current(self):
+        """The merge is a fallback, not a rebuild: anything the caller's
+        synthetic `new` doesn't set must come off `current`.
+
+        Both callers (`.backend`, dormant and active) hand-build `new` from
+        the two fields the command is about, so every OTHER field is at its
+        dataclass default there. Reading them off `new` silently resets them
+        — which is exactly how a channel's `no-nag` opt-out disappeared on
+        the first `.backend`."""
+        from mm_bridge.purpose import PurposeConfig
+        current = PurposeConfig(
+            backend="claude", model="sonnet", mention_only=False,
+            cwd="/srv/repo", no_nag=True,
+        )
+        new = PurposeConfig(backend="codex", model=None, mention_only=False)
+
+        merged = self.bridge._merge_configs(current, new)
+
+        self.assertTrue(merged.no_nag)
+        self.assertEqual(merged.cwd, "/srv/repo")
+
+    def test_merge_clears_warnings(self):
+        """Warnings describe ONE parse; carrying them forward would re-post a
+        stale complaint after every later config command."""
+        from mm_bridge.purpose import PurposeConfig
+        current = PurposeConfig(
+            backend="claude", model="sonnet", mention_only=False,
+            warnings=["stale"],
+        )
+        new = PurposeConfig(
+            backend="codex", model=None, mention_only=False, warnings=["fresh"],
+        )
+
+        self.assertEqual(self.bridge._merge_configs(current, new).warnings, [])
+
 
 class MessageContentNotConfigTests(_BridgeTestCase):
     """The bare `autorespond`/`noautorespond` message-content toggle was
@@ -6471,6 +6506,155 @@ class TypingRunLifecycleTests(_BridgeTestCase):
                 pass
 
         self.assertNotIn("ses_x", self.bridge.typing.running_sessions())
+
+
+class NoNagAcrossConfigCommandsTests(_BridgeTestCase):
+    """`no-nag` must survive every config dot-command that rewrites the Purpose.
+
+    The opt-out lives ONLY in the Channel Purpose — there is no other store.
+    Each of `.model` / `.backend` / `.cwd` / `.autorespond` rebuilds the
+    channel's `PurposeConfig` and persists the canonical serialisation of it,
+    so a rebuild that forgets a field deletes the operator's choice with no
+    message anywhere. `no-nag` is the field that got forgotten; these tests
+    pin every path, and the deliberate `warnings=[]` reset those same
+    rebuilds perform (a stale parse warning must NOT be re-posted after an
+    unrelated `.model`).
+    """
+
+    STALE = "Could not parse Channel Purpose token `junk`."
+    NO_NAG_PURPOSE = "claude, opus, autorespond, no-nag"
+
+    def _seed_config(self, purpose_text: str, *, stale: bool) -> None:
+        """Prime the channel + its cached config (optionally with a warning).
+
+        `_load_channel_config` returns the cache when it's warm, so seeding
+        here is what every command under test actually reads.
+        """
+        from mm_bridge import purpose as purpose_mod
+        cfg = purpose_mod.parse(purpose_text, "claude", None, lambda _b: [])
+        self.assertTrue(cfg.no_nag)  # fixture sanity: the token parsed
+        if stale:
+            cfg.warnings = [self.STALE]
+        self.bridge.purpose_by_channel["c1"] = cfg
+        self.bridge.mm.channels["c1"] = {
+            "id": "c1", "purpose": purpose_text, "display_name": "Test channel",
+        }
+
+    def _active_channel(self, *, stale: bool = False, cwd: str = "/tmp/proj") -> None:
+        self.bridge.mapping.link(Anchor("c1"), "s1")
+        self._seed_config(f"{self.NO_NAG_PURPOSE}, cwd={cwd}", stale=stale)
+        self.bridge.harness.sessions_meta = [{
+            "id": "s1", "backend": "claude", "model": "opus",
+            "project": {"path": cwd, "name": Path(cwd).name}, "origin": "harness",
+        }]
+
+    async def _dormant_channel(self, *, stale: bool = False) -> None:
+        self.bridge.mm.channels["c1"] = {
+            "id": "c1", "purpose": self.NO_NAG_PURPOSE, "display_name": "Test channel",
+        }
+        await self.bridge._on_mm_user_added("c1", self.bridge.mm.bot_user_id)
+        self.assertIn("c1", self.bridge._dormant_channels)
+        self._seed_config(self.NO_NAG_PURPOSE, stale=stale)
+
+    async def _post(self, message: str) -> None:
+        await self.bridge._on_mm_posted({
+            "channel_id": "c1", "message": message, "user_id": "u1", "type": "",
+        })
+
+    def _new_dir(self, name: str) -> str:
+        target = str(Path(self.tmp.name) / name)
+        Path(target).mkdir()
+        return target
+
+    def _assert_no_nag_survived(self) -> None:
+        written = self.bridge.mm.channels["c1"]["purpose"]
+        self.assertIn("no-nag", written)
+        self.assertTrue(self.bridge.purpose_by_channel["c1"].no_nag)
+
+    def _assert_warnings_cleared(self) -> None:
+        self.assertEqual(self.bridge.purpose_by_channel["c1"].warnings, [])
+
+    # ── active channel (the command restarts the session) ────────────────
+
+    async def test_dot_model_keeps_no_nag(self):
+        self._active_channel()
+        await self._post(".model claude-sonnet")
+        self.assertTrue(self.bridge.harness.created)
+        self._assert_no_nag_survived()
+
+    async def test_dot_model_resets_stale_warnings(self):
+        self._active_channel(stale=True)
+        await self._post(".model claude-sonnet")
+        self._assert_warnings_cleared()
+
+    async def test_dot_backend_keeps_no_nag(self):
+        self._active_channel()
+        await self._post(".backend codex")
+        self.assertEqual(self.bridge.harness.created[-1]["backend"], "codex")
+        self._assert_no_nag_survived()
+
+    async def test_dot_backend_resets_stale_warnings(self):
+        self._active_channel(stale=True)
+        await self._post(".backend codex")
+        self._assert_warnings_cleared()
+
+    async def test_dot_cwd_keeps_no_nag(self):
+        self._active_channel()
+        await self._post(f".cwd {self._new_dir('moved')}")
+        self.assertTrue(self.bridge.harness.created)
+        self._assert_no_nag_survived()
+
+    async def test_dot_cwd_resets_stale_warnings(self):
+        self._active_channel(stale=True)
+        await self._post(f".cwd {self._new_dir('moved')}")
+        self._assert_warnings_cleared()
+
+    async def test_dot_autorespond_keeps_no_nag(self):
+        self._active_channel()
+        await self._post(".autorespond off")
+        self.assertTrue(self.bridge.purpose_by_channel["c1"].mention_only)
+        self._assert_no_nag_survived()
+
+    async def test_dot_autorespond_resets_stale_warnings(self):
+        self._active_channel(stale=True)
+        await self._post(".autorespond off")
+        self._assert_warnings_cleared()
+
+    # ── dormant channel (persist only, no session) ───────────────────────
+
+    async def test_dormant_model_keeps_no_nag(self):
+        await self._dormant_channel()
+        await self._post(".model gpt-5.4")
+        self.assertEqual(self.bridge.harness.created, [])
+        self._assert_no_nag_survived()
+
+    async def test_dormant_model_resets_stale_warnings(self):
+        await self._dormant_channel(stale=True)
+        await self._post(".model gpt-5.4")
+        self._assert_warnings_cleared()
+
+    async def test_dormant_backend_keeps_no_nag(self):
+        await self._dormant_channel()
+        await self._post(".backend codex")
+        self.assertEqual(self.bridge.harness.created, [])
+        self.assertEqual(self.bridge.purpose_by_channel["c1"].backend, "codex")
+        self._assert_no_nag_survived()
+
+    async def test_dormant_backend_resets_stale_warnings(self):
+        await self._dormant_channel(stale=True)
+        await self._post(".backend codex")
+        self._assert_warnings_cleared()
+
+    async def test_dormant_cwd_keeps_no_nag(self):
+        await self._dormant_channel()
+        await self._post(f".cwd {self._new_dir('dormant-repo')}")
+        self.assertEqual(self.bridge.harness.created, [])
+        self._assert_no_nag_survived()
+
+    async def test_dormant_cwd_resets_stale_warnings(self):
+        await self._dormant_channel(stale=True)
+        await self._post(f".cwd {self._new_dir('dormant-repo')}")
+        self._assert_warnings_cleared()
 
 
 if __name__ == "__main__":
