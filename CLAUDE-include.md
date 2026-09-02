@@ -5,7 +5,7 @@ If `~/.mm-bridge/sessions/$CLAUDE_SESSION_ID` exists (Claude Code) or `~/.mm-bri
 The bridge CLI resolves the current session id via four sources, in order: `CLAUDE_SESSION_ID` env → `MM_BRIDGE_SESSION_ID` env → live-codex parent (`/proc` walk, Linux-only — finds the rollout fd held open by a `codex` ancestor) → cwd-matched codex rollout file (mtime walk, only adopted when a sidecar exists). The `/proc` tie-breaker disambiguates the case where multiple codex sessions share a cwd — only the one in our actual ancestor chain wins. Codex tool shells self-identify whether or not agent-harness pinned the env var.
 
 - **CLI env (`MM_BOT_TOKEN` etc.).** Every `mm-bridge` subcommand that hits the MM API (`invite`, `spawn`, `channels`, `post`, `read`) needs `MM_BOT_TOKEN` (and `MM_URL`, `MM_TEAM`) in the environment. If you get `Error: MM_BOT_TOKEN environment variable is required`, source your bridge secrets: `set -a; source ~/.config/mm-bridge/env; set +a` (or the repo-local `.env` fallback, if that's where this host keeps them).
-- **In-channel dot-commands.** Anyone in a bridged channel can type `.commands` that the bridge handles directly (no `@claude` mention needed; never forwarded to you as a turn): `.help`, `.stop` (interrupt the run), `.status`, `.autorespond [on|off]`, `.model [<name>]` (switch model — recreates the session, so `.stop` first), `.backend [<name>]` (switch backend — validated against the known set, recreates the session and resets the model to that backend's default, so `.stop` first), `.cwd [<path>]` (show/set the working directory — bare reads it, a path must be absolute (`~` expanded), exist, and contain no comma; recreates the session, so `.stop` first, and persists as `cwd=<path>` in the Channel Purpose), `.models` (list models for the backend), `.running` (sessions with a live run), `.sessions [N]` (recent sessions across all agents, incl. terminal ones), `.fleet [all]` (state of the channels you spawned — see below), `.invite <session-id>` (get added to a session's channel, creating it if needed). An unknown `.word` gets an "unknown command — try `.help`" reply.
+- **In-channel dot-commands.** Anyone in a bridged channel can type `.commands` that the bridge handles directly (no `@claude` mention needed; never forwarded to you as a turn): `.help`, `.stop` (interrupt the run), `.status`, `.autorespond [on|off]`, `.model [<name>]` (switch model — recreates the session, so `.stop` first), `.backend [<name>]` (switch backend — validated against the known set, recreates the session and resets the model to that backend's default, so `.stop` first), `.cwd [<path>]` (show/set the working directory — bare reads it, a path must be absolute (`~` expanded), exist, and contain no comma; recreates the session, so `.stop` first, and persists as `cwd=<path>` in the Channel Purpose), `.models` (list models for the backend), `.running` (sessions with a live run), `.sessions [N]` (recent sessions across all agents, incl. terminal ones), `.fleet [all]` (state of the channels you spawned — see below), `.queue [clear]` (posts held for this channel while you were working; `clear` drops them), `.invite <session-id>` (get added to a session's channel, creating it if needed). An unknown `.word` gets an "unknown command — try `.help`" reply.
 - **Declaring how your turn ends (`<state/>`).** End a reply with one tag and the bridge
   remembers it, per session, with the moment you said it. It is stripped from the visible
   post like `<openFile/>`:
@@ -41,6 +41,13 @@ The bridge CLI resolves the current session id via four sources, in order: `CLAU
 
   The last tag in a reply wins; an unknown `kind` leaves your state alone and gets you a
   one-line reply naming the valid ones.
+
+- **Checking what is waiting before you commit to something.** `mm-bridge inbox
+  [--channel <ref>] [--json]` prints the posts held for you but not yet delivered, or
+  `(empty)`. Run it before freezing a FINAL, opening a PR, or any other step you can't take
+  back: a ruling that landed mid-turn is exactly what you don't want to find out about
+  afterwards. It reads a local file — no bot token needed for your own channel. For
+  channels you spawned, `.fleet`'s `held:` column is the same number.
 
 - **Seeing what your children are doing.** `.fleet` (in-channel) or `mm-bridge fleet`
   (CLI, `--all`, `--json`) prints one row per channel you spawned: its declared state, how
