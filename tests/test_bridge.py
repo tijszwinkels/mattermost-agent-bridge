@@ -6657,5 +6657,126 @@ class NoNagAcrossConfigCommandsTests(_BridgeTestCase):
         self._assert_warnings_cleared()
 
 
+class EffortSessionPlumbingTests(_BridgeTestCase):
+    """A Channel Purpose `effort=` level must reach `create_session` — and
+    survive every config command that recreates the session."""
+
+    async def _join_dormant(self, purpose_text: str) -> None:
+        self.bridge.mm.channels["c1"] = {
+            "id": "c1", "purpose": purpose_text, "display_name": "Test channel",
+        }
+        self.bridge._self_joined_channels.add("c1")
+        await self.bridge._on_mm_user_added("c1", self.bridge.mm.bot_user_id)
+
+    async def test_purpose_effort_reaches_create_session(self):
+        await self._join_dormant("claude, opus, autorespond, effort=xhigh")
+
+        await self.bridge._on_mm_posted({
+            "channel_id": "c1", "message": "hello",
+            "user_id": "u1", "type": "",
+        })
+
+        self.assertTrue(self.bridge.harness.created)
+        self.assertEqual(self.bridge.harness.created[-1]["effort"], "xhigh")
+
+    async def test_no_effort_in_purpose_sends_none(self):
+        """Unset must stay unset — the backend CLI's own default applies."""
+        await self._join_dormant("claude, opus, autorespond")
+
+        await self.bridge._on_mm_posted({
+            "channel_id": "c1", "message": "hello",
+            "user_id": "u1", "type": "",
+        })
+
+        self.assertTrue(self.bridge.harness.created)
+        self.assertIsNone(self.bridge.harness.created[-1]["effort"])
+
+    async def test_purpose_effort_is_not_mistaken_for_a_model(self):
+        """The empty-catalog trap: `effort=` must never land in the model slot."""
+        await self._join_dormant("claude, autorespond, effort=xhigh")
+
+        await self.bridge._on_mm_posted({
+            "channel_id": "c1", "message": "hello",
+            "user_id": "u1", "type": "",
+        })
+
+        self.assertNotEqual(self.bridge.harness.created[-1]["model"], "xhigh")
+
+    async def test_effort_survives_a_model_change(self):
+        """`.model` rebuilds the config field-by-field — effort must be carried."""
+        from mm_bridge.purpose import PurposeConfig
+        self.bridge.mapping.link(Anchor("c1"), "s1")
+        self.bridge.purpose_by_channel["c1"] = PurposeConfig(
+            backend="claude", model="opus", mention_only=False, effort="max",
+        )
+        self.bridge.mm.channels["c1"] = {
+            "id": "c1", "purpose": "claude, opus, autorespond, effort=max",
+        }
+
+        await self.bridge._on_mm_posted({
+            "channel_id": "c1", "message": ".model claude-sonnet",
+            "user_id": "u1", "type": "",
+        })
+
+        self.assertEqual(self.bridge.harness.created[-1]["model"], "claude-sonnet")
+        self.assertEqual(self.bridge.harness.created[-1]["effort"], "max")
+        self.assertIn("effort=max", self.bridge.mm.channels["c1"]["purpose"])
+
+    async def test_effort_survives_a_backend_change(self):
+        from mm_bridge.purpose import PurposeConfig
+        self.bridge.mapping.link(Anchor("c1"), "s1")
+        self.bridge.purpose_by_channel["c1"] = PurposeConfig(
+            backend="claude", model="opus", mention_only=False, effort="low",
+        )
+        self.bridge.mm.channels["c1"] = {
+            "id": "c1", "purpose": "claude, opus, autorespond, effort=low",
+        }
+
+        await self.bridge._on_mm_posted({
+            "channel_id": "c1", "message": ".backend codex",
+            "user_id": "u1", "type": "",
+        })
+
+        self.assertEqual(self.bridge.harness.created[-1]["backend"], "codex")
+        self.assertEqual(self.bridge.harness.created[-1]["effort"], "low")
+        self.assertIn("effort=low", self.bridge.mm.channels["c1"]["purpose"])
+
+    async def test_effort_survives_a_cwd_change(self):
+        from mm_bridge.purpose import PurposeConfig
+        self.bridge.mapping.link(Anchor("c1"), "s1")
+        self.bridge.purpose_by_channel["c1"] = PurposeConfig(
+            backend="claude", model="opus", mention_only=False, effort="high",
+        )
+        self.bridge.mm.channels["c1"] = {
+            "id": "c1", "purpose": "claude, opus, autorespond, effort=high",
+        }
+
+        await self.bridge._on_mm_posted({
+            "channel_id": "c1", "message": f".cwd {self.tmp.name}",
+            "user_id": "u1", "type": "",
+        })
+
+        self.assertEqual(self.bridge.harness.created[-1]["effort"], "high")
+        self.assertIn("effort=high", self.bridge.mm.channels["c1"]["purpose"])
+
+    async def test_effort_survives_an_autorespond_toggle(self):
+        """`.autorespond` persists the Purpose too — it must not drop the level."""
+        from mm_bridge.purpose import PurposeConfig
+        self.bridge.mapping.link(Anchor("c1"), "s1")
+        self.bridge.purpose_by_channel["c1"] = PurposeConfig(
+            backend="claude", model="opus", mention_only=False, effort="medium",
+        )
+        self.bridge.mm.channels["c1"] = {
+            "id": "c1", "purpose": "claude, opus, autorespond, effort=medium",
+        }
+
+        await self.bridge._on_mm_posted({
+            "channel_id": "c1", "message": ".autorespond off",
+            "user_id": "u1", "type": "",
+        })
+
+        self.assertIn("effort=medium", self.bridge.mm.channels["c1"]["purpose"])
+
+
 if __name__ == "__main__":
     unittest.main()

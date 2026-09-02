@@ -1556,6 +1556,7 @@ class Bridge:
                 model=self._resolve_session_model(cfg),
                 cwd=effective_cwd,
                 title=display_name,
+                effort=cfg.effort,
             )
             session_id = session.get("id")
             if not session_id:
@@ -1681,6 +1682,7 @@ class Bridge:
             model=model,
             mention_only=new.mention_only,
             cwd=new.cwd if new.cwd is not None else current.cwd,
+            effort=new.effort if new.effort is not None else current.effort,
             warnings=[],
         )
 
@@ -1820,6 +1822,7 @@ class Bridge:
                     backend=cfg.backend,
                     model=self._resolve_session_model(cfg),
                     cwd=effective_cwd,
+                    effort=cfg.effort,
                 )
                 session_id = session.get("id")
                 if not session_id:
