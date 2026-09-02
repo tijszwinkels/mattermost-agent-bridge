@@ -67,6 +67,11 @@ class FakeMattermostClient:
     # post_id → set of emoji names, mirroring the MM reactions API. Held
     # posts get an hourglass, delivered ones a check mark.
     reactions: dict = field(default_factory=dict)
+    # Times `list_bot_channels` was called — `.fleet` must fan out over ONE
+    # listing, never one call per row.
+    list_bot_channels_calls: int = 0
+    # Usernames `get_user_by_username` should resolve (beyond `users`).
+    usernames: set = field(default_factory=set)
     _post_counter: int = 0
     # Mirror of MattermostClient's own-post tracking — populated
     # whenever the fake creates or edits a post.
@@ -143,6 +148,26 @@ class FakeMattermostClient:
     def get_user(self, user_id: str) -> dict:
         return self.users.get(user_id, {"id": user_id, "username": f"u-{user_id[:4]}"})
 
+    def get_user_by_username(self, username: str) -> dict:
+        """Resolve a username, raising like the real client on an unknown one.
+
+        The nag needs the distinction: a KNOWN username is mentioned and the
+        nag is placed in the awaiting session's own channel; an unknown one
+        falls back to the lead placement.
+        """
+        for uid, u in self.users.items():
+            if u.get("username") == username:
+                return dict(u, id=u.get("id", uid))
+        if username in self.usernames:
+            return {"id": f"u-{username}", "username": username}
+        raise RuntimeError(f"no such user: {username}")
+
+    def get_channel_by_name(self, team_name: str, channel_name: str) -> dict:
+        for c in self.channels.values():
+            if c.get("name") == channel_name:
+                return dict(c)
+        raise RuntimeError(f"no such channel: {channel_name}")
+
     def publish_user_typing(self, channel_id: str, parent_id=None) -> None:
         self.typing.append((channel_id, parent_id))
 
@@ -177,6 +202,16 @@ class FakeMattermostClient:
 
     def get_bot_channel_ids(self) -> set:
         return set(self.bot_channel_ids)
+
+    def list_bot_channels(self) -> list:
+        """Full channel records for the bot's memberships.
+
+        The fleet view reads `header` + `display_name` from exactly this
+        call, so the fake serves whole records out of `channels` (which
+        `create_channel` / `set_channel_header` already populate).
+        """
+        self.list_bot_channels_calls += 1
+        return [dict(c) for c in self.channels.values()]
 
     def list_public_team_channels(self) -> list:
         return list(self.public_channels)

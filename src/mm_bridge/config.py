@@ -12,6 +12,7 @@ import sys
 import tomllib
 
 from . import sidecar
+from .session_state import SessionState
 
 logger = logging.getLogger(__name__)
 
@@ -136,6 +137,22 @@ class Config:
 
     # Typing indicator
     typing_refresh_seconds: float = 3.0
+    # ----- awaiting-nag (F2) -----
+    # The bridge is the only always-awake party, and a post into a channel IS
+    # a turn — so an `awaiting` state THAT ASKED TO BE RUNG can be. OFF leaves
+    # the state directive and the fleet view fully working; only the doorbell
+    # stops (spec §5.8).
+    # Global kill switch. Its meaning is "honour nag requests": individual
+    # waits opt IN with `nag="<duration>"`, so there is no default threshold
+    # to configure here.
+    nag_enabled: bool = True
+    # Bounds a requested delay is clamped into, so one agent cannot ask to be
+    # rung every 5 seconds nor effectively never.
+    nag_min_seconds: float = 900.0
+    nag_max_seconds: float = 14400.0
+    # Who to @-mention when a wait escalates. Empty = fall back to the most
+    # recent non-bot poster in the awaiting session's channel.
+    operator_username: str = ""
     typing_stop_after_silence_seconds: float = 15.0
 
     # Claim window for matching session_added → pending MM invite
@@ -272,6 +289,10 @@ class Config:
             "coalesce_posts",
             "coalesce_max_held",
             "held_posts_file",
+            "nag_enabled",
+            "nag_min_seconds",
+            "nag_max_seconds",
+            "operator_username",
         ):
             if key in data:
                 setattr(self, key, data[key])
@@ -421,6 +442,28 @@ class Config:
                     "MM_COALESCE_MAX_HELD=%r is not an integer — keeping %d",
                     env["MM_COALESCE_MAX_HELD"], self.coalesce_max_held,
                 )
+        if "MM_NAG_ENABLED" in env:
+            self.nag_enabled = env["MM_NAG_ENABLED"].strip().lower() in (
+                "1", "true", "yes", "on",
+            )
+        for var, attr in (
+            ("MM_NAG_MIN_SECONDS", "nag_min_seconds"),
+            ("MM_NAG_MAX_SECONDS", "nag_max_seconds"),
+        ):
+            if var not in env:
+                continue
+            # A typo'd bound keeps the built-in default rather than taking the
+            # daemon down on boot — same discipline as MM_COALESCE_MAX_HELD.
+            try:
+                setattr(self, attr, float(env[var]))
+            except ValueError:
+                logger.warning(
+                    "%s=%r is not a number — keeping %s",
+                    var, env[var], getattr(self, attr),
+                )
+        if "MM_OPERATOR_USERNAME" in env:
+            self.operator_username = env["MM_OPERATOR_USERNAME"].strip().lstrip("@")
+
         if "MM_BRIDGE_DANGEROUS_PERMISSIONS" in env:
             self.dangerous_permissions = (
                 env["MM_BRIDGE_DANGEROUS_PERMISSIONS"].strip().lower()
@@ -458,7 +501,12 @@ class Anchor:
 # the agent-harness SSE stream from a known cursor across bridge restarts.
 # v4→v5 adds `adopted_session_ids` so the bootstrap auto-spawn-channel
 # path doesn't re-surface external sessions the bridge already replaced.
-STATE_SCHEMA_VERSION = 5
+# v5→v6 adds an optional per-entry `state` object (F2 turn-end state):
+# `{kind, on, note, set_at, source}`. It rides the entry rather than living
+# in a sibling file because a state's lifetime IS its session's — `unlink()`
+# and anchor replacement then drop it for free (see
+# specs/20260901-turn-state-fleet/design.md §2).
+STATE_SCHEMA_VERSION = 6
 
 
 @dataclass
@@ -482,10 +530,17 @@ class ChannelMapping:
       Bootstrap consults this set before auto-spawning a recovery channel
       for an unmapped external session — otherwise every restart resurrects
       adopted sessions as fresh orphan channels.
+    * v6: adds an optional ``"state"`` object per entry — the session's
+      turn-end state (F2). Unknown/corrupt state objects are dropped
+      individually; a bad state never costs an entry its mapping.
     """
 
     anchor_to_session: dict[Anchor, str] = field(default_factory=dict)
     session_to_anchor: dict[str, Anchor] = field(default_factory=dict)
+    # session_id → its last declared state. Keyed by session and populated
+    # ONLY for mapped sessions, so it is bounded by `session_to_anchor` and
+    # cannot leak entries for sessions that have gone away.
+    session_states: dict[str, SessionState] = field(default_factory=dict)
     last_event_seq: int | None = None
     adopted_session_ids: set[str] = field(default_factory=set)
     _path: str = ""
@@ -519,7 +574,7 @@ class ChannelMapping:
     def _ingest(self, data: dict) -> None:
         """Populate in-memory maps from any supported on-disk schema."""
         version = data.get("version")
-        if version in (3, 4, 5) and isinstance(data.get("entries"), list):
+        if version in (3, 4, 5, 6) and isinstance(data.get("entries"), list):
             for entry in data["entries"]:
                 sid = entry.get("session_id")
                 cid = entry.get("channel_id")
@@ -527,6 +582,10 @@ class ChannelMapping:
                     continue
                 rid = entry.get("root_id") or None
                 self._add(Anchor(cid, rid), sid)
+                if version >= 6:
+                    state = SessionState.from_json(entry.get("state"))
+                    if state is not None:
+                        self.session_states[sid] = state
             if version >= 4:
                 seq = data.get("last_event_seq")
                 self.last_event_seq = seq if isinstance(seq, int) else None
@@ -553,29 +612,52 @@ class ChannelMapping:
         prev_session = self.anchor_to_session.get(anchor)
         if prev_session and prev_session != session_id:
             self.session_to_anchor.pop(prev_session, None)
+            # The replaced session is gone (`.model`/`.backend`/`.cwd` swap,
+            # external-session adoption). Its state goes with it — that is
+            # the whole reason state lives here and not in a sibling file.
+            self.session_states.pop(prev_session, None)
         self.anchor_to_session[anchor] = session_id
         self.session_to_anchor[session_id] = anchor
 
     def save(self) -> None:
-        entries = [
-            {
+        """Write the whole file atomically (temp + ``os.replace``).
+
+        Atomic because this file gained a concurrent out-of-process reader:
+        ``mm-bridge fleet`` reads the persisted states while the daemon is
+        writing them, and the SSE cursor calls ``save()`` on a 2-second
+        throttle for the life of every busy stream. A bare ``write_text``
+        would eventually hand the CLI a half-written file. Mirrors
+        ``HeldPostStore._save``; the temp file is removed on failure so a
+        full disk can't litter the state directory.
+        """
+        entries = []
+        for a, sid in self.anchor_to_session.items():
+            entry = {
                 "channel_id": a.channel_id,
                 "root_id": a.root_id,
                 "session_id": sid,
             }
-            for a, sid in self.anchor_to_session.items()
-        ]
-        Path(self._path).write_text(
-            json.dumps(
-                {
-                    "version": STATE_SCHEMA_VERSION,
-                    "entries": entries,
-                    "last_event_seq": self.last_event_seq,
-                    "adopted_session_ids": sorted(self.adopted_session_ids),
-                },
-                indent=2,
-            )
+            state = self.session_states.get(sid)
+            if state is not None:
+                entry["state"] = state.to_json()
+            entries.append(entry)
+        payload = json.dumps(
+            {
+                "version": STATE_SCHEMA_VERSION,
+                "entries": entries,
+                "last_event_seq": self.last_event_seq,
+                "adopted_session_ids": sorted(self.adopted_session_ids),
+            },
+            indent=2,
         )
+        path = Path(self._path)
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        try:
+            tmp.write_text(payload)
+            os.replace(tmp, path)
+        except Exception:
+            tmp.unlink(missing_ok=True)
+            raise
 
     def set_event_seq(self, seq: int) -> None:
         """Update the persisted SSE cursor and flush to disk.
@@ -624,6 +706,7 @@ class ChannelMapping:
         session_id = self.anchor_to_session.pop(anchor, None)
         if session_id:
             self.session_to_anchor.pop(session_id, None)
+            self.session_states.pop(session_id, None)
             self.save()
             if self._sidecar_dir is not None:
                 sidecar.delete(self._sidecar_dir, session_id)
@@ -634,3 +717,30 @@ class ChannelMapping:
 
     def get_anchor(self, session_id: str) -> Anchor | None:
         return self.session_to_anchor.get(session_id)
+
+    # ----- turn-end state (F2) -----
+
+    def get_state(self, session_id: str) -> SessionState | None:
+        return self.session_states.get(session_id)
+
+    def set_state(self, session_id: str, state: SessionState | None) -> None:
+        """Persist `session_id`'s state (or clear it with ``None``).
+
+        A state for an UNMAPPED session is dropped with a debug log rather
+        than stored: states ride entries on disk, so it could never be
+        persisted anyway, and storing it in memory would be an unbounded
+        leak keyed by a session nothing else references.
+        """
+        if state is not None and session_id not in self.session_to_anchor:
+            logger.debug(
+                "Ignoring state for unmapped session %s", session_id[:8],
+            )
+            return
+        if state is None:
+            if self.session_states.pop(session_id, None) is None:
+                return
+        else:
+            if self.session_states.get(session_id) == state:
+                return
+            self.session_states[session_id] = state
+        self.save()

@@ -47,6 +47,11 @@ AUTORESPOND_ALIASES: frozenset[str] = frozenset({
     AUTORESPOND_TOKEN, "autoresponse",
 })
 CWD_PREFIX = "cwd="
+# Opt a CHANNEL out of receiving awaiting-nags. Protects the channel it is
+# written in — never the wait — so a busy lead channel can be silenced
+# without changing how its builders declare themselves.
+NO_NAG_TOKEN = "no-nag"
+NO_NAG_ALIASES: frozenset[str] = frozenset({NO_NAG_TOKEN, "nonag", "no_nag"})
 
 
 @dataclass
@@ -55,6 +60,7 @@ class PurposeConfig:
     model: str | None
     mention_only: bool = False
     cwd: str | None = None
+    no_nag: bool = False
     warnings: list[str] = field(default_factory=list)
 
 
@@ -205,6 +211,7 @@ def parse(
             model=default_model,
             mention_only=default_mention_only,
             cwd=None,
+            no_nag=False,
             warnings=[],
         )
 
@@ -215,6 +222,7 @@ def parse(
     # we keep raw tokens until this point.
     cwd: str | None = None
     mention_only_override: bool | None = None
+    no_nag = False
     remaining: list[str] = []
     for tok in raw_tokens:
         value, warn = _parse_cwd_token(tok)
@@ -235,6 +243,9 @@ def parse(
         if tok_lc in AUTORESPOND_ALIASES:
             mention_only_override = False
             continue
+        if tok_lc in NO_NAG_ALIASES:
+            no_nag = True
+            continue
         remaining.append(tok)
 
     mention_only_effective = (
@@ -248,6 +259,7 @@ def parse(
             model=default_model,
             mention_only=mention_only_effective,
             cwd=cwd,
+            no_nag=no_nag,
             warnings=warnings,
         )
 
@@ -315,6 +327,7 @@ def parse(
         model=model,
         mention_only=mention_only_effective,
         cwd=cwd,
+        no_nag=no_nag,
         warnings=warnings,
     )
 
@@ -323,7 +336,7 @@ def to_purpose_string(cfg: PurposeConfig, *, default_autorespond: bool) -> str:
     """Serialize a PurposeConfig back into canonical Channel Purpose form.
 
     Emits tokens in a stable order: backend, model, (mention-only|autorespond),
-    cwd. Always emits the mention/autorespond flag explicitly so the Channel
+    cwd, no-nag. Always emits the mention/autorespond flag explicitly so the Channel
     Purpose documents the effective setting regardless of config defaults.
 
     The `default_autorespond` argument is accepted for symmetry with `parse()`
@@ -342,5 +355,23 @@ def to_purpose_string(cfg: PurposeConfig, *, default_autorespond: bool) -> str:
 
     if cfg.cwd:
         parts.append(f"{CWD_PREFIX}{cfg.cwd}")
+    # Emitted so a `.cwd` / `.autorespond` rewrite can never silently drop an
+    # operator's opt-out — `parse(to_purpose_string(cfg)) == cfg` is the
+    # contract this function is held to.
+    if cfg.no_nag:
+        parts.append(NO_NAG_TOKEN)
 
     return ", ".join(parts)
+
+
+def has_no_nag(purpose_text: str) -> bool:
+    """True when a raw Purpose carries the `no-nag` token.
+
+    A token scan rather than a full `parse()`: the nag path needs this for
+    channels whose config was never loaded, and `parse()` would demand a
+    model catalog it has no reason to fetch.
+    """
+    config_section, _trailing = split_config_section(purpose_text or "")
+    return any(
+        tok.lower() in NO_NAG_ALIASES for tok in _tokenize(config_section)
+    )

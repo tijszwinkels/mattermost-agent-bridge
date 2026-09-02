@@ -109,6 +109,7 @@ forwarded to the agent. An unknown `.word` gets a "try `.help`" reply.
 | `.running` | Sessions with a run in flight right now. |
 | `.sessions [N]` | The N most recent sessions across all agents, including terminal ones. Each shows its channel or an `.invite` hint. |
 | `.queue [clear]` | Show the posts held while the agent is working; `clear` drops them, naming who wrote them. |
+| `.fleet [all]` | One row per spawned child channel: declared state, live run, held posts. |
 | `.invite <session-id>` | Get added to a session's channel, creating it for unmapped/terminal sessions. |
 
 Switching model, backend or directory in an **active** channel recreates the session, so
@@ -153,6 +154,73 @@ thread fork holds independently of its parent channel.
   `.queue clear` to actually drop it.
 - **Held posts are marked ⏳ in the channel**, and ✅ once delivered.
 - Set `coalesce_posts = false` (or `MM_COALESCE_POSTS=0`) for exactly the old behaviour.
+
+### Turn-end state, the fleet view, and the awaiting-nag
+
+A reply that ends "M1 done, awaiting your GO" used to be, to the bridge, identical to one
+that said "done for the night". The obligation lived only in prose: nothing watched it,
+nobody retried, and a lead had no view of which sessions were idle, running or stuck.
+
+**The agent declares its state** by ending a reply with one directive, stripped from the
+visible post like `<leaveChannel/>`:
+
+```
+<state kind="awaiting" on="lead" note="M0 gate" />
+```
+
+`kind` is `idle`, `awaiting`, `parked` or `blocked`; `on` names who is waited on (`lead`,
+or a Mattermost username); `note` is free text. **A reply with no tag means `idle`**, so an
+agent that never learns the tag behaves exactly as before.
+
+**`.fleet`** (and `mm-bridge fleet`) shows one row per child channel — the channels whose
+header reads `Parent: ~this-channel~`, which is what `mm-bridge spawn` writes:
+
+```
+kestrel   awaiting → lead   47 min   note: C5 gate   held: 0   err: -
+grebe     working           run 12m                  held: 2   err: -
+wagtail   blocked           3h 12m   note: quota     held: 1   err: -
+```
+
+Claims sit next to observations on purpose: `working` comes from the harness (probed in
+one bounded parallel pass, `?` when the answer is inconclusive) and `held` from the hold
+buffer, so a stale claim is visible *as* a stale claim. `.fleet all` widens to every mapped
+session. `err:` is a placeholder for provider-error classification, which lands next round;
+when it does, a bridge-classified block reads `blocked (quota_exhausted)` while an
+agent-declared one stays bare with its note alongside.
+
+**The nag — opt-in, per wait.** `awaiting` on its own is *passive*: a fleet row, and
+nothing else. A wait rings only if it asked to, by adding `nag="<duration>"`:
+
+```
+<state kind="awaiting" on="lead" note="M0 gate" nag="45m" />
+```
+
+The bridge is the only always-awake party, and a post into a channel *is* a turn. So a wait
+that asked for 45 minutes and got no answer produces ONE post into its parent channel:
+
+> ⏰ bridge nag: ~kestrel~ has been awaiting you for 45 min ("M0 gate")
+
+That post is also delivered to the parent's session as a turn, so it wakes the party that
+forgot — and if that party is mid-turn, the post is *held* and folded into its next
+coalesced turn rather than queueing a stale one. At 2× the requested delay there is one
+escalation carrying an @-mention (`operator_username`, else the last human who posted in
+the waiting channel). If `on` names a real Mattermost user, the first nag goes to the
+waiting session's own channel and mentions them there instead — a human is only woken by a
+mention, and that channel is where the context is.
+
+Durations are `<int>[s|m|h]` (bare integer = seconds), clamped into
+`nag_min_seconds` … `nag_max_seconds` (15 min … 4 h by default) so no agent can ask to be
+rung every five seconds. An unusable duration applies the state and says it ignored the
+nag; `nag` on any kind other than `awaiting` is ignored.
+
+**Opting a channel out.** Put `no-nag` in a channel's Purpose and no nag is ever placed
+there — neither the post nor the turn. It protects the channel it is written in, not the
+wait, so silencing a busy lead channel doesn't change how its builders declare themselves.
+
+Bounded by construction: nothing rings unless it asked to, one nag per level per wait, at
+most one nag post per watchdog tick across the whole fleet, and `nag_enabled = false` (or
+`MM_NAG_ENABLED=0`) as the global off switch, leaving the state directive and `.fleet`
+fully working.
 The global listings (`.sessions`, `.running`, `.invite`) reveal operator-wide state, so in
 a dormant channel they need an explicit mention.
 
@@ -171,6 +239,7 @@ as the daemon. All of them accept `--channel <channel>` to target another channe
 | `mm-bridge post [--file <path>] "<msg>"` | Post a message (`-` reads the body from stdin). |
 | `mm-bridge read [-n N] [--since 1h]` | Print recent posts — how one agent reads another's channel. |
 | `mm-bridge inbox [--channel <ref>]` | Print posts held for this session but not yet delivered. Needs no bot token. |
+| `mm-bridge fleet [--all] [--json]` | Print the state of this channel's child sessions: state, run, held posts. |
 | `mm-bridge spawn "<prompt>"` | Start a sub-session in a new sibling channel. |
 
 ### `mm-bridge spawn`
@@ -208,6 +277,10 @@ reply and strips them from the visible post:
 
 - `<openFile path="/abs/path" [line="N"] />` — upload that file (must live under an
   allowed root; see `allowed_attachment_roots`).
+- `<state kind="idle|awaiting|parked|blocked" [on="lead|<username>"] [note="..."]
+  [nag="45m"] />` — declare how the turn ends. Last tag wins; no tag means `idle`; an
+  unknown `kind` leaves the state alone and gets a one-line reply naming the valid ones.
+  `nag=` is what makes an `awaiting` ring; without it the wait is passive.
 
 [`CLAUDE-include.md`](CLAUDE-include.md) is the prompt snippet that teaches Claude how to
 use all of this — drop it into your `CLAUDE.md`.
@@ -274,6 +347,16 @@ auto_join_reconcile_seconds = 5.0
 # Attachment safety — <openFile path="..."> only resolves files under these.
 allowed_attachment_roots = ["~/projects"]
 
+# Awaiting-nag. A wait rings only if it asked to (`nag="45m"` on the
+# `<state/>` tag); these bounds clamp what it may ask for.
+# `nag_enabled = false` is the global off switch — it means "honour nag
+# requests" — and leaves the state directive and `.fleet` working.
+# Put `no-nag` in a channel's Purpose to stop nags landing in it.
+nag_enabled = true
+nag_min_seconds = 900
+nag_max_seconds = 14400
+operator_username = "tijs"
+
 # State + sidecar paths.
 state_file  = "~/.config/mm-bridge/state.json"
 sidecar_dir = "~/.mm-bridge/sessions"
@@ -325,14 +408,21 @@ url = "http://localhost:8877"
 | `MM_BRIDGE_HELD_POSTS` | Path to the held-posts JSON (default: beside the state file). |
 | `MM_COALESCE_POSTS` | `0/false/no/off` to disable hold-and-coalesce (default on). |
 | `MM_COALESCE_MAX_HELD` | Per-anchor cap on held posts (default 50). |
+| `MM_NAG_ENABLED` | `0/false/no/off` to ignore all nag requests (default on). |
+| `MM_NAG_MIN_SECONDS` | Floor for a requested nag delay (default 900). |
+| `MM_NAG_MAX_SECONDS` | Ceiling for a requested nag delay (default 14400). |
+| `MM_OPERATOR_USERNAME` | Who an escalating nag @-mentions. |
 | `MM_BRIDGE_CONFIG` | Path to the TOML file. |
 
 ## Under the hood
 
-**State file** — the canonical `session ↔ Anchor(channel_id, root_id?)` map. JSON, v5
+**State file** — the canonical `session ↔ Anchor(channel_id, root_id?)` map. JSON, v6
 schema (v3 collapsed the mapping into `entries`, v4 added the SSE cursor, v5 the adopted
-session ids); v2 is read transparently and re-emitted as the current version on the next
-save.
+session ids, v6 the per-session turn-end `state`); v2 is read transparently and re-emitted
+as the current version on the next save. Written atomically (temp + rename), because
+`mm-bridge fleet` reads it out of process while the daemon is writing it. A session's state
+rides its entry deliberately: unlinking or replacing a session then drops its state with no
+separate cleanup path.
 
 **Held-posts file** — `held_posts.json`, beside the state file. Posts that arrived while a
 session's run was in flight, waiting to be delivered as one coalesced turn. Written

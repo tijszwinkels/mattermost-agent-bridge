@@ -15,6 +15,7 @@ from mm_bridge.purpose import (
     join_sections,
     parse,
     split_config_section,
+    has_no_nag,
     to_purpose_string,
 )
 
@@ -615,6 +616,50 @@ def test_strict_catalog_off_keeps_permissive_purpose_parsing():
     )
     assert cfg.model == "claude-opus-4-7"
     assert cfg.warnings == []
+
+
+# ---------------------------------------------------------------------------
+# `no-nag` — opting a CHANNEL out of receiving awaiting-nags (F2 / C3)
+
+
+def test_no_nag_token_is_parsed():
+    cfg = parse("claude, autorespond, no-nag", "claude", None, _models_for)
+    assert cfg.no_nag is True
+    assert cfg.backend == "claude"
+    assert cfg.warnings == []
+
+
+def test_no_nag_spelling_variants():
+    for token in ("no-nag", "nonag", "no_nag", "NO-NAG"):
+        assert parse(f"claude, {token}", "claude", None, _models_for).no_nag is True
+
+
+def test_absent_no_nag_defaults_to_false():
+    assert parse("claude, autorespond", "claude", None, _models_for).no_nag is False
+    assert parse("", "claude", None, _models_for).no_nag is False
+
+
+def test_no_nag_alone_still_yields_the_default_backend():
+    cfg = parse("no-nag", "claude", None, _models_for)
+    assert cfg.no_nag is True
+    assert cfg.backend == "claude"
+    assert cfg.warnings == []
+
+
+def test_no_nag_survives_a_round_trip():
+    """A `.cwd` / `.autorespond` rewrite must never silently drop the opt-out."""
+    cfg = parse("claude, mention-only, cwd=/tmp/x, no-nag", "claude", None, _models_for)
+    again = parse(to_purpose_string(cfg, default_autorespond=True),
+                  "claude", None, _models_for)
+    assert again.no_nag is True
+    assert again.cwd == "/tmp/x"
+    assert again.mention_only is True
+
+
+def test_has_no_nag_scans_raw_text_without_a_catalog():
+    assert has_no_nag("claude, no-nag") is True
+    assert has_no_nag("claude, autorespond") is False
+    assert has_no_nag("") is False
 
 
 if __name__ == "__main__":

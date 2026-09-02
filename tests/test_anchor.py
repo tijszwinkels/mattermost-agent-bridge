@@ -9,11 +9,14 @@ fields and re-emits them under the new `entries` key on first save.
 from __future__ import annotations
 
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from mm_bridge.config import Anchor, ChannelMapping
+from mm_bridge.session_state import SessionState
 
 
 class AnchorTypeTests(unittest.TestCase):
@@ -283,6 +286,148 @@ class AdoptedSessionIdsTests(unittest.TestCase):
         self.assertEqual(
             sorted(data["adopted_session_ids"]), ["claude_x", "claude_y"],
         )
+
+
+class SessionStateSchemaTests(unittest.TestCase):
+    """v5 → v6: one small `state` object per entry (F2).
+
+    Colocated with the mapping rather than kept in a sibling file because a
+    state's lifetime IS its session's: `unlink()` and session replacement
+    must drop it, and colocation gets that for free.
+
+    Spec: specs/20260901-turn-state-fleet/design.md §2.
+    """
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.state = f"{self.tmp.name}/state.json"
+        self.sdir = f"{self.tmp.name}/sessions"
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def _mapping(self) -> ChannelMapping:
+        return ChannelMapping.load(self.state, self.sdir)
+
+    def test_state_round_trips_through_disk(self) -> None:
+        m = self._mapping()
+        m.link(Anchor("c1"), "ses_a")
+        m.set_state("ses_a", SessionState("awaiting", on="lead",
+                                          note="M0 gate", set_at=1756704000.0))
+        reloaded = ChannelMapping.load(self.state, self.sdir)
+        got = reloaded.get_state("ses_a")
+        assert got is not None
+        self.assertEqual(got.kind, "awaiting")
+        self.assertEqual(got.on, "lead")
+        self.assertEqual(got.note, "M0 gate")
+        self.assertEqual(got.set_at, 1756704000.0)
+
+    def test_saved_file_declares_version_6(self) -> None:
+        m = self._mapping()
+        m.link(Anchor("c1"), "ses_a")
+        data = json.loads(Path(self.state).read_text())
+        self.assertEqual(data["version"], 6)
+
+    def test_v5_file_loads_with_no_states(self) -> None:
+        Path(self.state).parent.mkdir(parents=True, exist_ok=True)
+        Path(self.state).write_text(json.dumps({
+            "version": 5,
+            "entries": [{"channel_id": "c1", "root_id": None,
+                         "session_id": "ses_a"}],
+            "last_event_seq": 7,
+            "adopted_session_ids": [],
+        }))
+        m = ChannelMapping.load(self.state, self.sdir)
+        self.assertEqual(m.get_session(Anchor("c1")), "ses_a")
+        self.assertIsNone(m.get_state("ses_a"))
+
+    def test_corrupt_state_object_costs_the_state_not_the_entry(self) -> None:
+        Path(self.state).parent.mkdir(parents=True, exist_ok=True)
+        Path(self.state).write_text(json.dumps({
+            "version": 6,
+            "entries": [{"channel_id": "c1", "root_id": None,
+                         "session_id": "ses_a", "state": {"kind": "nonsense"}}],
+        }))
+        m = ChannelMapping.load(self.state, self.sdir)
+        self.assertEqual(m.get_session(Anchor("c1")), "ses_a")
+        self.assertIsNone(m.get_state("ses_a"))
+
+    def test_unlink_drops_the_state_with_the_entry(self) -> None:
+        m = self._mapping()
+        m.link(Anchor("c1"), "ses_a")
+        m.set_state("ses_a", SessionState("awaiting"))
+        m.unlink(Anchor("c1"))
+        self.assertIsNone(m.get_state("ses_a"))
+        reloaded = ChannelMapping.load(self.state, self.sdir)
+        self.assertIsNone(reloaded.get_state("ses_a"))
+
+    def test_replacing_an_anchors_session_drops_the_old_state(self) -> None:
+        """`.model` / `.backend` swaps relink the anchor to a new session."""
+        m = self._mapping()
+        m.link(Anchor("c1"), "ses_old")
+        m.set_state("ses_old", SessionState("awaiting"))
+        m.link(Anchor("c1"), "ses_new")
+        self.assertIsNone(m.get_state("ses_old"))
+
+    def test_set_state_none_clears(self) -> None:
+        m = self._mapping()
+        m.link(Anchor("c1"), "ses_a")
+        m.set_state("ses_a", SessionState("awaiting"))
+        m.set_state("ses_a", None)
+        self.assertIsNone(m.get_state("ses_a"))
+
+    def test_state_for_an_unmapped_session_is_not_persisted(self) -> None:
+        """States ride entries; a session with no anchor has no row to ride."""
+        m = self._mapping()
+        m.set_state("ses_ghost", SessionState("awaiting"))
+        reloaded = ChannelMapping.load(self.state, self.sdir)
+        self.assertIsNone(reloaded.get_state("ses_ghost"))
+
+
+class AtomicSaveTests(unittest.TestCase):
+    """`save()` is atomic — the CLI (`mm-bridge fleet`) now reads this file
+    out of process while the daemon writes it, so a torn read must be
+    impossible. Mirrors `HeldPostStore._save`.
+
+    Lead condition on the v6 ruling: shared-path code gets its own reds.
+    """
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.state = f"{self.tmp.name}/state.json"
+        self.sdir = f"{self.tmp.name}/sessions"
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def test_write_lands_through_os_replace(self) -> None:
+        m = ChannelMapping.load(self.state, self.sdir)
+        with patch("mm_bridge.config.os.replace", wraps=os.replace) as repl:
+            m.link(Anchor("c1"), "ses_a")
+        self.assertTrue(repl.called, "save() must publish via os.replace")
+        self.assertEqual(json.loads(Path(self.state).read_text())["version"], 6)
+
+    def test_a_failed_write_leaves_no_temp_file_behind(self) -> None:
+        m = ChannelMapping.load(self.state, self.sdir)
+        m.link(Anchor("c1"), "ses_a")
+        before = set(Path(self.tmp.name).iterdir())
+        with patch("mm_bridge.config.os.replace",
+                   side_effect=OSError("disk full")):
+            with self.assertRaises(OSError):
+                m.save()
+        self.assertEqual(set(Path(self.tmp.name).iterdir()), before)
+
+    def test_a_failed_write_leaves_the_previous_file_intact(self) -> None:
+        m = ChannelMapping.load(self.state, self.sdir)
+        m.link(Anchor("c1"), "ses_a")
+        good = Path(self.state).read_text()
+        # Mutate in memory only — `link()` would save successfully first.
+        m.anchor_to_session[Anchor("c2")] = "ses_b"
+        with patch("mm_bridge.config.os.replace",
+                   side_effect=OSError("disk full")):
+            with self.assertRaises(OSError):
+                m.save()
+        self.assertEqual(Path(self.state).read_text(), good)
 
 
 if __name__ == "__main__":

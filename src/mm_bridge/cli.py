@@ -6,6 +6,7 @@ Subcommands:
   - `channel`               → print this session's MM channel_id (debug)
   - `spawn <prompt>`        → start a sub-session in a new sibling channel
   - `inbox`                 → print posts held for this session, not yet delivered
+  - `fleet`                 → print the state of this channel's child sessions
 
 A bare `mm-bridge` prints help and exits with status 1 — this is intentional
 so that a typo like `mm-bridge` (meaning to ask a question inside a channel)
@@ -31,10 +32,16 @@ import json
 
 from . import sidecar, spawn as spawn_mod
 from .agent_harness_client import AgentHarnessClient
-from .bridge import Bridge, resolve_attachment_path
+from .bridge import (
+    Bridge,
+    HARNESS_LIVE_RUN_STATUSES,
+    fleet_targets,
+    resolve_attachment_path,
+)
 from .codex_session import find_active_codex_rollout_uuid, iter_session_ids_by_cwd
 from .config import Anchor, ChannelMapping, Config
 from .held_posts import HeldPostStore
+from .session_state import FleetRow, render_fleet
 from .channel_ref import ChannelRef, ChannelRefError, parse_channel_ref
 from .mm_client import MattermostClient
 
@@ -1223,6 +1230,162 @@ def cmd_inbox(args: argparse.Namespace) -> int:
     return 0
 
 
+# Per-probe bound for the CLI's fleet pass. The probes fan out, so this is
+# also the total wall-clock bound. Deliberately shorter than the daemon's:
+# a human is waiting on a terminal prompt.
+FLEET_CLI_PROBE_TIMEOUT_S = 2.0
+
+
+async def _probe_fleet_runs(
+    harness_url: str, session_ids: list[str],
+) -> dict[str, bool | None]:
+    """Ask the harness which of `session_ids` have a live run.
+
+    Best-effort and bounded: a value of ``None`` means UNKNOWN (timeout,
+    error, harness down) and renders as `?`. Unlike the daemon, the CLI has
+    no run tracker to fall back to, so "unknown" is the honest answer rather
+    than "idle".
+    """
+    if not session_ids:
+        return {}
+    harness = AgentHarnessClient(harness_url)
+
+    async def probe(sid: str) -> bool | None:
+        try:
+            runs = await asyncio.wait_for(
+                harness.list_session_runs(sid), FLEET_CLI_PROBE_TIMEOUT_S,
+            )
+        except Exception:
+            return None
+        return any(
+            (r or {}).get("status") in HARNESS_LIVE_RUN_STATUSES for r in runs
+        )
+
+    try:
+        results = await asyncio.gather(*(probe(s) for s in session_ids))
+    finally:
+        try:
+            await harness.close()
+        except Exception:
+            pass
+    return dict(zip(session_ids, results))
+
+
+def cmd_fleet(args: argparse.Namespace) -> int:
+    """Print one row per child channel: state, run, held posts.
+
+    The out-of-process twin of the `.fleet` dot-command. Both build their
+    rows with `fleet_targets` and render them with `render_fleet`, so they
+    cannot drift.
+
+    Read-only and best-effort **by contract**, exactly like
+    ``mm-bridge inbox``. The daemon owns the state and holds files and
+    rewrites both atomically (temp + ``os.replace``), so this can never read
+    a torn file — the worst case is a snapshot one watchdog tick stale.
+    Every failure mode (missing file, corrupt JSON, unknown schema,
+    unreachable harness) degrades to a row that says so, never a traceback:
+    a lead checking the fleet must not be the thing that breaks.
+
+    The mapping is loaded with ``reconcile_sidecars=False``: the daemon owns
+    the sidecar directory, and a read-only view must never mutate it.
+    """
+    cfg = Config.load()
+    _require_bot_token(cfg)
+
+    mm = _make_mm_client(cfg)
+    try:
+        mm.login()
+    except Exception as exc:
+        print(f"Error: could not log into Mattermost: {exc}", file=sys.stderr)
+        return 3
+
+    if args.channel:
+        try:
+            ref = _validate_channel_ref(cfg, args.channel)
+            anchor = (
+                Anchor(args.channel) if ref is not None and ref.kind == "id"
+                else _resolve_explicit_anchor(ref, cfg, mm)
+            )
+        except ChannelResolutionError as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            return 2
+        channel_id = anchor.channel_id
+    else:
+        try:
+            session_id = _current_session_id(cfg.sidecar_dir)
+            channel_id = _resolve_anchor_from_session(
+                cfg.sidecar_dir, session_id,
+            ).channel_id
+        except NotInMattermostChannel as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            return 2
+
+    try:
+        channels = mm.list_bot_channels()
+    except Exception as exc:
+        print(f"Error: could not list channels: {exc}", file=sys.stderr)
+        return 3
+    by_id = {c.get("id"): c for c in channels if c.get("id")}
+    if channel_id not in by_id:
+        try:
+            by_id[channel_id] = mm.get_channel(channel_id)
+        except Exception:
+            pass
+
+    try:
+        mapping = ChannelMapping.load(
+            cfg.state_file, sidecar_dir=cfg.sidecar_dir,
+            reconcile_sidecars=False,
+        )
+    except Exception as exc:
+        # A corrupt or half-migrated state file must not take the view down;
+        # channels still render (dormant), which is itself informative.
+        print(f"# state file unreadable ({exc}) — showing channels only",
+              file=sys.stderr)
+        mapping = ChannelMapping(_path=cfg.state_file)
+
+    holds = HeldPostStore(cfg.resolved_held_posts_file(), cap=1)
+    holds.load()
+
+    targets = fleet_targets(
+        channel_id, by_id, mapping, all_sessions=bool(args.all),
+    )
+    session_ids = [sid for _a, sid, _t in targets if sid]
+    probed = asyncio.run(_probe_fleet_runs(cfg.agent_harness_url, session_ids))
+
+    now = time.time()
+    rows: list[FleetRow] = []
+    for anchor, sid, title in targets:
+        state = mapping.get_state(sid) if sid else None
+        live = probed.get(sid) if sid else False
+        rows.append(FleetRow(
+            title=title,
+            state=state,
+            age_s=(now - state.set_at) if state and state.set_at else None,
+            run_live=bool(live),
+            held=len(holds.peek(anchor)),
+            uncertain=sid is not None and live is None,
+        ))
+
+    if args.json:
+        print(json.dumps([
+            {
+                "title": r.title,
+                "state": r.state.to_json() if r.state else None,
+                "age_s": r.age_s,
+                "run_live": r.run_live,
+                "held": r.held,
+                "uncertain": r.uncertain,
+                "failure": r.failure,
+            }
+            for r in rows
+        ], indent=2))
+        return 0
+
+    print(render_fleet(rows))
+    return 0
+
+
 def cmd_spawn(args: argparse.Namespace) -> int:
     cfg = Config.load()
     _require_bot_token(cfg)
@@ -1716,6 +1879,34 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Emit the raw held-post envelopes as JSON.",
     )
     p_inbox.set_defaults(func=cmd_inbox)
+
+    p_fleet = sub.add_parser(
+        "fleet",
+        help="Show the state of this channel's spawned child sessions.",
+        description=(
+            "One row per child channel (those whose header reads "
+            "`Parent: ~<this channel>~`): declared state, whether a run is "
+            "live, how long it has been that way, and how many posts are "
+            "held for it. Best-effort: the daemon owns the files, so treat "
+            "the output as a snapshot."
+        ),
+    )
+    p_fleet.add_argument(
+        "--channel",
+        help=(
+            "Channel id, bare slug, channel URL or permalink URL. Defaults "
+            "to the current session's own channel."
+        ),
+    )
+    p_fleet.add_argument(
+        "--all", action="store_true",
+        help="Show every mapped session, not just this channel's children.",
+    )
+    p_fleet.add_argument(
+        "--json", action="store_true",
+        help="Emit the rows as JSON.",
+    )
+    p_fleet.set_defaults(func=cmd_fleet)
 
     p_spawn = sub.add_parser(
         "spawn",

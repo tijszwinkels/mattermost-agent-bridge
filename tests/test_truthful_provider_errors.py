@@ -427,11 +427,20 @@ class StateNoteTests(unittest.TestCase):
 
 
 class StateSeamTests(_BridgeTestCase):
-    """F2 (`feat/turn-state-fleet`) owns `set_session_state`. This branch must
-    stand alone on `main`, where that API does not exist yet."""
+    """F2 (`feat/turn-state-fleet`) owns `set_session_state`.
+
+    This test originally asserted the API was ABSENT, because F3 had to stand
+    alone on a `main` that did not have F2 yet. F2 has since merged, so that
+    assertion is now false by construction — but the guard in
+    `_note_run_failure` is still live code (it is a `getattr(..., None)`), and
+    the branch it protects still has to be covered. So absence is SIMULATED
+    here rather than asserted about the codebase: the invariant under test was
+    never "F2 doesn't exist", it was "a missing setter must not cost the
+    channel its warning".
+    """
 
     async def test_seam_is_a_no_op_when_f2s_api_is_absent(self):
-        self.assertFalse(hasattr(self.bridge, "set_session_state"))
+        self.bridge.set_session_state = None  # type: ignore[assignment]
         self.bridge.mapping.link(Anchor("c1"), "s1")
         self.bridge.purpose_by_channel["c1"] = PurposeConfig(
             backend="pi", model=None, mention_only=False,
