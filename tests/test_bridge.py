@@ -1199,7 +1199,8 @@ class DormantChannelTests(_BridgeTestCase):
     async def test_no_dot_command_forwards_to_llm_in_dormant(self):
         commands_under_test = [
             ".help", ".status", ".stop", ".autorespond", ".model", ".models",
-            ".backend", ".sessions", ".running", ".invite ses_x",
+            ".backend", ".effort", ".effort xhigh", ".sessions", ".running",
+            ".invite ses_x",
             ".frobnicate now",  # unknown dot-word
             "@claude .sessions",  # mentioned global command
         ]
@@ -6776,6 +6777,188 @@ class EffortSessionPlumbingTests(_BridgeTestCase):
         })
 
         self.assertIn("effort=medium", self.bridge.mm.channels["c1"]["purpose"])
+
+
+class EffortCommandTests(_BridgeTestCase):
+    """`.effort [<level>]` — the one config command that does NOT restart.
+
+    The harness rebuilds the backend argv on every run, so PATCHing the live
+    session is enough: the level lands on the next turn with the conversation
+    intact. That is also why a live run doesn't block the change.
+    """
+
+    def _posted_texts(self) -> list[str]:
+        return [p.message for p in self.bridge.mm.posted]
+
+    def _joined(self) -> str:
+        return "\n".join(self._posted_texts())
+
+    def _active_channel(self, effort: str | None = None) -> None:
+        from mm_bridge.purpose import PurposeConfig
+        self.bridge.mapping.link(Anchor("c1"), "s1")
+        self.bridge.purpose_by_channel["c1"] = PurposeConfig(
+            backend="claude", model="opus", mention_only=False, effort=effort,
+        )
+        purpose_text = "claude, opus, autorespond"
+        if effort:
+            purpose_text += f", effort={effort}"
+        self.bridge.mm.channels["c1"] = {"id": "c1", "purpose": purpose_text}
+        self.bridge.harness.sessions_meta = [{
+            "id": "s1", "backend": "claude-code", "model": "opus",
+            "project": {"path": "/tmp/proj"}, "status": "idle",
+            **({"effort": effort} if effort else {}),
+        }]
+
+    async def _post(self, message: str, **extra) -> None:
+        await self.bridge._on_mm_posted({
+            "channel_id": "c1", "message": message,
+            "user_id": "u1", "type": "", **extra,
+        })
+
+    # ----- setting a level on a live session -----
+
+    async def test_dot_effort_patches_without_creating_a_session(self):
+        self._active_channel()
+
+        await self._post(".effort xhigh")
+
+        self.assertEqual(self.bridge.harness.patched, [("s1", {"effort": "xhigh"})])
+        # The whole point: the conversation survives.
+        self.assertEqual(self.bridge.harness.created, [])
+        self.assertEqual(self.bridge.mapping.get_session(Anchor("c1")), "s1")
+
+    async def test_dot_effort_persists_to_channel_purpose(self):
+        self._active_channel()
+
+        await self._post(".effort max")
+
+        self.assertIn("effort=max", self.bridge.mm.channels["c1"]["purpose"])
+        self.assertEqual(self.bridge.purpose_by_channel["c1"].effort, "max")
+
+    async def test_dot_effort_normalises_case(self):
+        self._active_channel()
+
+        await self._post(".effort XHigh")
+
+        self.assertEqual(self.bridge.harness.patched, [("s1", {"effort": "xhigh"})])
+
+    async def test_dot_effort_accepts_change_while_a_run_is_active(self):
+        """Unlike `.model`, no `.stop` first — it applies from the next message."""
+        self._active_channel()
+        self.bridge.current_run_id_by_session["s1"] = "run-s1"
+
+        await self._post(".effort high")
+
+        self.assertEqual(self.bridge.harness.patched, [("s1", {"effort": "high"})])
+        self.assertNotIn("`.stop` it first", self._joined())
+        self.assertIn("next message", self._joined().lower())
+
+    # ----- reading -----
+
+    async def test_bare_dot_effort_reports_the_current_level(self):
+        self._active_channel(effort="medium")
+
+        await self._post(".effort")
+
+        self.assertIn("medium", self._joined())
+        self.assertEqual(self.bridge.harness.patched, [])
+
+    async def test_bare_dot_effort_reports_default_when_unset(self):
+        """Honest: unset means the backend CLI's own configured default."""
+        self._active_channel()
+
+        await self._post(".effort")
+
+        self.assertIn("default", self._joined())
+        self.assertEqual(self.bridge.harness.patched, [])
+
+    # ----- validation -----
+
+    async def test_invalid_level_is_rejected_with_the_valid_set(self):
+        self._active_channel()
+
+        await self._post(".effort turbo")
+
+        self.assertEqual(self.bridge.harness.patched, [])
+        joined = self._joined()
+        for level in ("low", "medium", "high", "xhigh", "max"):
+            self.assertIn(level, joined, level)
+        self.assertNotIn("effort=turbo", self.bridge.mm.channels["c1"]["purpose"])
+
+    # ----- truthful failures -----
+
+    async def test_patch_failure_does_not_claim_success_or_persist(self):
+        self._active_channel()
+        self.bridge.harness.update_session_error = RuntimeError("harness down")
+
+        await self._post(".effort max")
+
+        self.assertNotIn("effort=max", self.bridge.mm.channels["c1"]["purpose"])
+        self.assertIn(":warning:", self._joined())
+
+    # ----- dormant (no session yet) -----
+
+    async def _join_dormant(self, purpose_text: str = "autorespond") -> None:
+        self.bridge.mm.channels["c1"] = {
+            "id": "c1", "purpose": purpose_text, "display_name": "Test channel",
+        }
+        self.bridge._self_joined_channels.add("c1")
+        await self.bridge._on_mm_user_added("c1", self.bridge.mm.bot_user_id)
+
+    async def test_dormant_dot_effort_persists_without_a_session(self):
+        await self._join_dormant()
+
+        await self._post(".effort low")
+
+        self.assertEqual(self.bridge.harness.created, [])
+        self.assertEqual(self.bridge.harness.patched, [])
+        self.assertIn("effort=low", self.bridge.mm.channels["c1"]["purpose"])
+
+    async def test_dormant_bare_dot_effort_reads(self):
+        await self._join_dormant("claude, autorespond, effort=high")
+
+        await self._post(".effort")
+
+        self.assertIn("high", self._joined())
+        self.assertEqual(self.bridge.harness.created, [])
+
+    async def test_dormant_invalid_level_is_rejected(self):
+        await self._join_dormant()
+
+        await self._post(".effort turbo")
+
+        self.assertNotIn("effort=turbo", self.bridge.mm.channels["c1"]["purpose"])
+        self.assertIn("xhigh", self._joined())
+
+    # ----- .status -----
+
+    async def test_status_shows_the_effort_level(self):
+        self._active_channel(effort="xhigh")
+
+        await self._post(".status")
+
+        self.assertIn("effort: `xhigh`", self._joined())
+
+    async def test_status_shows_default_when_effort_unset(self):
+        self._active_channel()
+
+        await self._post(".status")
+
+        self.assertIn("effort: `default`", self._joined())
+
+    async def test_dormant_status_shows_the_effort_level(self):
+        await self._join_dormant("claude, autorespond, effort=max")
+
+        await self._post(".status")
+
+        self.assertIn("effort: `max`", self._joined())
+
+    async def test_dormant_status_shows_default_when_effort_unset(self):
+        await self._join_dormant("claude, autorespond")
+
+        await self._post(".status")
+
+        self.assertIn("effort: `default`", self._joined())
 
 
 if __name__ == "__main__":
