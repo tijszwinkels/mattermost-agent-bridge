@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import io
 import tempfile
 import unittest
@@ -641,7 +642,7 @@ class SpawnCommandTests(unittest.TestCase):
         Defaults to ``opus`` since the test fixture's ``default_backend``
         is claude.
         """
-        async def _stub(harness_url, message, cwd, backend, model, title=None):
+        async def _stub(harness_url, message, cwd, backend, model, title=None, effort=None):
             self.assertEqual(model, expected_model)
             sidecar.write(self.sdir, sess_id, chan_id)
             return {"status": "started"}
@@ -701,7 +702,7 @@ class SpawnCommandTests(unittest.TestCase):
         """
         captured: dict = {}
 
-        async def _stub(harness_url, message, cwd, backend, model, title=None):
+        async def _stub(harness_url, message, cwd, backend, model, title=None, effort=None):
             captured["message"] = message
             sidecar.write(self.sdir, "new-sess", "new-chan")
             return {"status": "started"}
@@ -844,7 +845,7 @@ class SpawnCommandTests(unittest.TestCase):
         """
         captured: dict = {}
 
-        async def _stub(harness_url, message, cwd, backend, model, title=None):
+        async def _stub(harness_url, message, cwd, backend, model, title=None, effort=None):
             captured["backend"] = backend
             captured["model"] = model
             captured["title"] = title
@@ -875,7 +876,7 @@ class SpawnCommandTests(unittest.TestCase):
         without mutating the daemon's config."""
         captured: dict = {}
 
-        async def _stub(harness_url, message, cwd, backend, model, title=None):
+        async def _stub(harness_url, message, cwd, backend, model, title=None, effort=None):
             captured["backend"] = backend
             captured["model"] = model
             sidecar.write(self.sdir, "new-sess", "new-chan")
@@ -896,6 +897,80 @@ class SpawnCommandTests(unittest.TestCase):
         self.assertEqual(captured["backend"], "claude")
         self.assertEqual(captured["model"], "claude-fable-5")
 
+    def test_spawn_effort_flag_reaches_create_session(self) -> None:
+        """``mm-bridge spawn --effort xhigh`` sets the sub-session's
+        reasoning level at create time — the spawn-path equivalent of an
+        `effort=` Channel Purpose token."""
+        captured: dict = {}
+
+        async def _stub(
+            harness_url, message, cwd, backend, model, title=None, effort=None,
+        ):
+            captured["effort"] = effort
+            sidecar.write(self.sdir, "new-sess", "new-chan")
+            return {"status": "started"}
+
+        with patch("sys.argv", [
+            "mm-bridge", "spawn", "hi", "--effort", "XHigh",
+        ]), \
+             patch("mm_bridge.cli.Config.load", return_value=self.cfg), \
+             patch.dict("os.environ", {"CLAUDE_SESSION_ID": "parent-sess"}), \
+             patch("mm_bridge.cli._make_mm_client", return_value=self.fake_mm), \
+             patch("mm_bridge.cli._harness_create_session", side_effect=_stub):
+            with self.assertRaises(SystemExit) as cm:
+                cli.main()
+            self.assertEqual(cm.exception.code, 0)
+
+        # Normalised to the canonical lowercase level.
+        self.assertEqual(captured["effort"], "xhigh")
+
+    def test_spawn_without_effort_sends_none(self) -> None:
+        """Unset stays unset — the backend CLI's own default applies."""
+        captured: dict = {}
+
+        async def _stub(
+            harness_url, message, cwd, backend, model, title=None, effort=None,
+        ):
+            captured["effort"] = effort
+            sidecar.write(self.sdir, "new-sess", "new-chan")
+            return {"status": "started"}
+
+        with patch("sys.argv", ["mm-bridge", "spawn", "hi"]), \
+             patch("mm_bridge.cli.Config.load", return_value=self.cfg), \
+             patch.dict("os.environ", {"CLAUDE_SESSION_ID": "parent-sess"}), \
+             patch("mm_bridge.cli._make_mm_client", return_value=self.fake_mm), \
+             patch("mm_bridge.cli._harness_create_session", side_effect=_stub):
+            with self.assertRaises(SystemExit) as cm:
+                cli.main()
+            self.assertEqual(cm.exception.code, 0)
+
+        self.assertIsNone(captured["effort"])
+
+    def test_spawn_rejects_unknown_effort_level_before_dispatching(self) -> None:
+        """codex doesn't validate the level locally — it forwards it and the
+        API 400s mid-run. Fail here instead, before anything is spawned."""
+        called: list = []
+
+        async def _stub(*a, **kw):
+            called.append(kw)
+            return {"status": "started"}
+
+        stderr = io.StringIO()
+        with patch("sys.argv", [
+            "mm-bridge", "spawn", "hi", "--effort", "turbo",
+        ]), \
+             patch("mm_bridge.cli.Config.load", return_value=self.cfg), \
+             patch.dict("os.environ", {"CLAUDE_SESSION_ID": "parent-sess"}), \
+             patch("mm_bridge.cli._make_mm_client", return_value=self.fake_mm), \
+             patch("mm_bridge.cli._harness_create_session", side_effect=_stub), \
+             contextlib.redirect_stderr(stderr):
+            with self.assertRaises(SystemExit) as cm:
+                cli.main()
+            self.assertEqual(cm.exception.code, 2)
+
+        self.assertEqual(called, [])
+        self.assertIn("xhigh", stderr.getvalue())
+
     def test_spawn_passes_title_to_harness_create_session(self) -> None:
         """``mm-bridge spawn --title "Foo"`` must surface "Foo" as the
         harness Session.title so consumers (e.g. command-bridge lane
@@ -903,7 +978,7 @@ class SpawnCommandTests(unittest.TestCase):
         back to project name or session id."""
         captured: dict = {}
 
-        async def _stub(harness_url, message, cwd, backend, model, title=None):
+        async def _stub(harness_url, message, cwd, backend, model, title=None, effort=None):
             captured["title"] = title
             sidecar.write(self.sdir, "new-sess", "new-chan")
             return {"status": "started"}
@@ -996,7 +1071,7 @@ class SpawnCommandTests(unittest.TestCase):
         self.assertIn("/pl/root-9", header_text)
 
     def test_spawn_harness_failure_exits_3(self) -> None:
-        async def _boom(harness_url, message, cwd, backend, model):
+        async def _boom(harness_url, message, cwd, backend, model, effort=None):
             raise RuntimeError("harness down")
         with patch("sys.argv", ["mm-bridge", "spawn", "x"]), \
              patch("mm_bridge.cli.Config.load", return_value=self.cfg), \
