@@ -51,6 +51,28 @@ def exception_detail(exc: BaseException) -> str:
     return msg or type(exc).__name__
 
 
+def format_resume_refusal(detail: str) -> str:
+    """Channel text for a harness 409 on ``POST /v1/runs``.
+
+    A 409 is the harness declining *before* it ran anything, and its
+    ``detail`` explains why — most usefully for an external pi session
+    whose transcript has moved or been deleted, where the alternative to
+    refusing is pi quietly opening a new conversation and answering with
+    no memory of the thread. Repeating that reason is the whole point:
+    it's the difference between an operator fixing the session's cwd and
+    an operator concluding the bridge is broken.
+
+    Says explicitly that the message did not run, so a refusal can never be
+    mistaken for a delivered-but-quiet turn. Redacted and condensed like
+    every other channel-facing error.
+    """
+    safe_detail = condense_error_detail(redact_secrets(detail))
+    return (
+        ":warning: **Your message was not delivered** — the harness can't "
+        f"continue this session:\n> {safe_detail}"
+    )
+
+
 def run_failure_detail(data: dict) -> str:
     """Human-relevant detail from a ``run.failed`` SSE payload.
 
