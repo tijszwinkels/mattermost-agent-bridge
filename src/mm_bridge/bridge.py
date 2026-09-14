@@ -547,6 +547,9 @@ class Bridge:
         )
         self.typing: TypingIndicator | None = None  # created after login
         self.purpose_by_channel: dict[str, purpose.PurposeConfig] = {}
+        # Channels whose Purpose changed under us since we last parsed it.
+        # Cleared by any successful (re)load; consulted by the write path.
+        self._purpose_dirty: set[str] = set()
         self.warming_up_sessions: dict[str, WarmingUpChannel] = {}
         self.dead_threads: set[tuple[str, str]] = set()
         self.last_channel_state: dict[str, dict] = {}
@@ -1214,6 +1217,7 @@ class Bridge:
                     return
                 self._dormant_channels.discard(channel_id)
                 self.purpose_by_channel.pop(channel_id, None)
+                self._purpose_dirty.discard(channel_id)
                 return
             if self._stop_cmd_re.match(message):
                 self._post_cmd_reply(
@@ -1396,6 +1400,7 @@ class Bridge:
             return
         session_id = self.mapping.unlink(Anchor(channel_id))
         self.purpose_by_channel.pop(channel_id, None)
+        self._purpose_dirty.discard(channel_id)
         self.warming_up_sessions.pop(channel_id, None)
         self._dormant_channels.discard(channel_id)
         # Drain per-channel config state so a removal mid-restart (before the
@@ -1439,6 +1444,22 @@ class Bridge:
                 if not pending:
                     self._self_written_purpose.pop(channel_id, None)
                 return
+
+            # Mark the cached config stale. The next command that REWRITES
+            # the Purpose re-reads before serialising, so it can no longer
+            # paste a pre-edit copy over what the operator just typed
+            # (`cwd=`, `no-nag`, ...) — the b4667c2 erasure class, reached
+            # here through an external edit instead of a cold cache.
+            #
+            # A mark, not a reload: reloading here would put a Mattermost GET
+            # plus a per-backend model-catalog fetch on the critical path of
+            # the serial WebSocket dispatcher, and a reload that FAILED would
+            # leave the stale copy in place — exactly what we are guarding
+            # against. Dropping the entry outright is worse still: a cold
+            # cache reads as autorespond (`if cfg and cfg.mention_only`), so a
+            # mention-only channel would answer everything until something
+            # repopulated it.
+            self._purpose_dirty.add(channel_id)
 
             if channel_id in self._dormant_channels:
                 try:
@@ -1589,6 +1610,7 @@ class Bridge:
         except Exception as exc:
             logger.exception("Failed to create agent-harness session for channel %s", channel_id)
             self.purpose_by_channel.pop(channel_id, None)
+            self._purpose_dirty.discard(channel_id)
             self._awaiting_first_forward.discard(channel_id)
             self._pending_initial_catch_up.pop(channel_id, None)
             try:
@@ -1859,6 +1881,7 @@ class Bridge:
                     self.purpose_by_channel[channel_id] = previous_cfg
                 else:
                     self.purpose_by_channel.pop(channel_id, None)
+                    self._purpose_dirty.discard(channel_id)
                 try:
                     self.mm.post_message(
                         channel_id,
@@ -1989,7 +2012,15 @@ class Bridge:
     ) -> purpose.PurposeConfig:
         """Return and cache the effective Channel Purpose configuration."""
         cached = self.purpose_by_channel.get(channel_id)
-        if cached is not None and not force:
+        # The dirty mark forces a re-read on its own. Checking it here rather
+        # than at one call site is what makes it reliable: the dormant
+        # command path loads without `force` and would otherwise serialise
+        # the stale copy — the same erasure, reached by another route.
+        if (
+            cached is not None
+            and not force
+            and channel_id not in self._purpose_dirty
+        ):
             return cached
         ch = await asyncio.to_thread(self.mm.get_channel, channel_id)
         self.last_channel_state.setdefault(channel_id, {
@@ -2005,6 +2036,7 @@ class Bridge:
             default_autorespond=self.config.default_autorespond,
         )
         self.purpose_by_channel[channel_id] = cfg
+        self._purpose_dirty.discard(channel_id)
         return cfg
 
     async def _config_for_update(
@@ -2025,6 +2057,14 @@ class Bridge:
         Returns ``None`` when the Purpose can't be read; callers refuse via
         :meth:`_refuse_update_unknown_config`.
         """
+        # Force a re-read only when a `channel_updated` event told us the
+        # Purpose moved. Forcing unconditionally would be wrong: the cache
+        # legitimately holds state the Purpose text cannot express — a
+        # Purpose with no autorespond token resolves that flag from the
+        # daemon default, so a blanket re-read makes a bare `.autorespond`
+        # toggle flip from the default rather than the channel's real state.
+        # A failed read returns None here, and callers refuse the command
+        # rather than writing invented values.
         try:
             return await self._load_channel_config(channel_id)
         except Exception:
@@ -5475,6 +5515,7 @@ class Bridge:
             return
         self.mapping.unlink(Anchor(channel_id))
         self.purpose_by_channel.pop(channel_id, None)
+        self._purpose_dirty.discard(channel_id)
         self._awaiting_first_forward.discard(channel_id)
         self._pending_initial_catch_up.pop(channel_id, None)
         self._forget_channel_silent_drops(channel_id)

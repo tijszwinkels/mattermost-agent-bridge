@@ -48,6 +48,8 @@ class FakeMattermostClient:
     # Simulates Mattermost rejecting a Purpose write (permissions, the 250-char
     # cap, an outage) so callers can be tested for truthful reporting.
     set_channel_purpose_error: Exception | None = None
+    # Simulates Mattermost being unreachable for a channel read.
+    get_channel_error: Exception | None = None
     users: dict = field(default_factory=dict)
     posts_by_channel: dict = field(default_factory=dict)
     posts_by_id: dict = field(default_factory=dict)
@@ -141,6 +143,8 @@ class FakeMattermostClient:
         self.channels.setdefault(channel_id, {"id": channel_id})["purpose"] = purpose
 
     def get_channel(self, channel_id: str) -> dict:
+        if self.get_channel_error is not None:
+            raise self.get_channel_error
         return self.channels.get(channel_id, {"id": channel_id, "purpose": ""})
 
     def remove_self_from_channel(self, channel_id: str) -> None:
