@@ -202,6 +202,31 @@ def test_cwd_arg_preserves_case_and_tilde():
     assert cmd.arg == "~/Projects/MM-Bridge"
 
 
+def test_effort_command_is_registered_and_parses():
+    assert "effort" in REGISTRY
+    cmd = parse(".effort xhigh")
+    assert cmd.name == "effort"
+    assert cmd.arg == "xhigh"
+
+
+def test_bare_effort_has_no_arg():
+    cmd = parse(".effort")
+    assert cmd.name == "effort"
+    assert cmd.arg is None
+
+
+def test_effort_usage_lists_the_levels():
+    """`.help` renders from the registry — the closed set has to be visible."""
+    usage = REGISTRY["effort"].usage
+    for level in ("low", "medium", "high", "xhigh", "max"):
+        assert level in usage, level
+
+
+def test_effort_is_session_scoped_but_channel_local():
+    assert REGISTRY["effort"].session_scoped is True
+    assert REGISTRY["effort"].global_scope is False
+
+
 # ---------------------------------------------------------------------------
 # Command capability metadata — the single source of truth the bridge's
 # pre-session (dormant) gate reads. `global_scope` marks operator-wide
@@ -216,7 +241,8 @@ def test_global_scope_flags_only_operator_wide_commands():
         assert REGISTRY[name].global_scope is True, name
     # These are channel-local: they only read/change THIS channel.
     for name in (
-        "help", "status", "stop", "model", "backend", "cwd", "models", "autorespond",
+        "help", "status", "stop", "model", "backend", "cwd", "models",
+        "autorespond", "effort",
     ):
         assert REGISTRY[name].global_scope is False, name
 

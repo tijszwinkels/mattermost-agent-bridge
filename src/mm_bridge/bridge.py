@@ -1568,6 +1568,7 @@ class Bridge:
                 model=self._resolve_session_model(cfg),
                 cwd=effective_cwd,
                 title=display_name,
+                effort=cfg.effort,
             )
             session_id = session.get("id")
             if not session_id:
@@ -1665,6 +1666,12 @@ class Bridge:
         """Layer `new` on top of `current`. Any field explicitly set by the
         new parse wins; omitted fields fall back to current.
 
+        Built with ``replace(current, ...)`` — overriding exactly the fields
+        a caller's `new` actually carries — so a field added to
+        ``PurposeConfig`` later falls back correctly without touching this
+        function. Rebuilding field-by-field instead silently reset every
+        field this function hadn't been taught about (`no_nag` was one).
+
         Exception: when the backend changes, the carried model is dropped.
         Models are backend-specific (``sonnet`` is claude-only, ``gpt-5.5``
         is codex-only) — letting one leak across a backend swap crashes
@@ -1681,11 +1688,13 @@ class Bridge:
             model = None
         else:
             model = current.model
-        return purpose.PurposeConfig(
+        return replace(
+            current,
             backend=new.backend,
             model=model,
             mention_only=new.mention_only,
             cwd=new.cwd if new.cwd is not None else current.cwd,
+            effort=new.effort if new.effort is not None else current.effort,
             warnings=[],
         )
 
@@ -1825,6 +1834,7 @@ class Bridge:
                     backend=cfg.backend,
                     model=self._resolve_session_model(cfg),
                     cwd=effective_cwd,
+                    effort=cfg.effort,
                 )
                 session_id = session.get("id")
                 if not session_id:
@@ -2068,12 +2078,8 @@ class Bridge:
         but the flag is carried through to the persisted Purpose untouched).
         """
         turn_on_autorespond = token.strip().lower() in purpose.AUTORESPOND_ALIASES
-        updated = purpose.PurposeConfig(
-            backend=current.backend,
-            model=current.model,
-            mention_only=not turn_on_autorespond,
-            cwd=current.cwd,
-            warnings=[],
+        updated = replace(
+            current, mention_only=not turn_on_autorespond, warnings=[],
         )
         self.purpose_by_channel[channel_id] = updated
         self._persist_purpose(channel_id, updated)
@@ -3491,6 +3497,7 @@ class Bridge:
             # config, so ensure it's loaded (and cached) first.
             if spec.name in {
                 "backend", "model", "cwd", "models", "autorespond", "status",
+                "effort",
             }:
                 try:
                     await self._load_channel_config(channel_id)
@@ -3516,6 +3523,11 @@ class Bridge:
                 return
             if spec.name == "cwd":
                 await self._cmd_dormant_cwd(
+                    channel_id, parsed.arg, thread_root,
+                )
+                return
+            if spec.name == "effort":
+                await self._cmd_dormant_effort(
                     channel_id, parsed.arg, thread_root,
                 )
                 return
@@ -3546,6 +3558,8 @@ class Bridge:
             await self._cmd_backend(channel_id, session_id, parsed.arg, thread_root)
         elif spec.name == "cwd":
             await self._cmd_cwd(channel_id, session_id, parsed.arg, thread_root)
+        elif spec.name == "effort":
+            await self._cmd_effort(channel_id, session_id, parsed.arg, thread_root)
         elif spec.name == "models":
             await self._cmd_models(channel_id, session_id, thread_root)
         elif spec.name == "fleet":
@@ -3630,6 +3644,10 @@ class Bridge:
         backend = meta.get("backend") or (cfg.backend if cfg else "?")
         model = meta.get("model") or (cfg.model if cfg else None) or "default"
         cwd = (meta.get("project") or {}).get("path") or "?"
+        # "default" is honest: unset means the backend CLI applies its own.
+        effort = (
+            meta.get("effort") or (cfg.effort if cfg else None) or "default"
+        )
         autorespond = "mention-only" if (cfg and cfg.mention_only) else "on"
 
         run_id = self.current_run_id_by_session.get(session_id)
@@ -3642,7 +3660,7 @@ class Bridge:
 
         lines = [
             f"**Status** — session `{session_id[:12]}`",
-            f"• backend: `{backend}`  ·  model: `{model}`",
+            f"• backend: `{backend}`  ·  model: `{model}`  ·  effort: `{effort}`",
             f"• cwd: `{cwd}`",
             f"• autorespond: `{autorespond}`",
             f"• run: {run_state}",
@@ -3679,9 +3697,10 @@ class Bridge:
             cfg.mention_only if cfg else not self.config.default_autorespond
         )
         autorespond = "mention-only" if mention_only else "on"
+        effort = (cfg.effort if cfg else None) or "default"
         lines = [
             "**Status** — no session yet (starts on your first message).",
-            f"• backend: `{backend}`  ·  model: `{model}`",
+            f"• backend: `{backend}`  ·  model: `{model}`  ·  effort: `{effort}`",
             f"• cwd: `{cwd}`",
             f"• autorespond: `{autorespond}`",
         ]
@@ -4374,13 +4393,7 @@ class Bridge:
             )
             return
 
-        updated = purpose.PurposeConfig(
-            backend=cfg.backend,
-            model=arg,
-            mention_only=cfg.mention_only,
-            cwd=cfg.cwd,
-            warnings=[],
-        )
+        updated = replace(cfg, model=arg, warnings=[])
         self.purpose_by_channel[channel_id] = updated
         self._persist_purpose(channel_id, updated)
         self._post_cmd_reply(
@@ -4423,13 +4436,7 @@ class Bridge:
             )
             return
 
-        target = purpose.PurposeConfig(
-            backend=requested,
-            model=None,
-            mention_only=cfg.mention_only,
-            cwd=cfg.cwd,
-            warnings=[],
-        )
+        target = replace(cfg, backend=requested, model=None, warnings=[])
         updated = self._merge_configs(cfg, target)
         self.purpose_by_channel[channel_id] = updated
         self._persist_purpose(channel_id, updated)
@@ -4500,13 +4507,7 @@ class Bridge:
         # Only the model moves: the backend (the LIVE one — see
         # ``_live_backend``), the working directory and the autorespond flag
         # carry over untouched.
-        new_cfg = purpose.PurposeConfig(
-            backend=backend,
-            model=arg,
-            mention_only=cfg.mention_only,
-            cwd=cfg.cwd,
-            warnings=[],
-        )
+        new_cfg = replace(cfg, backend=backend, model=arg, warnings=[])
         new_session = await self._restart_session_with_config(
             channel_id, session_id, new_cfg,
         )
@@ -4598,13 +4599,7 @@ class Bridge:
         # Layer the new backend over the current config via ``_merge_configs``
         # so the carried model is dropped (a claude model can't run on codex).
         # The working directory and the autorespond flag survive the swap.
-        target = purpose.PurposeConfig(
-            backend=requested,
-            model=None,
-            mention_only=cfg.mention_only,
-            cwd=cfg.cwd,
-            warnings=[],
-        )
+        target = replace(cfg, backend=requested, model=None, warnings=[])
         # Merge against the LIVE backend, not the Purpose's: in a token-less
         # channel the Purpose parses to the default backend, which would make
         # ``_merge_configs`` see no change and carry the old model (or, with
@@ -4810,12 +4805,8 @@ class Bridge:
         # ``_live_backend``), model and the autorespond flag carry over
         # untouched (unlike `.backend`, where the model can't survive the
         # swap).
-        new_cfg = purpose.PurposeConfig(
-            backend=self._live_backend(meta, cfg),
-            model=cfg.model,
-            mention_only=cfg.mention_only,
-            cwd=target,
-            warnings=[],
+        new_cfg = replace(
+            cfg, backend=self._live_backend(meta, cfg), cwd=target, warnings=[],
         )
         new_session = await self._restart_session_with_config(
             channel_id, session_id, new_cfg,
@@ -4860,19 +4851,139 @@ class Bridge:
             )
             return
 
-        updated = purpose.PurposeConfig(
-            backend=cfg.backend,
-            model=cfg.model,
-            mention_only=cfg.mention_only,
-            cwd=target,
-            warnings=[],
-        )
+        updated = replace(cfg, cwd=target, warnings=[])
         self.purpose_by_channel[channel_id] = updated
         self._persist_purpose(channel_id, updated)
         self._post_cmd_reply(
             channel_id,
             f":file_folder: Working directory set to `{target}` — "
             "it will apply when the session starts.",
+            thread_root,
+        )
+
+    @staticmethod
+    def _effort_levels_list() -> str:
+        """The closed set, rendered for a channel message."""
+        return ", ".join(f"`{level}`" for level in purpose.EFFORT_LEVELS)
+
+    async def _cmd_effort(
+        self,
+        channel_id: str,
+        session_id: str,
+        arg: str | None,
+        thread_root: str | None,
+    ) -> None:
+        """`.effort [<level>]` — show the reasoning level, or change it.
+
+        The one config command that does NOT recreate the session. The
+        harness rebuilds the backend argv fresh on every run, so PATCHing the
+        live session is enough: the new level takes effect on the next turn
+        with the conversation intact. That's also why an active run doesn't
+        block a change — unlike `.model` / `.backend` / `.cwd` there's no
+        restart, so there's no run to orphan and no `.stop` to demand.
+
+        Levels are validated here against ``purpose.EFFORT_LEVELS`` rather
+        than left to the CLI: codex does NOT validate locally, it forwards
+        an unknown value and the API 400s mid-run.
+        """
+        cfg = await self._config_for_update(channel_id, ".effort")
+        try:
+            meta = await self.harness.get_session(session_id) or {}
+        except Exception:
+            logger.debug("`.effort` harness get_session failed", exc_info=True)
+            meta = {}
+        levels = self._effort_levels_list()
+
+        # Bare `.effort` → report the live level (a pure read, thread-safe).
+        if not arg:
+            current = (
+                meta.get("effort") or (cfg.effort if cfg else None) or "default"
+            )
+            self._post_cmd_reply(
+                channel_id,
+                f":brain: Current effort: `{current}`. "
+                f"Set with `.effort <level>`. Levels: {levels}.",
+                thread_root,
+            )
+            return
+
+        level = purpose.normalize_effort(arg)
+        if level is None:
+            self._post_cmd_reply(
+                channel_id,
+                f":warning: Unknown effort level `{arg.strip()}`. Levels: {levels}.",
+                thread_root,
+            )
+            return
+
+        # A set persists the CHANNEL's Purpose, so it can't come from a
+        # thread fork — same rule as `.model` / `.backend` / `.cwd`.
+        if self._config_switch_blocked_in_thread(
+            channel_id, thread_root, ".effort <level>",
+        ):
+            return
+
+        if cfg is None:
+            self._refuse_update_unknown_config(
+                channel_id, thread_root, "Leaving the session on its current effort",
+            )
+            return
+
+        try:
+            await self.harness.update_session(session_id, effort=level)
+        except Exception:
+            logger.exception(
+                "`.effort` could not PATCH session %s to `%s`", session_id, level,
+            )
+            self._post_cmd_reply(
+                channel_id,
+                f":warning: Could not set effort to `{level}` — the harness "
+                "rejected the change. The session is unchanged.",
+                thread_root,
+            )
+            return
+
+        updated = replace(cfg, effort=level, warnings=[])
+        self.purpose_by_channel[channel_id] = updated
+        self._persist_purpose(channel_id, updated)
+        self._post_cmd_reply(
+            channel_id,
+            f":brain: Effort set to `{level}` — applies from your next message "
+            "(the session and its conversation are kept).",
+            thread_root,
+        )
+
+    async def _cmd_dormant_effort(
+        self, channel_id: str, arg: str | None, thread_root: str | None,
+    ) -> None:
+        """Read or persist a reasoning level without creating a session."""
+        cfg = self.purpose_by_channel[channel_id]
+        levels = self._effort_levels_list()
+        if not arg:
+            self._post_cmd_reply(
+                channel_id,
+                f":brain: Effort for the next session: `{cfg.effort or 'default'}`. "
+                f"Set with `.effort <level>`. Levels: {levels}.",
+                thread_root,
+            )
+            return
+
+        level = purpose.normalize_effort(arg)
+        if level is None:
+            self._post_cmd_reply(
+                channel_id,
+                f":warning: Unknown effort level `{arg.strip()}`. Levels: {levels}.",
+                thread_root,
+            )
+            return
+
+        updated = replace(cfg, effort=level, warnings=[])
+        self.purpose_by_channel[channel_id] = updated
+        self._persist_purpose(channel_id, updated)
+        self._post_cmd_reply(
+            channel_id,
+            f":brain: Effort set to `{level}` — it will apply when the "
+            "session starts.",
             thread_root,
         )
 

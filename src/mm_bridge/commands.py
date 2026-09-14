@@ -26,6 +26,8 @@ import re
 from dataclasses import dataclass
 from typing import Iterable
 
+from .purpose import EFFORT_LEVELS
+
 
 @dataclass(frozen=True)
 class CommandSpec:
@@ -100,6 +102,13 @@ _SPECS: tuple[CommandSpec, ...] = (
     CommandSpec(
         "cwd", ".cwd [<path>]",
         "Show/set the working directory (configures the next session if dormant).",
+        session_scoped=True,
+    ),
+    CommandSpec(
+        # Usage is generated from the closed set so `.help` can never drift
+        # from what `purpose.normalize_effort` actually accepts.
+        "effort", f".effort [{'|'.join(EFFORT_LEVELS)}]",
+        "Show/set the reasoning level (applies from your next message).",
         session_scoped=True,
     ),
     CommandSpec(

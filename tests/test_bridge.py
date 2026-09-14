@@ -1199,7 +1199,8 @@ class DormantChannelTests(_BridgeTestCase):
     async def test_no_dot_command_forwards_to_llm_in_dormant(self):
         commands_under_test = [
             ".help", ".status", ".stop", ".autorespond", ".model", ".models",
-            ".backend", ".sessions", ".running", ".invite ses_x",
+            ".backend", ".effort", ".effort xhigh", ".sessions", ".running",
+            ".invite ses_x",
             ".frobnicate now",  # unknown dot-word
             "@claude .sessions",  # mentioned global command
         ]
@@ -4440,6 +4441,41 @@ class MergeConfigsTests(_BridgeTestCase):
 
         self.assertEqual(merged.model, "opus")
 
+    def test_fields_the_new_parse_never_carries_fall_back_to_current(self):
+        """The merge is a fallback, not a rebuild: anything the caller's
+        synthetic `new` doesn't set must come off `current`.
+
+        Both callers (`.backend`, dormant and active) hand-build `new` from
+        the two fields the command is about, so every OTHER field is at its
+        dataclass default there. Reading them off `new` silently resets them
+        — which is exactly how a channel's `no-nag` opt-out disappeared on
+        the first `.backend`."""
+        from mm_bridge.purpose import PurposeConfig
+        current = PurposeConfig(
+            backend="claude", model="sonnet", mention_only=False,
+            cwd="/srv/repo", no_nag=True,
+        )
+        new = PurposeConfig(backend="codex", model=None, mention_only=False)
+
+        merged = self.bridge._merge_configs(current, new)
+
+        self.assertTrue(merged.no_nag)
+        self.assertEqual(merged.cwd, "/srv/repo")
+
+    def test_merge_clears_warnings(self):
+        """Warnings describe ONE parse; carrying them forward would re-post a
+        stale complaint after every later config command."""
+        from mm_bridge.purpose import PurposeConfig
+        current = PurposeConfig(
+            backend="claude", model="sonnet", mention_only=False,
+            warnings=["stale"],
+        )
+        new = PurposeConfig(
+            backend="codex", model=None, mention_only=False, warnings=["fresh"],
+        )
+
+        self.assertEqual(self.bridge._merge_configs(current, new).warnings, [])
+
 
 class MessageContentNotConfigTests(_BridgeTestCase):
     """The bare `autorespond`/`noautorespond` message-content toggle was
@@ -6521,6 +6557,458 @@ class TypingRunLifecycleTests(_BridgeTestCase):
                 pass
 
         self.assertNotIn("ses_x", self.bridge.typing.running_sessions())
+
+
+class NoNagAcrossConfigCommandsTests(_BridgeTestCase):
+    """`no-nag` must survive every config dot-command that rewrites the Purpose.
+
+    The opt-out lives ONLY in the Channel Purpose — there is no other store.
+    Each of `.model` / `.backend` / `.cwd` / `.autorespond` rebuilds the
+    channel's `PurposeConfig` and persists the canonical serialisation of it,
+    so a rebuild that forgets a field deletes the operator's choice with no
+    message anywhere. `no-nag` is the field that got forgotten; these tests
+    pin every path, and the deliberate `warnings=[]` reset those same
+    rebuilds perform (a stale parse warning must NOT be re-posted after an
+    unrelated `.model`).
+    """
+
+    STALE = "Could not parse Channel Purpose token `junk`."
+    NO_NAG_PURPOSE = "claude, opus, autorespond, no-nag"
+
+    def _seed_config(self, purpose_text: str, *, stale: bool) -> None:
+        """Prime the channel + its cached config (optionally with a warning).
+
+        `_load_channel_config` returns the cache when it's warm, so seeding
+        here is what every command under test actually reads.
+        """
+        from mm_bridge import purpose as purpose_mod
+        cfg = purpose_mod.parse(purpose_text, "claude", None, lambda _b: [])
+        self.assertTrue(cfg.no_nag)  # fixture sanity: the token parsed
+        if stale:
+            cfg.warnings = [self.STALE]
+        self.bridge.purpose_by_channel["c1"] = cfg
+        self.bridge.mm.channels["c1"] = {
+            "id": "c1", "purpose": purpose_text, "display_name": "Test channel",
+        }
+
+    def _active_channel(self, *, stale: bool = False, cwd: str = "/tmp/proj") -> None:
+        self.bridge.mapping.link(Anchor("c1"), "s1")
+        self._seed_config(f"{self.NO_NAG_PURPOSE}, cwd={cwd}", stale=stale)
+        self.bridge.harness.sessions_meta = [{
+            "id": "s1", "backend": "claude", "model": "opus",
+            "project": {"path": cwd, "name": Path(cwd).name}, "origin": "harness",
+        }]
+
+    async def _dormant_channel(self, *, stale: bool = False) -> None:
+        self.bridge.mm.channels["c1"] = {
+            "id": "c1", "purpose": self.NO_NAG_PURPOSE, "display_name": "Test channel",
+        }
+        await self.bridge._on_mm_user_added("c1", self.bridge.mm.bot_user_id)
+        self.assertIn("c1", self.bridge._dormant_channels)
+        self._seed_config(self.NO_NAG_PURPOSE, stale=stale)
+
+    async def _post(self, message: str) -> None:
+        await self.bridge._on_mm_posted({
+            "channel_id": "c1", "message": message, "user_id": "u1", "type": "",
+        })
+
+    def _new_dir(self, name: str) -> str:
+        target = str(Path(self.tmp.name) / name)
+        Path(target).mkdir()
+        return target
+
+    def _assert_no_nag_survived(self) -> None:
+        written = self.bridge.mm.channels["c1"]["purpose"]
+        self.assertIn("no-nag", written)
+        self.assertTrue(self.bridge.purpose_by_channel["c1"].no_nag)
+
+    def _assert_warnings_cleared(self) -> None:
+        self.assertEqual(self.bridge.purpose_by_channel["c1"].warnings, [])
+
+    # ── active channel (the command restarts the session) ────────────────
+
+    async def test_dot_model_keeps_no_nag(self):
+        self._active_channel()
+        await self._post(".model claude-sonnet")
+        self.assertTrue(self.bridge.harness.created)
+        self._assert_no_nag_survived()
+
+    async def test_dot_model_resets_stale_warnings(self):
+        self._active_channel(stale=True)
+        await self._post(".model claude-sonnet")
+        self._assert_warnings_cleared()
+
+    async def test_dot_backend_keeps_no_nag(self):
+        self._active_channel()
+        await self._post(".backend codex")
+        self.assertEqual(self.bridge.harness.created[-1]["backend"], "codex")
+        self._assert_no_nag_survived()
+
+    async def test_dot_backend_resets_stale_warnings(self):
+        self._active_channel(stale=True)
+        await self._post(".backend codex")
+        self._assert_warnings_cleared()
+
+    async def test_dot_cwd_keeps_no_nag(self):
+        self._active_channel()
+        await self._post(f".cwd {self._new_dir('moved')}")
+        self.assertTrue(self.bridge.harness.created)
+        self._assert_no_nag_survived()
+
+    async def test_dot_cwd_resets_stale_warnings(self):
+        self._active_channel(stale=True)
+        await self._post(f".cwd {self._new_dir('moved')}")
+        self._assert_warnings_cleared()
+
+    async def test_dot_autorespond_keeps_no_nag(self):
+        self._active_channel()
+        await self._post(".autorespond off")
+        self.assertTrue(self.bridge.purpose_by_channel["c1"].mention_only)
+        self._assert_no_nag_survived()
+
+    async def test_dot_autorespond_resets_stale_warnings(self):
+        self._active_channel(stale=True)
+        await self._post(".autorespond off")
+        self._assert_warnings_cleared()
+
+    # ── dormant channel (persist only, no session) ───────────────────────
+
+    async def test_dormant_model_keeps_no_nag(self):
+        await self._dormant_channel()
+        await self._post(".model gpt-5.4")
+        self.assertEqual(self.bridge.harness.created, [])
+        self._assert_no_nag_survived()
+
+    async def test_dormant_model_resets_stale_warnings(self):
+        await self._dormant_channel(stale=True)
+        await self._post(".model gpt-5.4")
+        self._assert_warnings_cleared()
+
+    async def test_dormant_backend_keeps_no_nag(self):
+        await self._dormant_channel()
+        await self._post(".backend codex")
+        self.assertEqual(self.bridge.harness.created, [])
+        self.assertEqual(self.bridge.purpose_by_channel["c1"].backend, "codex")
+        self._assert_no_nag_survived()
+
+    async def test_dormant_backend_resets_stale_warnings(self):
+        await self._dormant_channel(stale=True)
+        await self._post(".backend codex")
+        self._assert_warnings_cleared()
+
+    async def test_dormant_cwd_keeps_no_nag(self):
+        await self._dormant_channel()
+        await self._post(f".cwd {self._new_dir('dormant-repo')}")
+        self.assertEqual(self.bridge.harness.created, [])
+        self._assert_no_nag_survived()
+
+    async def test_dormant_cwd_resets_stale_warnings(self):
+        await self._dormant_channel(stale=True)
+        await self._post(f".cwd {self._new_dir('dormant-repo')}")
+        self._assert_warnings_cleared()
+
+
+class EffortSessionPlumbingTests(_BridgeTestCase):
+    """A Channel Purpose `effort=` level must reach `create_session` — and
+    survive every config command that recreates the session."""
+
+    async def _join_dormant(self, purpose_text: str) -> None:
+        self.bridge.mm.channels["c1"] = {
+            "id": "c1", "purpose": purpose_text, "display_name": "Test channel",
+        }
+        self.bridge._self_joined_channels.add("c1")
+        await self.bridge._on_mm_user_added("c1", self.bridge.mm.bot_user_id)
+
+    async def test_purpose_effort_reaches_create_session(self):
+        await self._join_dormant("claude, opus, autorespond, effort=xhigh")
+
+        await self.bridge._on_mm_posted({
+            "channel_id": "c1", "message": "hello",
+            "user_id": "u1", "type": "",
+        })
+
+        self.assertTrue(self.bridge.harness.created)
+        self.assertEqual(self.bridge.harness.created[-1]["effort"], "xhigh")
+
+    async def test_no_effort_in_purpose_sends_none(self):
+        """Unset must stay unset — the backend CLI's own default applies."""
+        await self._join_dormant("claude, opus, autorespond")
+
+        await self.bridge._on_mm_posted({
+            "channel_id": "c1", "message": "hello",
+            "user_id": "u1", "type": "",
+        })
+
+        self.assertTrue(self.bridge.harness.created)
+        self.assertIsNone(self.bridge.harness.created[-1]["effort"])
+
+    async def test_purpose_effort_is_not_mistaken_for_a_model(self):
+        """The empty-catalog trap: `effort=` must never land in the model slot."""
+        await self._join_dormant("claude, autorespond, effort=xhigh")
+
+        await self.bridge._on_mm_posted({
+            "channel_id": "c1", "message": "hello",
+            "user_id": "u1", "type": "",
+        })
+
+        self.assertNotEqual(self.bridge.harness.created[-1]["model"], "xhigh")
+
+    async def test_effort_survives_a_model_change(self):
+        """`.model` rebuilds the config field-by-field — effort must be carried."""
+        from mm_bridge.purpose import PurposeConfig
+        self.bridge.mapping.link(Anchor("c1"), "s1")
+        self.bridge.purpose_by_channel["c1"] = PurposeConfig(
+            backend="claude", model="opus", mention_only=False, effort="max",
+        )
+        self.bridge.mm.channels["c1"] = {
+            "id": "c1", "purpose": "claude, opus, autorespond, effort=max",
+        }
+
+        await self.bridge._on_mm_posted({
+            "channel_id": "c1", "message": ".model claude-sonnet",
+            "user_id": "u1", "type": "",
+        })
+
+        self.assertEqual(self.bridge.harness.created[-1]["model"], "claude-sonnet")
+        self.assertEqual(self.bridge.harness.created[-1]["effort"], "max")
+        self.assertIn("effort=max", self.bridge.mm.channels["c1"]["purpose"])
+
+    async def test_effort_survives_a_backend_change(self):
+        from mm_bridge.purpose import PurposeConfig
+        self.bridge.mapping.link(Anchor("c1"), "s1")
+        self.bridge.purpose_by_channel["c1"] = PurposeConfig(
+            backend="claude", model="opus", mention_only=False, effort="low",
+        )
+        self.bridge.mm.channels["c1"] = {
+            "id": "c1", "purpose": "claude, opus, autorespond, effort=low",
+        }
+
+        await self.bridge._on_mm_posted({
+            "channel_id": "c1", "message": ".backend codex",
+            "user_id": "u1", "type": "",
+        })
+
+        self.assertEqual(self.bridge.harness.created[-1]["backend"], "codex")
+        self.assertEqual(self.bridge.harness.created[-1]["effort"], "low")
+        self.assertIn("effort=low", self.bridge.mm.channels["c1"]["purpose"])
+
+    async def test_effort_survives_a_cwd_change(self):
+        from mm_bridge.purpose import PurposeConfig
+        self.bridge.mapping.link(Anchor("c1"), "s1")
+        self.bridge.purpose_by_channel["c1"] = PurposeConfig(
+            backend="claude", model="opus", mention_only=False, effort="high",
+        )
+        self.bridge.mm.channels["c1"] = {
+            "id": "c1", "purpose": "claude, opus, autorespond, effort=high",
+        }
+
+        await self.bridge._on_mm_posted({
+            "channel_id": "c1", "message": f".cwd {self.tmp.name}",
+            "user_id": "u1", "type": "",
+        })
+
+        self.assertEqual(self.bridge.harness.created[-1]["effort"], "high")
+        self.assertIn("effort=high", self.bridge.mm.channels["c1"]["purpose"])
+
+    async def test_effort_survives_an_autorespond_toggle(self):
+        """`.autorespond` persists the Purpose too — it must not drop the level."""
+        from mm_bridge.purpose import PurposeConfig
+        self.bridge.mapping.link(Anchor("c1"), "s1")
+        self.bridge.purpose_by_channel["c1"] = PurposeConfig(
+            backend="claude", model="opus", mention_only=False, effort="medium",
+        )
+        self.bridge.mm.channels["c1"] = {
+            "id": "c1", "purpose": "claude, opus, autorespond, effort=medium",
+        }
+
+        await self.bridge._on_mm_posted({
+            "channel_id": "c1", "message": ".autorespond off",
+            "user_id": "u1", "type": "",
+        })
+
+        self.assertIn("effort=medium", self.bridge.mm.channels["c1"]["purpose"])
+
+
+class EffortCommandTests(_BridgeTestCase):
+    """`.effort [<level>]` — the one config command that does NOT restart.
+
+    The harness rebuilds the backend argv on every run, so PATCHing the live
+    session is enough: the level lands on the next turn with the conversation
+    intact. That is also why a live run doesn't block the change.
+    """
+
+    def _posted_texts(self) -> list[str]:
+        return [p.message for p in self.bridge.mm.posted]
+
+    def _joined(self) -> str:
+        return "\n".join(self._posted_texts())
+
+    def _active_channel(self, effort: str | None = None) -> None:
+        from mm_bridge.purpose import PurposeConfig
+        self.bridge.mapping.link(Anchor("c1"), "s1")
+        self.bridge.purpose_by_channel["c1"] = PurposeConfig(
+            backend="claude", model="opus", mention_only=False, effort=effort,
+        )
+        purpose_text = "claude, opus, autorespond"
+        if effort:
+            purpose_text += f", effort={effort}"
+        self.bridge.mm.channels["c1"] = {"id": "c1", "purpose": purpose_text}
+        self.bridge.harness.sessions_meta = [{
+            "id": "s1", "backend": "claude-code", "model": "opus",
+            "project": {"path": "/tmp/proj"}, "status": "idle",
+            **({"effort": effort} if effort else {}),
+        }]
+
+    async def _post(self, message: str, **extra) -> None:
+        await self.bridge._on_mm_posted({
+            "channel_id": "c1", "message": message,
+            "user_id": "u1", "type": "", **extra,
+        })
+
+    # ----- setting a level on a live session -----
+
+    async def test_dot_effort_patches_without_creating_a_session(self):
+        self._active_channel()
+
+        await self._post(".effort xhigh")
+
+        self.assertEqual(self.bridge.harness.patched, [("s1", {"effort": "xhigh"})])
+        # The whole point: the conversation survives.
+        self.assertEqual(self.bridge.harness.created, [])
+        self.assertEqual(self.bridge.mapping.get_session(Anchor("c1")), "s1")
+
+    async def test_dot_effort_persists_to_channel_purpose(self):
+        self._active_channel()
+
+        await self._post(".effort max")
+
+        self.assertIn("effort=max", self.bridge.mm.channels["c1"]["purpose"])
+        self.assertEqual(self.bridge.purpose_by_channel["c1"].effort, "max")
+
+    async def test_dot_effort_normalises_case(self):
+        self._active_channel()
+
+        await self._post(".effort XHigh")
+
+        self.assertEqual(self.bridge.harness.patched, [("s1", {"effort": "xhigh"})])
+
+    async def test_dot_effort_accepts_change_while_a_run_is_active(self):
+        """Unlike `.model`, no `.stop` first — it applies from the next message."""
+        self._active_channel()
+        self.bridge.current_run_id_by_session["s1"] = "run-s1"
+
+        await self._post(".effort high")
+
+        self.assertEqual(self.bridge.harness.patched, [("s1", {"effort": "high"})])
+        self.assertNotIn("`.stop` it first", self._joined())
+        self.assertIn("next message", self._joined().lower())
+
+    # ----- reading -----
+
+    async def test_bare_dot_effort_reports_the_current_level(self):
+        self._active_channel(effort="medium")
+
+        await self._post(".effort")
+
+        self.assertIn("medium", self._joined())
+        self.assertEqual(self.bridge.harness.patched, [])
+
+    async def test_bare_dot_effort_reports_default_when_unset(self):
+        """Honest: unset means the backend CLI's own configured default."""
+        self._active_channel()
+
+        await self._post(".effort")
+
+        self.assertIn("default", self._joined())
+        self.assertEqual(self.bridge.harness.patched, [])
+
+    # ----- validation -----
+
+    async def test_invalid_level_is_rejected_with_the_valid_set(self):
+        self._active_channel()
+
+        await self._post(".effort turbo")
+
+        self.assertEqual(self.bridge.harness.patched, [])
+        joined = self._joined()
+        for level in ("low", "medium", "high", "xhigh", "max"):
+            self.assertIn(level, joined, level)
+        self.assertNotIn("effort=turbo", self.bridge.mm.channels["c1"]["purpose"])
+
+    # ----- truthful failures -----
+
+    async def test_patch_failure_does_not_claim_success_or_persist(self):
+        self._active_channel()
+        self.bridge.harness.update_session_error = RuntimeError("harness down")
+
+        await self._post(".effort max")
+
+        self.assertNotIn("effort=max", self.bridge.mm.channels["c1"]["purpose"])
+        self.assertIn(":warning:", self._joined())
+
+    # ----- dormant (no session yet) -----
+
+    async def _join_dormant(self, purpose_text: str = "autorespond") -> None:
+        self.bridge.mm.channels["c1"] = {
+            "id": "c1", "purpose": purpose_text, "display_name": "Test channel",
+        }
+        self.bridge._self_joined_channels.add("c1")
+        await self.bridge._on_mm_user_added("c1", self.bridge.mm.bot_user_id)
+
+    async def test_dormant_dot_effort_persists_without_a_session(self):
+        await self._join_dormant()
+
+        await self._post(".effort low")
+
+        self.assertEqual(self.bridge.harness.created, [])
+        self.assertEqual(self.bridge.harness.patched, [])
+        self.assertIn("effort=low", self.bridge.mm.channels["c1"]["purpose"])
+
+    async def test_dormant_bare_dot_effort_reads(self):
+        await self._join_dormant("claude, autorespond, effort=high")
+
+        await self._post(".effort")
+
+        self.assertIn("high", self._joined())
+        self.assertEqual(self.bridge.harness.created, [])
+
+    async def test_dormant_invalid_level_is_rejected(self):
+        await self._join_dormant()
+
+        await self._post(".effort turbo")
+
+        self.assertNotIn("effort=turbo", self.bridge.mm.channels["c1"]["purpose"])
+        self.assertIn("xhigh", self._joined())
+
+    # ----- .status -----
+
+    async def test_status_shows_the_effort_level(self):
+        self._active_channel(effort="xhigh")
+
+        await self._post(".status")
+
+        self.assertIn("effort: `xhigh`", self._joined())
+
+    async def test_status_shows_default_when_effort_unset(self):
+        self._active_channel()
+
+        await self._post(".status")
+
+        self.assertIn("effort: `default`", self._joined())
+
+    async def test_dormant_status_shows_the_effort_level(self):
+        await self._join_dormant("claude, autorespond, effort=max")
+
+        await self._post(".status")
+
+        self.assertIn("effort: `max`", self._joined())
+
+    async def test_dormant_status_shows_default_when_effort_unset(self):
+        await self._join_dormant("claude, autorespond")
+
+        await self._post(".status")
+
+        self.assertIn("effort: `default`", self._joined())
 
 
 if __name__ == "__main__":

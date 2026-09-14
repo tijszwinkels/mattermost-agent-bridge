@@ -249,6 +249,8 @@ class FakeAgentHarnessClient:
     runs_meta: dict = field(default_factory=dict)  # (session_id, run_id) → row
     session_runs_meta: dict = field(default_factory=dict)  # session_id → [rows]
     run_probe_error: Exception | None = None
+    patched: list = field(default_factory=list)  # (session_id, patch) per PATCH
+    update_session_error: Exception | None = None
     models_by_backend: dict = field(default_factory=lambda: {
         "claude": ["opus", "sonnet"],
         "codex": ["gpt-5.4"],
@@ -269,9 +271,11 @@ class FakeAgentHarnessClient:
         model=None,
         cwd,
         title=None,
+        effort=None,
     ) -> dict:
         self.created.append({
             "cwd": cwd, "backend": backend, "model": model, "title": title,
+            "effort": effort,
         })
         self.session_create_count += 1
         session_id = self.next_session_id
@@ -284,7 +288,21 @@ class FakeAgentHarnessClient:
             "project": {"path": cwd, "name": Path(cwd).name},
             "title": title,
             "origin": "harness",
+            "effort": effort,
         }
+
+    async def update_session(self, session_id, *, effort=None) -> dict:
+        if self.update_session_error is not None:
+            raise self.update_session_error
+        patch = {}
+        if effort is not None:
+            patch["effort"] = effort
+        self.patched.append((session_id, patch))
+        for s in self.sessions_meta:
+            if s.get("id") == session_id:
+                s.update(patch)
+                return s
+        return {"id": session_id, **patch}
 
     async def create_run(self, session_id, message) -> dict:
         self.sent.append((session_id, message))

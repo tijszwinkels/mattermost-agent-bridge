@@ -30,7 +30,7 @@ from urllib.parse import urlsplit
 
 import json
 
-from . import sidecar, spawn as spawn_mod
+from . import purpose, sidecar, spawn as spawn_mod
 from .agent_harness_client import AgentHarnessClient
 from .bridge import (
     Bridge,
@@ -371,6 +371,7 @@ async def _harness_create_session(
     backend: str | None,
     model: str | None,
     title: str | None = None,
+    effort: str | None = None,
 ) -> dict:
     """Async wrapper: one-shot harness client for the spawn CLI path."""
     harness = AgentHarnessClient(harness_url)
@@ -380,6 +381,7 @@ async def _harness_create_session(
             model=model,
             cwd=cwd,
             title=title,
+            effort=effort,
         )
         session_id = session.get("id")
         if not session_id:
@@ -1399,6 +1401,20 @@ def cmd_spawn(args: argparse.Namespace) -> int:
         print(f"Error: {exc}", file=sys.stderr)
         return 2
 
+    # Validate the level here for the same reason the bridge does: codex
+    # doesn't check it locally, it forwards the value and the API 400s
+    # mid-run. Fail before anything is spawned.
+    effort: str | None = None
+    if args.effort:
+        effort = purpose.normalize_effort(args.effort)
+        if effort is None:
+            print(
+                f"Error: unknown effort level {args.effort!r}. "
+                f"Valid: {', '.join(purpose.EFFORT_LEVELS)}.",
+                file=sys.stderr,
+            )
+            return 2
+
     try:
         parent_session_id = _current_session_id(cfg.sidecar_dir)
         parent_anchor = _resolve_anchor_from_session(
@@ -1444,6 +1460,7 @@ def cmd_spawn(args: argparse.Namespace) -> int:
                 backend,
                 model,
                 title=args.title,
+                effort=effort,
             ),
         )
     except Exception as exc:
@@ -1932,6 +1949,14 @@ def _build_parser() -> argparse.ArgumentParser:
         help=(
             "Model for the sub-session (e.g. 'claude-fable-5'). "
             "Default: per-backend config default."
+        ),
+    )
+    p_spawn.add_argument(
+        "--effort",
+        help=(
+            "Reasoning level for the sub-session "
+            f"({'|'.join(purpose.EFFORT_LEVELS)}). "
+            "Default: the backend CLI's own configured default."
         ),
     )
     p_spawn.add_argument(

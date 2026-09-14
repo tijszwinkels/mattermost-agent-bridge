@@ -46,12 +46,35 @@ NOAUTORESPOND_ALIASES: frozenset[str] = frozenset({
 AUTORESPOND_ALIASES: frozenset[str] = frozenset({
     AUTORESPOND_TOKEN, "autoresponse",
 })
-CWD_PREFIX = "cwd="
+CWD_KEY = "cwd"
+CWD_PREFIX = f"{CWD_KEY}="
 # Opt a CHANNEL out of receiving awaiting-nags. Protects the channel it is
 # written in — never the wait — so a busy lead channel can be silenced
 # without changing how its builders declare themselves.
 NO_NAG_TOKEN = "no-nag"
 NO_NAG_ALIASES: frozenset[str] = frozenset({NO_NAG_TOKEN, "nonag", "no_nag"})
+
+# Reasoning/thinking level, in ascending order (the order `.effort` and the
+# parse warnings list them in). Verified live 2026-09-02: all five are valid
+# on all three backends — claude `--effort`, codex
+# `-c model_reasoning_effort=`, pi `--thinking`.
+EFFORT_LEVELS: tuple[str, ...] = ("low", "medium", "high", "xhigh", "max")
+EFFORT_KEY = "effort"
+EFFORT_PREFIX = f"{EFFORT_KEY}="
+
+
+def normalize_effort(value: str | None) -> str | None:
+    """Return the canonical (lowercase) level, or ``None`` if not one.
+
+    The single validator for the closed set, shared by the Purpose parser and
+    the `.effort` command. It has to live here rather than lean on the CLIs:
+    codex does NOT validate locally — it forwards an unknown value and the
+    API 400s mid-run, which surfaces as a broken turn rather than a typo.
+    """
+    if not value:
+        return None
+    level = value.strip().lower()
+    return level if level in EFFORT_LEVELS else None
 
 
 @dataclass
@@ -61,6 +84,9 @@ class PurposeConfig:
     mention_only: bool = False
     cwd: str | None = None
     no_nag: bool = False
+    # ``None`` means "emit nothing": the harness omits the flag entirely and
+    # each backend CLI applies its own configured default.
+    effort: str | None = None
     warnings: list[str] = field(default_factory=list)
 
 
@@ -127,20 +153,30 @@ def _tokenize(purpose: str) -> list[str]:
     return [tok.strip() for tok in purpose.split(",") if tok.strip()]
 
 
+def _keyed_value(token: str, key: str) -> str | None:
+    """Return the right-hand side of a ``<key>=<value>`` token, else ``None``.
+
+    ``None`` means "not this key at all"; ``""`` means the key was present
+    with an empty value (malformed — the caller warns). Tolerates whitespace
+    around the ``=`` (``cwd = /path``); the key matches case-insensitively
+    while the value keeps its case, because paths are case-sensitive.
+    """
+    lhs, sep, raw_value = token.partition("=")
+    if not sep or lhs.strip().lower() != key:
+        return None
+    return raw_value.strip()
+
+
 def _parse_cwd_token(token: str) -> tuple[str | None, str | None]:
     """If `token` is a `cwd=…` assignment, return (value_or_None, warning_or_None).
 
     Returns (None, None) when the token isn't a cwd assignment at all.
     Returns (path, None) when a valid absolute path is supplied.
     Returns (None, warning) when the assignment is malformed.
-
-    Tolerates whitespace around the `=` (`cwd = /path`). The `cwd` key is
-    case-insensitive but the path value preserves case.
     """
-    lhs, sep, raw_value = token.partition("=")
-    if not sep or lhs.strip().lower() != "cwd":
+    value = _keyed_value(token, CWD_KEY)
+    if value is None:
         return None, None
-    value = raw_value.strip()
     if not value:
         return None, "Could not parse Channel Purpose `cwd=` token — value is empty."
     if not value.startswith("/"):
@@ -148,6 +184,29 @@ def _parse_cwd_token(token: str) -> tuple[str | None, str | None]:
             f"Channel Purpose `cwd=` value `{value}` must be an absolute path."
         )
     return value, None
+
+
+def _parse_effort_token(token: str) -> tuple[str | None, str | None]:
+    """If `token` is an `effort=…` assignment, return (level_or_None, warning_or_None).
+
+    Same three-way contract as :func:`_parse_cwd_token`. The level is
+    normalised to lowercase; anything outside :data:`EFFORT_LEVELS` is
+    rejected with a warning and the token is ignored, so a typo degrades to
+    the backend's own default instead of a mid-run API error.
+    """
+    value = _keyed_value(token, EFFORT_KEY)
+    if value is None:
+        return None, None
+    if not value:
+        return None, "Could not parse Channel Purpose `effort=` token — value is empty."
+    level = normalize_effort(value)
+    if level is None:
+        known = ", ".join(f"`{lvl}`" for lvl in EFFORT_LEVELS)
+        return None, (
+            f"Channel Purpose `effort=` value `{value}` is not a known level "
+            f"({known}) — ignoring it."
+        )
+    return level, None
 
 
 def _models_for(
@@ -212,15 +271,22 @@ def parse(
             mention_only=default_mention_only,
             cwd=None,
             no_nag=False,
+            effort=None,
             warnings=[],
         )
 
     warnings: list[str] = []
 
-    # Step 2a: extract cwd= and autorespond/noautorespond/mention-only tokens
-    # up-front so they work positionally anywhere. Paths are case-sensitive so
-    # we keep raw tokens until this point.
+    # Step 2a: extract cwd=, effort= and autorespond/noautorespond/mention-only
+    # tokens up-front so they work positionally anywhere. Paths are
+    # case-sensitive so we keep raw tokens until this point.
+    #
+    # `effort=` MUST be consumed here, before the Step-3/4 model fallback: with
+    # the live harness's empty model catalog any surviving unrecognised token
+    # is accepted as a model name, so an un-extracted level would be POSTed to
+    # the harness as `"model": "xhigh"`.
     cwd: str | None = None
+    effort: str | None = None
     mention_only_override: bool | None = None
     no_nag = False
     remaining: list[str] = []
@@ -235,6 +301,17 @@ def parse(
                     f"Multiple `cwd=` tokens in Channel Purpose — ignoring `{cwd}`, using `{value}`."
                 )
             cwd = value
+            continue
+        level, warn = _parse_effort_token(tok)
+        if warn:
+            warnings.append(warn)
+            continue
+        if level is not None:
+            if effort is not None and effort != level:
+                warnings.append(
+                    f"Multiple `effort=` tokens in Channel Purpose — ignoring `{effort}`, using `{level}`."
+                )
+            effort = level
             continue
         tok_lc = tok.lower()
         if tok_lc in NOAUTORESPOND_ALIASES:
@@ -260,6 +337,7 @@ def parse(
             mention_only=mention_only_effective,
             cwd=cwd,
             no_nag=no_nag,
+            effort=effort,
             warnings=warnings,
         )
 
@@ -328,6 +406,7 @@ def parse(
         mention_only=mention_only_effective,
         cwd=cwd,
         no_nag=no_nag,
+        effort=effort,
         warnings=warnings,
     )
 
@@ -336,7 +415,7 @@ def to_purpose_string(cfg: PurposeConfig, *, default_autorespond: bool) -> str:
     """Serialize a PurposeConfig back into canonical Channel Purpose form.
 
     Emits tokens in a stable order: backend, model, (mention-only|autorespond),
-    cwd, no-nag. Always emits the mention/autorespond flag explicitly so the Channel
+    cwd, effort, no-nag. Always emits the mention/autorespond flag explicitly so the Channel
     Purpose documents the effective setting regardless of config defaults.
 
     The `default_autorespond` argument is accepted for symmetry with `parse()`
@@ -355,6 +434,8 @@ def to_purpose_string(cfg: PurposeConfig, *, default_autorespond: bool) -> str:
 
     if cfg.cwd:
         parts.append(f"{CWD_PREFIX}{cfg.cwd}")
+    if cfg.effort:
+        parts.append(f"{EFFORT_PREFIX}{cfg.effort}")
     # Emitted so a `.cwd` / `.autorespond` rewrite can never silently drop an
     # operator's opt-out — `parse(to_purpose_string(cfg)) == cfg` is the
     # contract this function is held to.

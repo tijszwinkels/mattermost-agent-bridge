@@ -8,11 +8,13 @@ from __future__ import annotations
 import pytest
 
 from mm_bridge.purpose import (
+    EFFORT_LEVELS,
     KNOWN_BACKENDS,
     PurposeConfig,
     SECTION_SEPARATOR,
     canonical_backend,
     join_sections,
+    normalize_effort,
     parse,
     split_config_section,
     has_no_nag,
@@ -264,6 +266,118 @@ def test_cwd_surrounding_whitespace_tolerated():
 
 
 # ---------------------------------------------------------------------------
+# effort= token (reasoning/thinking level)
+#
+# Keyed on purpose: the live harness reports an EMPTY model catalog, so any
+# bare unrecognised token is accepted as a model name (see US-5.3 below). A
+# bare `xhigh` would therefore be POSTed as `"model": "xhigh"`. `effort=` is
+# extracted before that fallback ever runs.
+# ---------------------------------------------------------------------------
+
+
+def test_effort_token_parsed():
+    cfg = parse("claude, opus, autorespond, effort=high", "claude", "opus", _models_for)
+    assert cfg.effort == "high"
+    assert cfg.warnings == []
+
+
+def test_effort_defaults_to_none_when_absent():
+    cfg = parse("claude, opus", "claude", "opus", _models_for)
+    assert cfg.effort is None
+
+
+def test_effort_accepts_every_level():
+    for level in EFFORT_LEVELS:
+        cfg = parse(f"claude, effort={level}", "claude", "opus", _models_for)
+        assert cfg.effort == level, level
+        assert cfg.warnings == []
+
+
+def test_effort_value_is_case_insensitive_and_normalised():
+    cfg = parse("claude, EFFORT=XHigh", "claude", "opus", _models_for)
+    assert cfg.effort == "xhigh"
+
+
+def test_effort_surrounding_whitespace_tolerated():
+    cfg = parse("claude, effort = max  ", "claude", "opus", _models_for)
+    assert cfg.effort == "max"
+
+
+def test_invalid_effort_value_warns_and_is_ignored():
+    cfg = parse("claude, opus, effort=turbo", "claude", "opus", _models_for)
+    assert cfg.effort is None
+    assert any("effort" in w for w in cfg.warnings)
+    # The bad token must not leak into any other slot.
+    assert cfg.model == "opus"
+
+
+def test_empty_effort_value_warns():
+    cfg = parse("claude, effort=", "claude", "opus", _models_for)
+    assert cfg.effort is None
+    assert any("effort" in w for w in cfg.warnings)
+
+
+def test_effort_token_never_becomes_a_model_with_empty_catalog():
+    """The regression `effort=` is keyed to prevent.
+
+    With no enumerated catalog every unknown token is taken as a model, so an
+    un-extracted `effort=xhigh` (or a bare `xhigh`) would be sent to the
+    harness as the MODEL. Extraction happens before that fallback.
+    """
+    empty = lambda _b: []  # noqa: E731 — live-harness catalog
+    cfg = parse("claude, effort=xhigh", "claude", None, empty)
+    assert cfg.effort == "xhigh"
+    assert cfg.model is None
+    assert cfg.warnings == []
+
+
+def test_bare_level_token_is_not_an_effort_token():
+    """A bare `xhigh` is NOT effort — the keyed form is required.
+
+    Pins the decision: without the `effort=` key the token falls through to
+    the ordinary model-name path, which is exactly why the key exists.
+    """
+    cfg = parse("claude, xhigh", "claude", None, lambda _b: [])
+    assert cfg.effort is None
+    assert cfg.model == "xhigh"
+
+
+def test_multiple_effort_tokens_last_wins_and_warns():
+    cfg = parse("claude, effort=low, effort=max", "claude", "opus", _models_for)
+    assert cfg.effort == "max"
+    assert any("Multiple `effort=`" in w for w in cfg.warnings)
+
+
+def test_effort_works_alongside_cwd_and_no_nag():
+    cfg = parse(
+        "codex, effort=medium, cwd=/home/claude/foo, no-nag",
+        "claude", "opus", _models_for,
+    )
+    assert (cfg.backend, cfg.effort, cfg.cwd, cfg.no_nag) == (
+        "codex", "medium", "/home/claude/foo", True,
+    )
+    assert cfg.warnings == []
+
+
+# --- normalize_effort (shared by the parser and the `.effort` command) ---
+
+
+def test_normalize_effort_accepts_known_levels_case_insensitively():
+    assert normalize_effort("HIGH") == "high"
+    assert normalize_effort("  xhigh ") == "xhigh"
+
+
+def test_normalize_effort_rejects_unknown():
+    assert normalize_effort("turbo") is None
+    assert normalize_effort("") is None
+    assert normalize_effort(None) is None
+
+
+def test_effort_levels_is_the_closed_set_in_display_order():
+    assert EFFORT_LEVELS == ("low", "medium", "high", "xhigh", "max")
+
+
+# ---------------------------------------------------------------------------
 # Whitespace tolerance
 # ---------------------------------------------------------------------------
 
@@ -417,6 +531,36 @@ def test_to_purpose_string_with_cwd():
 def test_to_purpose_string_drops_model_when_none():
     cfg = PurposeConfig(backend="claude", model=None)
     assert to_purpose_string(cfg, default_autorespond=True) == "claude, autorespond"
+
+
+def test_to_purpose_string_with_effort():
+    """Stable position: after `cwd`, before `no-nag`."""
+    cfg = PurposeConfig(
+        backend="claude", model="opus", cwd="/home/claude/foo", effort="xhigh",
+    )
+    assert to_purpose_string(cfg, default_autorespond=True) == (
+        "claude, opus, autorespond, cwd=/home/claude/foo, effort=xhigh"
+    )
+
+
+def test_to_purpose_string_omits_effort_when_unset():
+    cfg = PurposeConfig(backend="claude", model="opus")
+    assert "effort" not in to_purpose_string(cfg, default_autorespond=True)
+
+
+def test_to_purpose_string_round_trips_effort():
+    """Contract: `_persist_purpose` must not drop effort on the next `.model`."""
+    orig = PurposeConfig(
+        backend="claude", model="haiku", mention_only=True,
+        cwd="/home/foo", effort="max",
+    )
+    s = to_purpose_string(orig, default_autorespond=True)
+    reparsed = parse(s, "claude", "opus", lambda _b: [], default_autorespond=True)
+    assert reparsed.effort == orig.effort
+    assert reparsed.model == orig.model
+    assert reparsed.cwd == orig.cwd
+    assert reparsed.mention_only == orig.mention_only
+    assert reparsed.warnings == []
 
 
 def test_to_purpose_string_parseable_again():

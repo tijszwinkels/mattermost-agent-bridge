@@ -87,6 +87,7 @@ class AgentHarnessClient:
         cwd: str,
         title: str | None = None,
         bypass_permissions: bool = True,
+        effort: str | None = None,
     ) -> dict:
         # Default ``bypass_permissions=True``: every session this client
         # creates is on behalf of a Mattermost user who can't see — let
@@ -104,8 +105,39 @@ class AgentHarnessClient:
             payload["model"] = model
         if title is not None:
             payload["title"] = title
+        # Omitted when unset so the harness leaves the flag off the argv
+        # entirely and each backend CLI applies its own configured default.
+        if effort is not None:
+            payload["effort"] = effort
 
         resp = await self._http.post("/v1/sessions", json=payload)
+        self._raise_for_status(resp)
+        return resp.json()
+
+    async def update_session(
+        self,
+        session_id: str,
+        *,
+        effort: str | None = None,
+    ) -> dict:
+        """PATCH a LIVE session's mutable settings, keeping its conversation.
+
+        Only fields explicitly passed are sent. The harness treats an omitted
+        field as "leave unchanged" and REJECTS an explicit null, so there is
+        no way to clear a setting back to unset through this route.
+
+        WHY this exists rather than a restart: the harness rebuilds the
+        backend argv fresh on every run, so a PATCH lands on the next turn
+        with the conversation intact — unlike `model`/`backend`/`cwd`, which
+        have no mutate endpoint and force a destroy-and-recreate.
+        """
+        payload: dict = {}
+        if effort is not None:
+            payload["effort"] = effort
+
+        resp = await self._http.patch(f"/v1/sessions/{session_id}", json=payload)
+        if resp.status_code == 404:
+            raise HarnessSessionNotFound(_error_detail(resp))
         self._raise_for_status(resp)
         return resp.json()
 

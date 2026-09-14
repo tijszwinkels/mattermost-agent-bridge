@@ -13,6 +13,7 @@ from mm_bridge.agent_harness_client import (
     HarnessInterruptUnsupported,
     HarnessResumeUnsupported,
     HarnessRunNotFound,
+    HarnessSessionNotFound,
 )
 
 
@@ -90,6 +91,87 @@ async def test_create_session_drops_none_model_and_includes_title_when_present()
         "title": "My session",
         "bypass_permissions": True,
     }
+
+
+async def test_create_session_includes_effort_when_set():
+    seen: dict[str, object] = {}
+
+    async def handler(req: httpx.Request) -> httpx.Response:
+        seen["body"] = json.loads(req.content)
+        return httpx.Response(201, json={"id": "s1"})
+
+    client = _client(handler)
+    await client.create_session(
+        backend="codex", model=None, cwd="/tmp/project", effort="xhigh",
+    )
+    assert seen["body"]["effort"] == "xhigh"
+
+
+async def test_create_session_omits_effort_when_unset():
+    """Unset means "emit nothing" — the backend CLI's own default applies."""
+    seen: dict[str, object] = {}
+
+    async def handler(req: httpx.Request) -> httpx.Response:
+        seen["body"] = json.loads(req.content)
+        return httpx.Response(201, json={"id": "s1"})
+
+    client = _client(handler)
+    await client.create_session(backend="codex", model=None, cwd="/tmp/project")
+    assert "effort" not in seen["body"]
+
+
+# --- update_session (PATCH) — mutate a LIVE session without recreating it ---
+
+
+async def test_update_session_patches_effort():
+    seen: dict[str, object] = {}
+
+    async def handler(req: httpx.Request) -> httpx.Response:
+        seen["method"] = req.method
+        seen["path"] = req.url.path
+        seen["body"] = json.loads(req.content)
+        return httpx.Response(200, json={"id": "s1", "effort": "max"})
+
+    client = _client(handler)
+    out = await client.update_session("s1", effort="max")
+
+    assert seen == {
+        "method": "PATCH",
+        "path": "/v1/sessions/s1",
+        "body": {"effort": "max"},
+    }
+    assert out["effort"] == "max"
+
+
+async def test_update_session_omits_unset_fields_never_sends_null():
+    """The harness REJECTS explicit nulls — omission is the only "unchanged"."""
+    seen: dict[str, object] = {}
+
+    async def handler(req: httpx.Request) -> httpx.Response:
+        seen["body"] = json.loads(req.content)
+        return httpx.Response(200, json={"id": "s1"})
+
+    client = _client(handler)
+    await client.update_session("s1")
+    assert seen["body"] == {}
+
+
+async def test_update_session_missing_session_is_typed():
+    async def handler(req: httpx.Request) -> httpx.Response:
+        return httpx.Response(404, json={"error": {"code": "not_found"}})
+
+    client = _client(handler)
+    with pytest.raises(HarnessSessionNotFound):
+        await client.update_session("nope", effort="low")
+
+
+async def test_update_session_server_error_raises_not_swallowed():
+    async def handler(req: httpx.Request) -> httpx.Response:
+        return httpx.Response(500, json={"error": {"detail": "boom"}})
+
+    client = _client(handler)
+    with pytest.raises(httpx.HTTPStatusError):
+        await client.update_session("s1", effort="low")
 
 
 async def test_create_session_allows_caller_to_disable_bypass_permissions():
