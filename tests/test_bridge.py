@@ -7130,5 +7130,111 @@ class EffortTruthfulReportingTests(_BridgeTestCase):
         self.assertIn("queued", self._joined().lower())
 
 
+class PurposeCacheStalenessTests(_BridgeTestCase):
+    """An external Purpose edit must not be clobbered by a later dot-command.
+
+    `_on_mm_channel_updated` refreshes `purpose_by_channel` only for DORMANT
+    channels. For an ACTIVE channel it posts a notice and returns, leaving the
+    cache stale. `_config_for_update` then reads that stale cache (no
+    `force=True`) and `_persist_purpose` serialises it back — silently dropping
+    every token the operator added in Mattermost.
+
+    Regression guard for the `no-nag` erasure class of bug (see b4667c2). The
+    hazard is shared by `.effort` / `.model` / `.backend` / `.cwd` /
+    `.autorespond`, so it is tested here rather than under one command.
+    """
+
+    def _active_channel(self) -> None:
+        from mm_bridge.purpose import PurposeConfig
+        self.bridge.mapping.link(Anchor("c1"), "s1")
+        self.bridge.purpose_by_channel["c1"] = PurposeConfig(
+            backend="claude", model="opus", mention_only=False,
+        )
+        self.bridge.mm.channels["c1"] = {
+            "id": "c1", "purpose": "claude, opus, autorespond",
+        }
+        self.bridge.last_channel_state["c1"] = {
+            "display_name": "", "purpose": "claude, opus, autorespond",
+        }
+        self.bridge.harness.sessions_meta = [{
+            "id": "s1", "backend": "claude-code", "model": "opus",
+            "project": {"path": "/tmp/proj"}, "status": "idle",
+        }]
+
+    async def _operator_edits_purpose(self, text: str) -> None:
+        """Simulate a human editing the Purpose in the Mattermost UI."""
+        self.bridge.mm.channels["c1"]["purpose"] = text
+        await self.bridge._on_mm_channel_updated(
+            {"id": "c1", "display_name": "", "purpose": text},
+        )
+
+    async def _post(self, message: str) -> None:
+        await self.bridge._on_mm_posted({
+            "channel_id": "c1", "message": message, "user_id": "u1", "type": "",
+        })
+
+    async def test_dot_command_preserves_externally_added_tokens(self):
+        self._active_channel()
+        await self._operator_edits_purpose(
+            "claude, opus, autorespond, cwd=/srv/new, no-nag",
+        )
+
+        await self._post(".effort high")
+
+        written = self.bridge.mm.channels["c1"]["purpose"]
+        self.assertIn("effort=high", written)
+        self.assertIn("cwd=/srv/new", written)
+        self.assertIn("no-nag", written)
+
+    async def test_external_edit_does_not_change_the_live_session(self):
+        """The mark must not reconfigure a running channel by itself.
+
+        US-3.4: a Purpose edit takes effect for NEW sessions. Reloading in
+        the event handler would also swap `mention_only`, silently changing
+        whether the live session answers unmentioned messages.
+        """
+        self._active_channel()
+        before = self.bridge.purpose_by_channel["c1"]
+
+        await self._operator_edits_purpose(
+            "claude, opus, autorespond, cwd=/srv/new, no-nag",
+        )
+
+        self.assertIs(self.bridge.purpose_by_channel["c1"], before)
+        self.assertIn("c1", self.bridge._purpose_dirty)
+
+    async def test_write_path_refuses_rather_than_clobbering_on_a_failed_read(self):
+        """A failed re-read must not fall back to the stale copy.
+
+        The earlier shape logged the failure and carried on with the cached
+        config, which put the erasure bug straight back.
+        """
+        self._active_channel()
+        await self._operator_edits_purpose(
+            "claude, opus, autorespond, cwd=/srv/new, no-nag",
+        )
+        self.bridge.mm.get_channel_error = RuntimeError("MM unreachable")
+
+        await self._post(".effort high")
+
+        self.assertEqual(self.bridge.mm.purposes, [])
+        self.assertIn(":warning:", "\n".join(p.message for p in self.bridge.mm.posted))
+
+    async def test_clean_channel_is_not_re_read(self):
+        """No external edit -> no forced round trip, and cached state stands.
+
+        Forcing unconditionally is what broke `.autorespond`: a Purpose with
+        no autorespond token resolves the flag from the daemon default, so a
+        blanket re-read toggles from the default instead of the real state.
+        """
+        self._active_channel()
+        self.bridge.mm.channels["c1"]["purpose"] = "claude, opus, autorespond"
+        cached = self.bridge.purpose_by_channel["c1"]
+
+        cfg = await self.bridge._config_for_update("c1", ".effort")
+
+        self.assertIs(cfg, cached)
+
+
 if __name__ == "__main__":
     unittest.main()
