@@ -4915,7 +4915,13 @@ class Bridge:
         cfg = await self._config_for_update(channel_id, ".effort")
         live_known = True
         try:
-            meta = await self.harness.get_session(session_id) or {}
+            meta = await self.harness.get_session(session_id)
+            if meta is None:
+                # A 404 is not "no effort set" — the harness has no such
+                # session, so we know nothing about a live level and must
+                # not present the Purpose as one.
+                live_known = False
+            meta = meta or {}
         except Exception:
             # Warning, not debug: without the harness we cannot see the live
             # level, and a read that silently downgrades to the cached copy is

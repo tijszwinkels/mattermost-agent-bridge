@@ -7091,6 +7091,15 @@ class EffortTruthfulReportingTests(_BridgeTestCase):
         self.assertNotIn("Current effort", joined)
         self.assertIn("medium", joined)
 
+    async def test_bare_effort_treats_a_missing_session_as_unknown(self):
+        """A 404 is not "no effort set" — the harness has no such session."""
+        self._active_channel(effort="medium")
+        self.bridge.harness.sessions_meta = []
+
+        await self._post(".effort")
+
+        self.assertNotIn("Current effort", self._joined())
+
     # ----- medium 2: a message is already queued behind the live run -----
 
     async def test_effort_discloses_that_a_held_message_may_use_the_old_level(self):
