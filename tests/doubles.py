@@ -45,6 +45,9 @@ class FakeMattermostClient:
     uploaded: list[tuple[str, str]] = field(default_factory=list)
     headers: list[tuple[str, str]] = field(default_factory=list)
     purposes: list[tuple[str, str]] = field(default_factory=list)
+    # Simulates Mattermost rejecting a Purpose write (permissions, the 250-char
+    # cap, an outage) so callers can be tested for truthful reporting.
+    set_channel_purpose_error: Exception | None = None
     users: dict = field(default_factory=dict)
     posts_by_channel: dict = field(default_factory=dict)
     posts_by_id: dict = field(default_factory=dict)
@@ -132,6 +135,8 @@ class FakeMattermostClient:
         self.channels.setdefault(channel_id, {"id": channel_id})["header"] = header
 
     def set_channel_purpose(self, channel_id: str, purpose: str) -> None:
+        if self.set_channel_purpose_error is not None:
+            raise self.set_channel_purpose_error
         self.purposes.append((channel_id, purpose))
         self.channels.setdefault(channel_id, {"id": channel_id})["purpose"] = purpose
 
@@ -251,6 +256,8 @@ class FakeAgentHarnessClient:
     run_probe_error: Exception | None = None
     patched: list = field(default_factory=list)  # (session_id, patch) per PATCH
     update_session_error: Exception | None = None
+    # Simulates the harness being unreachable for a session read.
+    get_session_error: Exception | None = None
     models_by_backend: dict = field(default_factory=lambda: {
         "claude": ["opus", "sonnet"],
         "codex": ["gpt-5.4"],
@@ -327,6 +334,8 @@ class FakeAgentHarnessClient:
         return self.sessions_meta
 
     async def get_session(self, session_id):
+        if self.get_session_error is not None:
+            raise self.get_session_error
         for s in self.sessions_meta:
             if s.get("id") == session_id:
                 if "project" not in s and s.get("projectPath"):

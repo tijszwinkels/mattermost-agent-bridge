@@ -2095,8 +2095,15 @@ class Bridge:
 
     def _persist_purpose(
         self, channel_id: str, cfg: purpose.PurposeConfig,
-    ) -> None:
+    ) -> bool:
         """Write the canonical form of `cfg` back to the MM channel's Purpose.
+
+        Returns True when Mattermost accepted the write. A caller that
+        confirms the change to the user MUST check this: the Purpose is the
+        durable copy, so a silent failure leaves the live session and the
+        stored config disagreeing, and the next reload quietly reverts what
+        the user was told had happened. Callers that are merely keeping the
+        Purpose in step (no user-facing claim) may ignore it.
 
         Preserves any trailing resume block below the section separator —
         that block is owned by ``_update_resume_purpose`` and lives
@@ -2127,6 +2134,17 @@ class Bridge:
             logger.warning(
                 "Failed to persist Channel Purpose for %s", channel_id, exc_info=True,
             )
+            # Drop the self-write marker: the write never landed, so no
+            # `channel_updated` event is coming to consume it. Leaving it
+            # would make us ignore the operator's NEXT genuine edit if they
+            # happen to type this exact text.
+            pending = self._self_written_purpose.get(channel_id)
+            if pending is not None:
+                pending.discard(serialized)
+                if not pending:
+                    self._self_written_purpose.pop(channel_id, None)
+            return False
+        return True
 
     def _note_self_wrote_purpose(self, channel_id: str, purpose_text: str) -> None:
         self._self_written_purpose.setdefault(channel_id, set()).add(purpose_text)
@@ -4887,11 +4905,16 @@ class Bridge:
         an unknown value and the API 400s mid-run.
         """
         cfg = await self._config_for_update(channel_id, ".effort")
+        live_known = True
         try:
             meta = await self.harness.get_session(session_id) or {}
         except Exception:
-            logger.debug("`.effort` harness get_session failed", exc_info=True)
+            # Warning, not debug: without the harness we cannot see the live
+            # level, and a read that silently downgrades to the cached copy is
+            # exactly the kind of failure that looks fine until it matters.
+            logger.warning("`.effort` harness get_session failed", exc_info=True)
             meta = {}
+            live_known = False
         levels = self._effort_levels_list()
 
         # Bare `.effort` → report the live level (a pure read, thread-safe).
@@ -4899,10 +4922,19 @@ class Bridge:
             current = (
                 meta.get("effort") or (cfg.effort if cfg else None) or "default"
             )
+            if live_known:
+                body = f":brain: Current effort: `{current}`."
+            else:
+                # Say what we actually know. The Purpose is the CONFIGURED
+                # level; the running session may have been PATCHed to
+                # something else (`spawn --effort`, an out-of-band change).
+                body = (
+                    f":warning: Configured effort: `{current}` — couldn't reach "
+                    "the harness, so this may not be the running session's level."
+                )
             self._post_cmd_reply(
                 channel_id,
-                f":brain: Current effort: `{current}`. "
-                f"Set with `.effort <level>`. Levels: {levels}.",
+                f"{body} Set with `.effort <level>`. Levels: {levels}.",
                 thread_root,
             )
             return
@@ -4945,11 +4977,36 @@ class Bridge:
 
         updated = replace(cfg, effort=level, warnings=[])
         self.purpose_by_channel[channel_id] = updated
-        self._persist_purpose(channel_id, updated)
+        persisted = self._persist_purpose(channel_id, updated)
+
+        if not persisted:
+            # The PATCH landed but the durable copy did not. Don't claim a
+            # clean success: on the next reload the Purpose wins and the
+            # level silently reverts to the old one.
+            self._post_cmd_reply(
+                channel_id,
+                f":warning: Effort set to `{level}` on the running session, but "
+                "I couldn't save it to the Channel Purpose — it will revert to "
+                f"`{cfg.effort or 'default'}` when this channel is reloaded. "
+                "Check my permissions on this channel, then set it again.",
+                thread_root,
+            )
+            return
+
+        note = ""
+        if self._held.peek(Anchor(channel_id)):
+            # A post that arrived BEFORE this command is already queued behind
+            # the in-flight run. Whether it is submitted before or after this
+            # PATCH depends on when the run's terminal event lands, so promising
+            # "your next message" without qualification would be a coin flip.
+            note = (
+                " A message is already queued behind the current run; it may "
+                "still be answered at the previous level."
+            )
         self._post_cmd_reply(
             channel_id,
             f":brain: Effort set to `{level}` — applies from your next message "
-            "(the session and its conversation are kept).",
+            f"(the session and its conversation are kept).{note}",
             thread_root,
         )
 
