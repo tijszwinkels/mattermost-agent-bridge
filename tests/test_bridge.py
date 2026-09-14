@@ -7011,5 +7011,124 @@ class EffortCommandTests(_BridgeTestCase):
         self.assertIn("effort: `default`", self._joined())
 
 
+class EffortTruthfulReportingTests(_BridgeTestCase):
+    """`.effort` must not claim more than it actually achieved.
+
+    Three failure modes from the gpt-5.6-sol review of #56, all of which
+    reported success (or a live value) that the system could not back up.
+    """
+
+    def _active_channel(self, effort: str | None = None) -> None:
+        from mm_bridge.purpose import PurposeConfig
+        self.bridge.mapping.link(Anchor("c1"), "s1")
+        self.bridge.purpose_by_channel["c1"] = PurposeConfig(
+            backend="claude", model="opus", mention_only=False, effort=effort,
+        )
+        purpose_text = "claude, opus, autorespond"
+        if effort:
+            purpose_text += f", effort={effort}"
+        self.bridge.mm.channels["c1"] = {"id": "c1", "purpose": purpose_text}
+        self.bridge.harness.sessions_meta = [{
+            "id": "s1", "backend": "claude-code", "model": "opus",
+            "project": {"path": "/tmp/proj"}, "status": "idle",
+            **({"effort": effort} if effort else {}),
+        }]
+
+    async def _post(self, message: str) -> None:
+        await self.bridge._on_mm_posted({
+            "channel_id": "c1", "message": message, "user_id": "u1", "type": "",
+        })
+
+    def _joined(self) -> str:
+        return "\n".join(p.message for p in self.bridge.mm.posted)
+
+    # ----- medium 1: PATCH succeeded, Purpose write failed -----
+
+    async def test_failed_purpose_write_is_not_reported_as_plain_success(self):
+        """Live session moved, durable Purpose did not — say so.
+
+        Silently claiming success strands the two out of sync: the next
+        engagement reloads the old Purpose and the level is quietly lost.
+        """
+        self._active_channel()
+        self.bridge.mm.set_channel_purpose_error = RuntimeError("MM rejected it")
+
+        await self._post(".effort max")
+
+        # The PATCH really did land, so we must not claim it didn't.
+        self.assertEqual(self.bridge.harness.patched, [("s1", {"effort": "max"})])
+        joined = self._joined()
+        self.assertNotIn("Effort set to `max` — applies from your next", joined)
+        self.assertIn(":warning:", joined)
+        self.assertIn("couldn't save it to the Channel Purpose", joined)
+        # The cache must not keep a level Mattermost rejected.
+        self.assertIsNone(self.bridge.purpose_by_channel["c1"].effort)
+
+    async def test_second_failed_write_still_names_the_real_durable_level(self):
+        """The revert level must come from the Purpose, not a phantom cache.
+
+        Caching the attempted level made a second failure report the value
+        of the first failed attempt as the durable one.
+        """
+        self._active_channel(effort="low")
+        self.bridge.mm.set_channel_purpose_error = RuntimeError("MM rejected it")
+
+        await self._post(".effort max")
+        await self._post(".effort xhigh")
+
+        self.assertIn("revert to `low`", self._joined())
+        self.assertNotIn("revert to `max`", self._joined())
+
+    # ----- medium 3: harness unreachable on a bare read -----
+
+    async def test_bare_effort_does_not_present_a_cached_value_as_live(self):
+        self._active_channel(effort="medium")
+        self.bridge.harness.get_session_error = RuntimeError("harness down")
+
+        await self._post(".effort")
+
+        joined = self._joined()
+        self.assertNotIn("Current effort", joined)
+        self.assertIn("medium", joined)
+
+    async def test_bare_effort_treats_a_missing_session_as_unknown(self):
+        """A 404 is not "no effort set" — the harness has no such session."""
+        self._active_channel(effort="medium")
+        self.bridge.harness.sessions_meta = []
+
+        await self._post(".effort")
+
+        self.assertNotIn("Current effort", self._joined())
+
+    # ----- medium 2: a message is already queued behind the live run -----
+
+    async def test_effort_discloses_that_a_held_message_may_use_the_old_level(self):
+        self._active_channel(effort="low")
+        self.bridge.current_run_id_by_session["s1"] = "run-s1"
+        from mm_bridge.held_posts import HeldPost
+        self.bridge._held.add(
+            Anchor("c1"),
+            HeldPost(
+                post={"id": "p-held", "user_id": "u1", "message": "already queued"},
+                username="u1",
+                held_at_ms=0,
+            ),
+            session_id="s1",
+        )
+
+        # Drain the queue DURING the command, exactly as the harness
+        # listener would on a run-terminal event mid-await. The disclosure
+        # must still be made: the message was queued when the user asked.
+        async def drain_then_patch(session_id, **kw):
+            self.bridge._held.clear(Anchor("c1"))
+            return {"id": session_id, **kw}
+        self.bridge.harness.update_session = drain_then_patch
+
+        await self._post(".effort high")
+
+        self.assertFalse(self.bridge._held.peek(Anchor("c1")))
+        self.assertIn("queued", self._joined().lower())
+
+
 if __name__ == "__main__":
     unittest.main()
