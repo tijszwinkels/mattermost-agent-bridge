@@ -138,6 +138,36 @@ forwarded to the agent. An unknown `.word` gets a "try `.help`" reply.
 | `.fleet [all]` | One row per spawned child channel: declared state, live run, held posts. |
 | `.invite <session-id>` | Get added to a session's channel, creating it for unmapped/terminal sessions. |
 
+### Channels onto terminal sessions
+
+`.sessions` lists sessions a human started in a terminal (the harness reports
+them as `origin: external`) and `.invite` opens a channel onto one. Posting
+there does **not** drive that terminal — the harness re-invokes the backend CLI
+headlessly — and what that means differs per backend, so the new channel opens
+with a heads-up that says which:
+
+- **claude / codex** — unchanged by this feature. Posting behaves exactly as it
+  did before, and the channel does not drive the terminal session.
+- **pi** continues the *same* conversation (`pi -p --session <path>`), appending
+  to the very file the terminal created. Not a fork — but **close the
+  terminal's pi/Herdr session before posting here, and reload it before going
+  back to it.** A terminal that stays open keeps its own in-memory copy: its
+  turns and yours become *sibling branches* of the same parent, and whoever
+  reopens the file next sees only the branch appended last — the other side's
+  turns are silently absent from the model's context. This is headless
+  continuation, not remote control of a live pi TUI.
+
+If the harness can't continue a session — e.g. a pi transcript that has moved
+or been deleted, where resuming would silently open a *new* conversation — the
+channel shows the harness's reason, with sensitive details redacted, and says
+the message was not delivered. Existing held-message recovery rules apply.
+
+> Sessions are discovered by watching the **harness host's own filesystem**. A
+> terminal session on your laptop will not appear in a harness running on a
+> server; that needs a harness + bridge on the laptop, or accessible transcripts
+> under one of the harness's observe-roots. Continuing them also requires the
+> project directory and pi provider configuration on the harness host.
+
 Switching model, backend or directory in an **active** channel recreates the session, so
 `.stop` a running turn first. (`.effort` is the exception — it patches the live session,
 so it needs neither.) Inside a **thread fork**, reading works but switching is

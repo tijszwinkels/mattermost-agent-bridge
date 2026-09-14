@@ -707,6 +707,29 @@ class FlushFailureTests(_HoldTestCase):
             ["p1"],
         )
 
+    async def test_resume_unsupported_tells_the_channel_the_harness_reason(self):
+        """A 409 detail is actionable — "no pi transcript under <path>"
+        tells the operator to check the cwd. A bare "can't resume" tells
+        them nothing, and they retry forever."""
+        self.run_live()
+        await self.bridge._on_mm_posted(self.post("p1", "one"))
+
+        async def unsupported(session_id, message):
+            raise HarnessResumeUnsupported(
+                "Cannot resume external pi session ses_abc: no pi transcript "
+                "for e5a93149-9a70-4aef-a189-2681b4e08525 under /home/me/project "
+                "— resuming would silently start a new conversation"
+            )
+
+        self.bridge.harness.create_run = unsupported
+        await self.terminal()
+
+        posted = "\n".join(p.message for p in self.bridge.mm.posted)
+        self.assertIn("/home/me/project", posted)
+        self.assertIn("silently start a new conversation", posted)
+        # And the operator is told the post did not run.
+        self.assertIn("not delivered", posted.lower())
+
     async def test_resume_unsupported_names_them_when_drops_are_disabled(self):
         # `initial_catch_up_n <= 0` disables the silent-drop queue, so the
         # carve-out has nowhere to park the posts. They must still not

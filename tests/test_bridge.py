@@ -4160,6 +4160,26 @@ class CommandPhase3Tests(_BridgeTestCase):
         # Mapped row points at its channel, not an invite hint.
         self.assertIn("Mapped One", joined)
 
+    async def test_dot_sessions_lists_external_pi_with_an_invite_hint(self):
+        """An external pi session the observer discovered has to be
+        reachable the same way any other unmapped session is — it is the
+        only route from "I was working in a pi terminal" to a channel."""
+        self.bridge.harness.sessions_meta = [
+            {"id": "ses_e5a931499a704aefa1892681b4e08525", "backend": "pi",
+             "title": None, "project": {"path": "/home/me/project", "name": "project"},
+             "origin": "external", "updated_at": "2026-09-14T10:00:00Z"},
+        ]
+
+        await self.bridge._on_mm_posted({
+            "channel_id": "c1", "message": ".sessions",
+            "user_id": "u1", "type": "",
+        })
+
+        joined = "\n".join(self._posted_texts())
+        self.assertIn("`pi`", joined)
+        self.assertIn(".invite ses_e5a931499a704aefa1892681b4e08525", joined)
+        self.assertIn("project", joined)
+
     async def test_dot_sessions_sorts_by_updated_at_desc(self):
         self.bridge.harness.sessions_meta = [
             {"id": "old", "backend": "claude", "title": "Old",
@@ -4252,7 +4272,12 @@ class CommandPhase3Tests(_BridgeTestCase):
         ]
         self.assertTrue(warned)
 
-    async def test_dot_invite_pi_external_is_rejected(self):
+    async def test_dot_invite_pi_external_creates_a_channel(self):
+        """External pi sessions ARE resumable now — headlessly, via
+        ``pi -p --session-id`` against the transcript the terminal wrote
+        (harness: specs/2026-09-14-external-pi-sessions.md). The blanket
+        rejection that used to live here is gone; the harness is what
+        decides, per session, whether a run can be honoured."""
         self.bridge.harness.sessions_meta = [{
             "id": "pi_ext", "backend": "pi", "title": "PiExt",
             "project": {"path": "/p", "name": "p"}, "origin": "external",
@@ -4263,10 +4288,35 @@ class CommandPhase3Tests(_BridgeTestCase):
             "user_id": "u1", "type": "",
         })
 
-        # No channel created, no invite.
-        self.assertIsNone(self.bridge.mapping.get_anchor("pi_ext"))
-        self.assertEqual(self.bridge.mm.invited, [])
-        self.assertIn("can't be resumed", "\n".join(self._posted_texts()).lower())
+        anchor = self.bridge.mapping.get_anchor("pi_ext")
+        self.assertIsNotNone(anchor)
+        self.assertEqual(self.bridge.mm.invited[-1][1], "u1")
+        self.assertEqual(self.bridge.mm.invited[-1][0], anchor.channel_id)
+
+    async def test_dot_invite_pi_external_warns_headless_not_fork(self):
+        """pi appends to the SAME transcript, so the claude/codex "this
+        channel is a fork" wording would be actively wrong here."""
+        self.bridge.harness.sessions_meta = [{
+            "id": "pi_ext", "backend": "pi", "title": "PiExt",
+            "project": {"path": "/p", "name": "p"}, "origin": "external",
+        }]
+
+        await self.bridge._on_mm_posted({
+            "channel_id": "c1", "message": ".invite pi_ext",
+            "user_id": "u1", "type": "",
+        })
+
+        anchor = self.bridge.mapping.get_anchor("pi_ext")
+        notices = [
+            p.message.lower() for p in self.bridge.mm.posted
+            if p.channel_id == anchor.channel_id and "heads-up" in p.message.lower()
+        ]
+        self.assertTrue(notices)
+        self.assertIn("headless", notices[0])
+        self.assertIn("same transcript", notices[0])
+        self.assertIn("not a remote control", notices[0])
+        self.assertIn("sibling branches", notices[0])
+        self.assertNotIn("becomes a **fork**", notices[0])
 
     async def test_dot_invite_unknown_session_errors(self):
         await self.bridge._on_mm_posted({

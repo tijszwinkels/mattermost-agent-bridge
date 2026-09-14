@@ -30,9 +30,11 @@ from .backend_errors import (
     exception_detail,
     format_backend_error,
     format_provider_failure,
+    format_resume_refusal,
     run_failure_detail,
     run_failure_path,
 )
+from .external_resume import external_resume_notice, supports_external_resume
 from .stderr_tail import SessionStderrTails
 from .agent_harness_client import (
     AgentHarnessClient,
@@ -746,11 +748,21 @@ class Bridge:
             if not session_id:
                 continue
             is_external = session.get("origin") == "external"
-            if is_external and self.mapping.get_anchor(session_id):
+            if (
+                is_external
+                and self.mapping.get_anchor(session_id)
+                and not supports_external_resume(session.get("backend"))
+            ):
                 # Inbound MM posts to this mapping can't be delivered:
                 # the harness has no stdin for an externally-launched
                 # session. ``_on_mm_posted`` will swap in a fresh
                 # harness-origin session on the next user post.
+                #
+                # Backends the harness CAN append to (pi) are exempt:
+                # swapping would throw away the very conversation the
+                # user asked to continue. They take the ordinary
+                # ``create_run`` path, and the harness 409s if the
+                # transcript has since become unresumable.
                 self._external_sessions.add(session_id)
             if self.mapping.get_anchor(session_id):
                 self._known_sessions.add(session_id)
@@ -2337,19 +2349,21 @@ class Bridge:
         try:
             run = await self.harness.create_run(session_id, body)
             self._track_run_response(session_id, run)
-        except HarnessResumeUnsupported:
+        except HarnessResumeUnsupported as exc:
             self._restore_first_message_state(
                 channel_id, first_message, first_catch_up,
             )
-            logger.warning("agent-harness resume unsupported for %s", session_id[:8])
+            logger.warning(
+                "agent-harness resume unsupported for %s: %s", session_id[:8], exc,
+            )
             try:
                 self.mm.post(
                     channel_id,
-                    ":warning: Can't resume this external session from Mattermost.",
+                    format_resume_refusal(exception_detail(exc)),
                     root_id=thread_root,
                 )
             except Exception:
-                pass
+                logger.debug("Failed to post resume-refusal notice", exc_info=True)
             for pending in requeue_on_failure:
                 self._enqueue_silent_drop(channel_id, thread_root, pending)
             return DELIVERY_UNSUPPORTED
@@ -5141,9 +5155,17 @@ class Bridge:
             return
         user_id = post.get("user_id") or ""
 
-        # Already mapped → just add the requester to its channel.
+        # Already mapped → just add the requester to its channel. They
+        # still need the heads-up: an auto-mirrored channel, or one someone
+        # else was invited to, is exactly where a newcomer would otherwise
+        # never see it.
         anchor = self.mapping.get_anchor(session_id)
         if anchor:
+            meta = await self._session_meta_or_none(session_id)
+            if meta and meta.get("origin") == "external":
+                self._post_external_resume_notice(
+                    anchor.channel_id, meta.get("backend"),
+                )
             await self._invite_requester(
                 anchor.channel_id, user_id, session_id, channel_id, thread_root,
             )
@@ -5166,18 +5188,6 @@ class Bridge:
             )
             return
 
-        # External pi sessions aren't resumable (harness 409), so a channel
-        # would be a dead end — reject up front.
-        backend = purpose.canonical_backend(meta.get("backend"))
-        if meta.get("origin") == "external" and backend == "pi":
-            self._post_cmd_reply(
-                channel_id,
-                f":warning: Session `{session_id[:12]}` is an external `pi` "
-                "session — it can't be resumed from Mattermost.",
-                thread_root,
-            )
-            return
-
         new_channel_id = await self._create_channel_for_session(meta)
         if not new_channel_id:
             self._post_cmd_reply(
@@ -5187,23 +5197,30 @@ class Bridge:
             )
             return
 
-        # Resuming a still-open TUI session forks it — the MM channel becomes
-        # a parallel branch, not a remote control of the live terminal.
-        if meta.get("origin") == "external":
-            try:
-                self.mm.post(
-                    new_channel_id,
-                    ":information_source: _Heads-up: posting here resumes this "
-                    "session via `--resume`. If it's still open in a terminal, "
-                    "this channel becomes a **fork** of the conversation, not a "
-                    "remote control of the live TUI._",
-                )
-            except Exception:
-                logger.debug("failed posting resume-fork warning", exc_info=True)
-
+        # The heads-up is posted by ``_create_channel_for_session`` so that
+        # auto-mirrored channels get it too — not repeated here.
         await self._invite_requester(
             new_channel_id, user_id, session_id, channel_id, thread_root,
         )
+
+    def _post_external_resume_notice(self, channel_id: str, backend: str | None) -> None:
+        """Explain what posting into an external session's channel does.
+
+        Best-effort: a failed notice must never block the channel itself.
+        """
+        try:
+            self.mm.post(
+                channel_id, ":information_source: " + external_resume_notice(backend),
+            )
+        except Exception:
+            logger.debug("failed posting external-resume notice", exc_info=True)
+
+    async def _session_meta_or_none(self, session_id: str) -> dict | None:
+        try:
+            return await self.harness.get_session(session_id)
+        except Exception:
+            logger.debug("get_session failed for %s", session_id[:12], exc_info=True)
+            return None
 
     async def _invite_requester(
         self,
@@ -5773,9 +5790,18 @@ class Bridge:
         # External-origin sessions have no harness stdin — a later MM post
         # must trigger ``_replace_external_session`` instead of a silent
         # ``create_run``. Tag the mapping so ``_on_mm_posted`` takes the
-        # replacement path on the next inbound message.
+        # replacement path on the next inbound message. Resumable backends
+        # (pi) are exempt: the harness appends to their observed
+        # transcript, so replacing would discard the conversation.
         if data.get("origin") == "external":
-            self._external_sessions.add(session_id)
+            backend = data.get("backend")
+            if not supports_external_resume(backend):
+                self._external_sessions.add(session_id)
+            # Posted here rather than at the ``.invite`` call site so that
+            # AUTO-MIRRORED channels — the ones nobody ran ``.invite`` for
+            # — carry the warning too. Missing it is how someone ends up
+            # believing they are driving the live terminal.
+            self._post_external_resume_notice(channel_id, backend)
         await self._update_resume_purpose(
             channel_id, session_id,
             data.get("backend"), project.get("path"),
