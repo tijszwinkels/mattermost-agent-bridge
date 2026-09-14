@@ -2098,12 +2098,16 @@ class Bridge:
     ) -> bool:
         """Write the canonical form of `cfg` back to the MM channel's Purpose.
 
-        Returns True when Mattermost accepted the write. A caller that
-        confirms the change to the user MUST check this: the Purpose is the
+        Returns True when Mattermost accepted the write. The Purpose is the
         durable copy, so a silent failure leaves the live session and the
-        stored config disagreeing, and the next reload quietly reverts what
-        the user was told had happened. Callers that are merely keeping the
-        Purpose in step (no user-facing claim) may ignore it.
+        stored config disagreeing and the next reload quietly reverts what
+        the user was told had happened.
+
+        Only `.effort` (active path) checks this today. The other callers
+        still confirm unconditionally and can therefore still promise a
+        setting that was never saved — the same defect, untouched here
+        rather than fixed by a return type nobody reads. Routing every
+        confirming caller through one shared helper is the follow-up.
 
         Preserves any trailing resume block below the section separator —
         that block is owned by ``_update_resume_purpose`` and lives
@@ -4904,6 +4908,10 @@ class Bridge:
         than left to the CLI: codex does NOT validate locally, it forwards
         an unknown value and the API 400s mid-run.
         """
+        # Snapshot before the first await. The harness listener can flush the
+        # held queue while we are awaiting below, and a disclosure that
+        # depends on when that lands would be a coin flip of its own.
+        held_on_entry = bool(self._held.peek(Anchor(channel_id)))
         cfg = await self._config_for_update(channel_id, ".effort")
         live_known = True
         try:
@@ -4976,8 +4984,13 @@ class Bridge:
             return
 
         updated = replace(cfg, effort=level, warnings=[])
-        self.purpose_by_channel[channel_id] = updated
+        # Persist FIRST, cache only on success. Caching a level Mattermost
+        # rejected leaves the cache disagreeing with the durable Purpose,
+        # and the next `.effort` would then quote that phantom level as the
+        # one it is about to revert to.
         persisted = self._persist_purpose(channel_id, updated)
+        if persisted:
+            self.purpose_by_channel[channel_id] = updated
 
         if not persisted:
             # The PATCH landed but the durable copy did not. Don't claim a
@@ -4994,7 +5007,7 @@ class Bridge:
             return
 
         note = ""
-        if self._held.peek(Anchor(channel_id)):
+        if held_on_entry:
             # A post that arrived BEFORE this command is already queued behind
             # the in-flight run. Whether it is submitted before or after this
             # PATCH depends on when the run's terminal event lands, so promising

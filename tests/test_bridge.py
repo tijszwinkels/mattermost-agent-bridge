@@ -7058,8 +7058,26 @@ class EffortTruthfulReportingTests(_BridgeTestCase):
         # The PATCH really did land, so we must not claim it didn't.
         self.assertEqual(self.bridge.harness.patched, [("s1", {"effort": "max"})])
         joined = self._joined()
+        self.assertNotIn("Effort set to `max` — applies from your next", joined)
         self.assertIn(":warning:", joined)
-        self.assertIn("max", joined)
+        self.assertIn("couldn't save it to the Channel Purpose", joined)
+        # The cache must not keep a level Mattermost rejected.
+        self.assertIsNone(self.bridge.purpose_by_channel["c1"].effort)
+
+    async def test_second_failed_write_still_names_the_real_durable_level(self):
+        """The revert level must come from the Purpose, not a phantom cache.
+
+        Caching the attempted level made a second failure report the value
+        of the first failed attempt as the durable one.
+        """
+        self._active_channel(effort="low")
+        self.bridge.mm.set_channel_purpose_error = RuntimeError("MM rejected it")
+
+        await self._post(".effort max")
+        await self._post(".effort xhigh")
+
+        self.assertIn("revert to `low`", self._joined())
+        self.assertNotIn("revert to `max`", self._joined())
 
     # ----- medium 3: harness unreachable on a bare read -----
 
@@ -7089,9 +7107,17 @@ class EffortTruthfulReportingTests(_BridgeTestCase):
             session_id="s1",
         )
 
+        # Drain the queue DURING the command, exactly as the harness
+        # listener would on a run-terminal event mid-await. The disclosure
+        # must still be made: the message was queued when the user asked.
+        async def drain_then_patch(session_id, **kw):
+            self.bridge._held.clear(Anchor("c1"))
+            return {"id": session_id, **kw}
+        self.bridge.harness.update_session = drain_then_patch
+
         await self._post(".effort high")
 
-        self.assertEqual(self.bridge.harness.patched, [("s1", {"effort": "high"})])
+        self.assertFalse(self.bridge._held.peek(Anchor("c1")))
         self.assertIn("queued", self._joined().lower())
 
 
