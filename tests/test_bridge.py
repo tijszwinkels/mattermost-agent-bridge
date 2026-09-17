@@ -5293,6 +5293,9 @@ class AutoJoinTests(_BridgeTestCase):
         self.bridge._dormant_channels.add("c1")
 
     async def test_channel_created_event_joins_when_enabled(self):
+        self.bridge.mm.channels["c-new"] = {
+            "id": "c-new", "type": "O", "team_id": self.bridge.mm.team_id,
+        }
         await self.bridge._on_mm_channel_created("c-new")
         self.assertIn("c-new", self.bridge.mm.joined)
         # Session-less silent presence; the resulting user_added must not
@@ -5302,7 +5305,7 @@ class AutoJoinTests(_BridgeTestCase):
         self.assertEqual(self.bridge.vd.created, [])
         self.assertIn("c-new", self.bridge._dormant_channels)
 
-    async def test_channel_created_event_ignored_when_disabled(self):
+    async def test_channel_created_event_does_not_join_when_disabled(self):
         self.config.auto_join_public_channels = False
         await self.bridge._on_mm_channel_created("c-new")
         self.assertEqual(self.bridge.mm.joined, [])
@@ -5854,11 +5857,11 @@ class ChannelJoinWelcomeTests(_BridgeTestCase):
         self.assertEqual(len(self._welcomes()), 1)
 
     async def test_re_invite_posts_a_second_welcome(self):
-        """Idempotent at the call site, deliberate at the post site: a
-        re-add IS the user reaching out again, so welcome them again."""
+        """An actual removal and re-invite should welcome the channel again."""
         self.bridge.mm.channels["c1"] = {"id": "c1", "purpose": ""}
 
         await self.bridge._on_mm_user_added("c1", self.bridge.mm.bot_user_id)
+        await self.bridge._on_mm_user_removed("c1", self.bridge.mm.bot_user_id)
         await self.bridge._on_mm_user_added("c1", self.bridge.mm.bot_user_id)
 
         self.assertEqual(len(self._welcomes()), 2)
