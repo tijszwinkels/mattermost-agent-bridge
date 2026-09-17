@@ -63,7 +63,11 @@ credentials masked.
 A channel the bot has joined but nobody has engaged yet is **dormant**: no session, no
 model, no cost. Configure it (`.model`, `.backend`, `.autorespond`) before the first real
 message and those settings — stored in the Channel Purpose — apply when the session is
-created.
+created. Every channel the bot belongs to becomes dormant, however it got there: an
+invite, an auto-join, or a channel created with the bot's own account (private ones
+included — that needs no auto-join). If the event announcing one goes missing, a periodic
+membership scan picks it up within `membership_reconcile_seconds` rather than waiting for
+a restart.
 
 ### Which directory a session starts in
 
@@ -401,6 +405,12 @@ mirror_external_sessions = true
 # NOT created until someone actually engages the bot.
 auto_join_public_channels  = false
 auto_join_reconcile_seconds = 5.0
+
+# How often to re-scan the bot's own memberships for channels the Mattermost
+# event stream never announced (a channel created with the bot's account while
+# the socket was reconnecting, say). Never joins anything — it only notices
+# channels the bot is already in — so it runs with auto-join off too.
+membership_reconcile_seconds = 300.0
 
 # Attachment safety — <openFile path="..."> only resolves files under these.
 allowed_attachment_roots = ["~/projects"]

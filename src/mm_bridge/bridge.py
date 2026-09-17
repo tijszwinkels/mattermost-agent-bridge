@@ -616,6 +616,21 @@ class Bridge:
         # safe config commands work immediately, while the first conversational
         # message creates the one and only harness session.
         self._dormant_channels: set[str] = set()
+        # Channels the bridge has left (or been removed from). The membership
+        # reconciler skips them, so a listing that still reports a membership
+        # we just gave up can't undo the leave. Self-pruning: entries drop as
+        # soon as a sweep sees the membership is really gone, and a genuine
+        # re-invite clears the entry in `_on_mm_user_added`.
+        self._left_channels: set[str] = set()
+        # Set when a discovery lookup failed and the membership reconciler
+        # should look again NOW rather than at the next interval. Coalescing
+        # by construction: any number of failures collapse into one sweep.
+        self._membership_recheck = asyncio.Event()
+        # True once a full membership listing has been seen. Until then a
+        # sweep can't tell a channel the event stream missed from one the
+        # bot has been sitting in for months, so it registers silently
+        # instead of welcoming — see `_reconcile_memberships_once`.
+        self._membership_baseline = False
         self._max_file_size: int | None = None
         # Per-session coalesced tool-use placeholder posts. Created on the
         # first tool_use block of a turn, edited on subsequent ones; the
@@ -687,7 +702,10 @@ class Bridge:
                 logger.exception("agent-harness health check failed — continuing anyway")
 
         await self._bootstrap_known_sessions()
-        await self._bootstrap_dormant_channels()
+        if not await self._bootstrap_dormant_channels():
+            # No membership picture at all: have the reconciler retry as soon
+            # as it starts rather than sit blind for a whole interval.
+            self._membership_recheck.set()
         self._event_cursor = await self._bootstrap_event_cursor()
 
         logger.info(
@@ -717,6 +735,7 @@ class Bridge:
             self._run_harness_listener(),
             self._run_typing_watchdog(),
             self._run_auto_join_reconciler(),
+            self._run_membership_reconciler(),
         )
 
     async def stop(self) -> None:
@@ -806,25 +825,35 @@ class Bridge:
             if await self._create_channel_for_session(session):
                 self._known_sessions.add(session_id)
 
-    async def _bootstrap_dormant_channels(self) -> None:
-        """Recover joined-but-unmapped channels after a daemon restart."""
+    async def _bootstrap_dormant_channels(self) -> bool:
+        """Recover joined-but-unmapped channels after a daemon restart.
+
+        Silent by design: these channels were welcomed when the bot first
+        joined them. Additive rather than replacing, so the membership
+        reconciler can re-run it after a failed boot without discarding the
+        invites that arrived in the meantime. Returns whether a listing was
+        actually read — the caller decides how urgently to try again.
+        """
         try:
             channel_ids = await asyncio.to_thread(self.mm.get_bot_channel_ids)
         except Exception:
             logger.warning(
-                "Failed to enumerate bot channel memberships for dormant-state bootstrap",
+                "Failed to enumerate bot channel memberships for dormant-state "
+                "bootstrap — the membership reconciler will retry",
                 exc_info=True,
             )
-            return
-        self._dormant_channels = {
+            return False
+        self._dormant_channels.update(
             channel_id for channel_id in channel_ids
-            if not self.mapping.get_session(Anchor(channel_id))
-        }
+            if self._needs_membership_registration(channel_id)
+        )
+        self._membership_baseline = True
         if self._dormant_channels:
             logger.info(
                 "Recovered %d dormant channel membership(s)",
                 len(self._dormant_channels),
             )
+        return True
 
     async def _bootstrap_event_cursor(self) -> int | None:
         """Return the SSE cursor to resume from on this boot.
@@ -963,6 +992,99 @@ class Bridge:
                 )
         if joined:
             logger.info("Auto-join reconciler joined %d channel(s)", joined)
+
+    async def _run_membership_reconciler(self) -> None:
+        """Re-discover memberships the WS event stream never delivered.
+
+        `channel_created` / `user_added` are the fast path, and both can be
+        lost: the membership lookup behind `channel_created` can fail, the
+        listing it reads can lag behind the channel it just described, and
+        any event emitted while the WS is reconnecting is gone for good —
+        Mattermost never re-sends them. Without this sweep the only recovery
+        is a daemon restart, which is the symptom this whole path exists to
+        remove.
+
+        Deliberately independent of `auto_join_public_channels`: it only
+        registers channels the bot is ALREADY a member of and never joins
+        anything, so it can't widen who the bot talks to. Runs forever;
+        each iteration's failures are logged but don't stop the loop.
+        """
+        while True:
+            try:
+                await asyncio.wait_for(
+                    self._membership_recheck.wait(),
+                    timeout=self.config.membership_reconcile_seconds,
+                )
+            except TimeoutError:
+                pass
+            # Cleared BEFORE the sweep: a discovery failure that lands while
+            # we're mid-listing describes a channel the listing may predate,
+            # so it must earn another pass rather than be swallowed by this
+            # one. One sweep per wake either way — never a spin.
+            self._membership_recheck.clear()
+            try:
+                await self._reconcile_memberships_once()
+            except Exception:
+                logger.exception("membership reconciler iteration failed")
+
+    def _needs_membership_registration(self, channel_id: str) -> bool:
+        """Whether a membership is news to the bridge.
+
+        One rule with two readers — the startup bootstrap and the reconciler
+        sweep — so a channel can never count as new to one and known to the
+        other. Mirrors `_on_mm_user_added`'s own early exits; checking here
+        as well keeps a sweep over a few hundred known channels silent,
+        since that handler logs a line for every mapped channel it skips.
+        """
+        return not (
+            self.mapping.get_session(Anchor(channel_id))
+            or channel_id in self._dormant_channels
+            or channel_id in self.warming_up_sessions
+            or channel_id in self._left_channels
+        )
+
+    async def _reconcile_memberships_once(self) -> None:
+        """One sweep — register every membership the bridge doesn't know about.
+
+        Add-only, and that asymmetry is the point: a channel the bot left is
+        simply absent from the listing, and `_left_channels` covers the window
+        where Mattermost still reports a membership we just gave up. Nothing
+        here can undo a leave, unmap a session, or re-welcome a channel that
+        is already known.
+        """
+        # A leave tombstone only has to outlive the listing lag it was made
+        # for, so it shields one sweep and then retires. Keeping it while the
+        # membership persists would blind this loop to a re-invite whose
+        # `user_added` went missing — the very failure it exists to catch.
+        shielded = set(self._left_channels)
+        if not self._membership_baseline:
+            # The boot-time listing never landed, so every membership looks
+            # new. Re-run the bootstrap instead: registering silently is
+            # right for channels the bot has been in all along, and the next
+            # sweep welcomes anything that appears after this baseline.
+            await self._bootstrap_dormant_channels()
+            return
+        bot_ids = await asyncio.to_thread(self.mm.get_bot_channel_ids)
+        discovered = 0
+        for channel_id in bot_ids:
+            if not self._needs_membership_registration(channel_id):
+                continue
+            try:
+                # Same registration the invite path uses — welcome included,
+                # since a channel discovered this late never got one.
+                await self._on_mm_user_added(channel_id, self.mm.bot_user_id)
+                discovered += 1
+            except Exception:
+                logger.warning(
+                    "Failed to register reconciled channel %s",
+                    channel_id, exc_info=True,
+                )
+        self._left_channels -= shielded
+        if discovered:
+            logger.info(
+                "Membership reconciler discovered %d channel(s) missed by the "
+                "event stream", discovered,
+            )
 
     async def _run_harness_listener(self) -> None:
         logger.info("Starting agent-harness SSE listener...")
@@ -1213,6 +1335,7 @@ class Bridge:
                     )
                     return
                 self._dormant_channels.discard(channel_id)
+                self._left_channels.add(channel_id)
                 self.purpose_by_channel.pop(channel_id, None)
                 return
             if self._stop_cmd_re.match(message):
@@ -1298,6 +1421,8 @@ class Bridge:
             return
         joined_by_bridge = channel_id in self._self_joined_channels
         self._self_joined_channels.discard(channel_id)
+        # A real membership supersedes any leave we're still remembering.
+        self._left_channels.discard(channel_id)
         if channel_id in self._dormant_channels:
             return
         # Creation and membership notifications can describe the same join.
@@ -1390,8 +1515,13 @@ class Bridge:
         try:
             bot_ids = await asyncio.to_thread(self.mm.get_bot_channel_ids)
         except Exception:
+            # Mattermost won't re-send `channel_created`, so dropping it here
+            # would hide the channel until a restart. Hand it to the
+            # reconciler instead, which retries on its own schedule.
+            self._membership_recheck.set()
             logger.warning(
-                "Failed to check membership for newly-created channel %s",
+                "Failed to check membership for newly-created channel %s — "
+                "handed to the membership reconciler",
                 channel_id, exc_info=True,
             )
             return
@@ -1428,6 +1558,9 @@ class Bridge:
         self.purpose_by_channel.pop(channel_id, None)
         self.warming_up_sessions.pop(channel_id, None)
         self._dormant_channels.discard(channel_id)
+        # Tombstone the removal so a membership listing that hasn't caught up
+        # can't walk the bot back into a channel it was just taken out of.
+        self._left_channels.add(channel_id)
         # Drain per-channel config state so a removal mid-restart (before the
         # self-write's `channel_updated` event arrives) doesn't leak an entry.
         self._self_written_purpose.pop(channel_id, None)
@@ -5504,6 +5637,7 @@ class Bridge:
                 pass
             return
         self.mapping.unlink(Anchor(channel_id))
+        self._left_channels.add(channel_id)
         self.purpose_by_channel.pop(channel_id, None)
         self._awaiting_first_forward.discard(channel_id)
         self._pending_initial_catch_up.pop(channel_id, None)

@@ -102,6 +102,14 @@ class Config:
     auto_join_public_channels: bool = False
     auto_join_reconcile_seconds: float = 5.0
 
+    # How often to re-scan the bot's OWN channel memberships for ones the
+    # WS event stream never delivered (see `_run_membership_reconciler`).
+    # Independent of `auto_join_public_channels` — this discovers channels
+    # the bot is already in and never joins anything. The sweep costs one
+    # channel listing per tick, so it's slow by default; a failed discovery
+    # lookup wakes it immediately rather than waiting out the interval.
+    membership_reconcile_seconds: float = 300.0
+
     # Hold posts that arrive while the anchor's session already has a run in
     # flight, and deliver them as ONE annotated run when it finishes. OFF is
     # exactly the pre-coalescing behavior: every post becomes its own eager
@@ -275,6 +283,7 @@ class Config:
             "mention_user_when_done",
             "auto_join_public_channels",
             "auto_join_reconcile_seconds",
+            "membership_reconcile_seconds",
             "state_file",
             "sidecar_dir",
             "allowed_attachment_roots",
