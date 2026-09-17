@@ -1298,6 +1298,10 @@ class Bridge:
             return
         joined_by_bridge = channel_id in self._self_joined_channels
         self._self_joined_channels.discard(channel_id)
+        if channel_id in self._dormant_channels:
+            return
+        # Creation and membership notifications can describe the same join.
+        # Reserve before the welcome's first await so duplicates stay silent.
         self._dormant_channels.add(channel_id)
         logger.info(
             "%s channel %s — dormant until first engagement",
@@ -1371,17 +1375,43 @@ class Bridge:
         )
 
     async def _on_mm_channel_created(self, channel_id: str) -> None:
-        """New channel appeared — join it if auto-join is enabled.
+        """Discover existing membership, independently of public auto-join.
 
-        Note: Mattermost scopes `channel_created` WS events to the creating
-        user's session only, so this path typically fires only for channels
-        the bot creates itself (e.g. `mm-bridge spawn`). Human-created public
-        channels are picked up by the reconciler.
+        Mattermost sends `channel_created` to the creator after adding their
+        membership, without a `user_added` event. This includes private
+        channels created by another process using the bot's account.
         """
+        if (
+            self.mapping.get_session(Anchor(channel_id))
+            or channel_id in self.warming_up_sessions
+            or channel_id in self._dormant_channels
+        ):
+            return
+        try:
+            bot_ids = await asyncio.to_thread(self.mm.get_bot_channel_ids)
+        except Exception:
+            logger.warning(
+                "Failed to check membership for newly-created channel %s",
+                channel_id, exc_info=True,
+            )
+            return
+        if channel_id in bot_ids:
+            # Reuse the idempotent invite path; it rechecks session state
+            # in case another event registered the channel during the lookup.
+            await self._on_mm_user_added(channel_id, self.mm.bot_user_id)
+            return
         if not self.config.auto_join_public_channels:
             return
-        self._self_joined_channels.add(channel_id)
         try:
+            channel = await asyncio.to_thread(self.mm.get_channel, channel_id)
+            if (
+                channel.get("type") != "O"
+                or channel.get("team_id") != self.mm.team_id
+                or channel.get("delete_at")
+                or channel_id in self._self_joined_channels
+            ):
+                return
+            self._self_joined_channels.add(channel_id)
             await asyncio.to_thread(self.mm.join_channel, channel_id)
             logger.info("Auto-joined newly-created channel %s", channel_id)
         except Exception:
@@ -2216,8 +2246,8 @@ class Bridge:
     async def _post_channel_join_welcome(self, channel_id: str) -> None:
         """Post the channel-join welcome. Best-effort, never raises.
 
-        Idempotent at the call site: a re-add posts the welcome again on
-        purpose — a re-invite implies fresh contact. The post is tagged
+        Idempotent at the call site: only a removal followed by a re-add
+        posts the welcome again. The post is tagged
         with ``props.{CHANNEL_JOIN_WELCOME_PROP}=welcome`` so operators
         can filter / dedupe historically.
         """
