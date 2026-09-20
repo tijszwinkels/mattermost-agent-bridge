@@ -5427,11 +5427,27 @@ class Bridge:
             )
             return
 
-        new_channel_id = await self._create_channel_for_session(meta)
+        # A mirror event may have mapped the session while get_session awaited.
+        # Creation through mapping.link below is synchronous; if moved off-thread,
+        # this check and creation will need per-session synchronization.
+        anchor = self.mapping.get_anchor(session_id)
+        if anchor:
+            if meta.get("origin") == "external":
+                self._post_external_resume_notice(anchor.channel_id, meta.get("backend"))
+            await self._invite_requester(
+                anchor.channel_id, user_id, session_id, channel_id, thread_root,
+            )
+            return
+
+        # Explicit invitations must not expose the session to public-channel
+        # auto-joiners (including other agent bots).
+        new_channel_id = await self._create_channel_for_session(meta, channel_type="P")
         if not new_channel_id:
             self._post_cmd_reply(
                 channel_id,
-                ":warning: Couldn't create a channel for that session.",
+                ":warning: Couldn't create a channel for that session. "
+                "A private channel is required; check the bot's permission to create "
+                "private channels and the bridge logs for details. No public fallback was attempted.",
                 thread_root,
             )
             return
@@ -5486,7 +5502,10 @@ class Bridge:
             )
             self._post_cmd_reply(
                 reply_channel_id,
-                ":warning: Failed to invite you to the channel.",
+                ":warning: Failed to invite you to the channel. The session channel "
+                f"still exists; retry `.invite {session_id}`. If it keeps failing, "
+                "ask an admin to check the bot's permission to add channel "
+                f"members and the bridge logs. Channel ID: `{target_channel_id}`.",
                 thread_root,
             )
             return
@@ -6000,7 +6019,9 @@ class Bridge:
                     pass
                 break
 
-    async def _create_channel_for_session(self, data: dict) -> str | None:
+    async def _create_channel_for_session(
+        self, data: dict, *, channel_type: str = "O",
+    ) -> str | None:
         session_id = data.get("id") or data.get("session_id") or ""
         if not session_id:
             return None
@@ -6017,6 +6038,7 @@ class Bridge:
                 name=channel_name,
                 display_name=display_name,
                 purpose=f"agent-harness session {session_id}",
+                channel_type=channel_type,
             )
             channel_id = ch["id"]
             self.mapping.link(Anchor(channel_id), session_id)
