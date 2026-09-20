@@ -118,12 +118,16 @@ class FakeMattermostClient:
             )
         self.deletes.append((post_id, permanent))
 
-    def create_channel(self, name: str, display_name: str, purpose: str = "") -> dict:
+    def create_channel(
+        self, name: str, display_name: str, purpose: str = "", *,
+        channel_type: str = "O",
+    ) -> dict:
         if self.fail_create_channel:
             raise RuntimeError("simulated MM create_channel failure")
         cid = f"c-{name}"
         self.channels[cid] = {
             "id": cid, "name": name, "display_name": display_name, "purpose": purpose,
+            "type": channel_type,
         }
         return {"id": cid}
 

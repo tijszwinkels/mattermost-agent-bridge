@@ -140,7 +140,7 @@ forwarded to the agent. An unknown `.word` gets a "try `.help`" reply.
 | `.sessions [N]` | The N most recent sessions across all agents, including terminal ones. Each shows its channel or an `.invite` hint. |
 | `.queue [clear]` | Show the posts held while the agent is working; `clear` drops them, naming who wrote them. |
 | `.fleet [all]` | One row per spawned child channel: declared state, live run, held posts. |
-| `.invite <session-id>` | Get added to a session's channel, creating it for unmapped/terminal sessions. |
+| `.invite <session-id>` | Get added to a session's channel, creating a **private** channel for unmapped/terminal sessions. Existing channels keep their visibility; automatic session mirroring still creates public channels. |
 
 ### Channels onto terminal sessions
 
@@ -282,6 +282,13 @@ Bounded by construction: nothing rings unless it asked to, one nag per level per
 most one nag post per watchdog tick across the whole fleet, and `nag_enabled = false` (or
 `MM_NAG_ENABLED=0`) as the global off switch, leaving the state directive and `.fleet`
 fully working.
+New `.invite` channels are private to prevent public-channel discovery and automatic
+joins by other bots. This is **not per-session authorization**: users who can run
+`.invite` can still request access to a known session. The bridge bot needs permission
+to create private channels and add members to them. Failures never fall back to a
+public channel; check the bridge logs and bot permissions. If adding the requester
+fails after creation, retry `.invite` or ask an admin to add them to the channel.
+
 The global listings (`.sessions`, `.running`, `.invite`) reveal operator-wide state, so in
 a dormant channel they need an explicit mention.
 

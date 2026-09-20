@@ -219,14 +219,15 @@ class MattermostClient:
     # ----- channels -----
 
     def create_channel(
-        self, name: str, display_name: str, purpose: str = ""
+        self, name: str, display_name: str, purpose: str = "", *,
+        channel_type: str = "O",
     ) -> dict:
         return self._driver.channels.create_channel(options={
             "team_id": self._team_id,
             "name": name,
             "display_name": display_name,
             "purpose": purpose,
-            "type": "O",
+            "type": channel_type,
         })
 
     def set_channel_header(self, channel_id: str, header: str) -> None:
